@@ -28,5 +28,5 @@ out="$work/build/android-v0"
   "$here/../runtime/threads.c" "$here/../runtime/ipc.c" \
   "$here/sha256.c" "$here/gate_android.S" "$here/hle_stack_android.S" \
   "$here/thread_enter_android.S" -D__ANDROID__ \
-  -pthread -o "$out/totk-android"
+  -pthread -lc++abi -lunwind -o "$out/totk-android"
 echo "built $out/totk-android"

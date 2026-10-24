@@ -37,6 +37,8 @@ void runtime_thread_note_hle(unsigned index);            /* threads.c: the calli
 uint32_t runtime_thread_current_handle(void);            /* threads.c: handle of the calling guest thread, 0 on a host thread */
 void *runtime_hle_wrap_named(void *fn, const char *name);/* hle_stack.c: runtime_hle_wrap with a name for diagnostics */
 void runtime_hle_trace_set(int mode);                    /* hle_stack.c: 1 count host calls, 2 also log the first call of each, 0 stop and print */
+void runtime_hle_trace_report(void);                     /* hle_stack.c: print the sorted summary now (atexit / crash) */
+int runtime_hle_last_call(char *out, size_t cap);       /* 1 and the name of the last wrapped call, 0 when none ran */
 void runtime_hle_describe(unsigned index, char *out, size_t cap);   /* hle_stack.c: readable name of a host-call wrapper */
 /* Text entry bar in the game window (runtime/frontend.m, Mac): the player types on the keyboard, Return confirms (1, the text
    as UTF-8 in out), Escape cancels (0). The caller waits; give the virtual core up around it (runtime_core_away). */
