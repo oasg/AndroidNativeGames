@@ -6,6 +6,7 @@
  * The full HLE/service layer is intentionally not here yet.
  */
 #include "runtime.h"
+#include "ipc.h"
 #include "sha256.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -299,20 +300,73 @@ static void *probe_thread(void *unused) {
     return NULL;
 }
 
-static void crash_handler(int sig, siginfo_t *si, void *ctx) {
-    (void)si;
-    ucontext_t *u = ctx;
-    uintptr_t pc = u->uc_mcontext.pc, lr = u->uc_mcontext.regs[30], sp = u->uc_mcontext.sp;
-    const char *mn = "?";
-    uint64_t off = 0;
+/* Module-relative name for a crash address, with a host symbol fallback. */
+static void describe_address(uint64_t addr, char *out, size_t cap) {
     for (unsigned i = 0; i < NMODULES; i++) {
         uintptr_t b = (uintptr_t)modules[i].base;
-        if (pc >= b && pc < b + modules[i].size) { mn = modules[i].name; off = pc - b; break; }
+        if (addr >= b && addr < b + modules[i].size) {
+            snprintf(out, cap, "%s+%#llx", modules[i].name, (unsigned long long)(addr - b));
+            return;
+        }
     }
-    fprintf(stderr, "[totk-android] CRASH sig=%d pc=%s+%#llx lr=%#llx sp=%#llx x0=%#llx x1=%#llx x8=%#llx\n",
-            sig, mn, (unsigned long long)off, (unsigned long long)lr, (unsigned long long)sp,
-            (unsigned long long)u->uc_mcontext.regs[0], (unsigned long long)u->uc_mcontext.regs[1],
+    snprintf(out, cap, "0x%llx", (unsigned long long)addr);
+}
+
+/* Read guest memory from the signal handler without faulting again.  The guest
+ * stacks are ordinary mappings of this process; /proc/self/mem turns a stale
+ * frame pointer into a short read instead of a nested SIGSEGV. */
+static int crash_read(uint64_t addr, void *out, size_t n) {
+    static int mem = -2;
+    if (mem == -2) mem = open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
+    if (mem < 0) return 0;
+    return pread(mem, out, n, (off_t)addr) == (ssize_t)n;
+}
+
+static void crash_handler(int sig, siginfo_t *si, void *ctx) {
+    ucontext_t *u = ctx;
+    uint64_t pc = u->uc_mcontext.pc;
+    uint64_t lr = u->uc_mcontext.regs[30];
+    uint64_t sp = u->uc_mcontext.sp;
+    uint64_t fp = u->uc_mcontext.regs[29];
+    char pcd[128], lrd[128];
+    describe_address(pc, pcd, sizeof pcd);
+    describe_address(lr, lrd, sizeof lrd);
+    fprintf(stderr, "[crash] sig=%d pc=%s lr=%s fault=%p sp=%#llx x8=%#llx\n",
+            sig, pcd, lrd, si ? si->si_addr : NULL, (unsigned long long)sp,
             (unsigned long long)u->uc_mcontext.regs[8]);
+
+    /* Guest frame-pointer chain: at x29 the pair is {caller fp, return address}. */
+    uint64_t chain_fp = fp;
+    if (chain_fp && !(chain_fp & 7)) {
+        for (unsigned n = 0; n < 16 && chain_fp; n++) {
+            uint64_t pair[2];
+            if (!crash_read(chain_fp, pair, sizeof pair)) break;
+            char fd[128];
+            describe_address(pair[1], fd, sizeof fd);
+            fprintf(stderr, "[crash] frame %u: fp=%#llx lr=%s\n",
+                    n, (unsigned long long)chain_fp, fd);
+            uint64_t next = pair[0];
+            if (!next || (next & 7) || next <= chain_fp || next - chain_fp > (64u << 20)) break;
+            chain_fp = next;
+        }
+    } else {
+        char fd[128];
+        describe_address(lr, fd, sizeof fd);
+        fprintf(stderr, "[crash] frame 0: fp=%#llx lr=%s\n", (unsigned long long)fp, fd);
+    }
+
+    char hle[256];
+    if (runtime_hle_last_call(hle, sizeof hle)) fprintf(stderr, "[crash] last HLE: %s\n", hle);
+    else fprintf(stderr, "[crash] last HLE: none\n");
+
+    RuntimeIpcRecord ipc;
+    if (runtime_ipc_last(&ipc) && ipc.valid)
+        fprintf(stderr, "[crash] last IPC: service=%s command=%u object=%u type=%u data=%u result=%u\n",
+                ipc.service, ipc.command, ipc.object, ipc.type, ipc.data_size, ipc.result);
+    else fprintf(stderr, "[crash] last IPC: none\n");
+
+    fprintf(stderr, "[crash] guest thread handle=%#x\n", runtime_thread_current_handle());
+    runtime_hle_trace_report();   /* no allocation/stdio locking beyond this handler */
     _exit(128 + sig);
 }
 
@@ -326,7 +380,10 @@ static int inits_enabled(void) {
 static void loader_ready(void) {
     printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"sdk-start\",\"stage\":\"loader-ready\"}\n");
     fflush(stdout);
-    if (!inits_enabled()) _exit(0);
+    if (!inits_enabled()) {
+        runtime_hle_trace_report();
+        _exit(0);
+    }
 }
 
 /* Use the host override when present; runtime_symbol() returns the guest SDK
@@ -466,6 +523,7 @@ static void module_inits(void) {
     if (getenv("TOTK_ANDROID_STOP_AFTER_INITS")) {
         printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"sdk-start\",\"stage\":\"module-inits\"}\n");
         fflush(stdout);
+        runtime_hle_trace_report();
         _exit(0);
     }
 }

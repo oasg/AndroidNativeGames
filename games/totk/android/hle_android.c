@@ -100,6 +100,7 @@ static void nnmain_entry(void) {
     }
     printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"sdk-start\",\"stage\":\"nnMain-entry\"}\n");
     fflush(stdout);
+    runtime_hle_trace_report();
     _exit(0);
 }
 
