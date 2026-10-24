@@ -35,6 +35,24 @@ static uint8_t *low_space, *alias_space, *heap;
 static size_t heap_size, alias_size;
 static uint8_t user_exception_context[0x1000] __attribute__((aligned(0x1000)));
 
+/* lm (LogManager): the SDK opens it from the first module initializer and sends
+ * Initialize(process_id); the host logger is already running. */
+static void lm_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    switch (rq->cmd) {
+    case 0: { /* Initialize(process_id): the host logger is already running */
+        if (rq->data_size != 8) { rs->result = 0xe401; return; }
+        uint64_t pid; memcpy(&pid, rq->data, 8);
+        fprintf(stderr, "[totk-ipc] lm initialized for process %#llx\n", (unsigned long long)pid);
+        return;
+    }
+    default:
+        ipc_unimplemented(s, rq);
+    }
+}
+__attribute__((constructor)) static void register_android_services(void) {
+    runtime_ipc_register("lm", lm_handler, NULL, NULL);
+}
+
 static uint8_t *reserve_fixed(uint64_t at, uint64_t size) {
     void *p = mmap((void *)(uintptr_t)at, (size_t)size, PROT_NONE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
@@ -55,7 +73,19 @@ static void memory_init(void) {
         if (alias_space) break;
         alias_size >>= 1;
     }
-    if (!alias_space) alias_size = 0;
+    if (!alias_space) {
+        /* Android may already use the preferred fixed window (or refuse such a
+           large MAP_FIXED_NOREPLACE); the SDK only needs the address GetInfo
+           reports, not 0x7000000000 specifically. */
+        alias_size = ALIAS_MAX;
+        while (alias_size >= (4ull << 30)) {
+            void *p = mmap(NULL, (size_t)alias_size, PROT_NONE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            if (p != MAP_FAILED) { alias_space = p; break; }
+            alias_size >>= 1;
+        }
+        if (!alias_space) alias_size = 0;
+    }
     fprintf(stderr, "[totk-android] guest layout: low %#llx+%#llx stack %#llx+%#llx heap %#llx alias %#llx+%#llx\n",
             (unsigned long long)(uintptr_t)low_space, (unsigned long long)LOW_SIZE,
             (unsigned long long)(uintptr_t)(low_space + STACK_OFF), (unsigned long long)STACK_SIZE,
@@ -142,11 +172,36 @@ uint64_t runtime_svc(unsigned num, uint64_t *r, const char *module, uint64_t off
         case 0x0b: { int64_t ns = (int64_t)r[0]; if (ns > 0) { struct timespec t = { ns / 1000000000, ns % 1000000000 }; nanosleep(&t, NULL); } r[0] = 0; return 0; }
         case 0x0c: case 0x0d: case 0x0e: case 0x0f: r[0] = 0; return 0;
         case 0x10: r[0] = 0; return 0;
+        case 0x24: r[0] = 0; r[1] = 1; return 0;   /* GetProcessId: one application process */
         case 0x25: r[0] = 0; r[1] = (uint64_t)gettid(); return 0;
         case 0x26: fprintf(stderr, "[totk-android] guest Break reason=%#llx\n", (unsigned long long)r[0]); r[0] = 0; return 0;
         case 0x27: { size_t n = (size_t)r[1]; if (n > 65536) n = 65536; fwrite((void *)(uintptr_t)r[0], 1, n, stderr); r[0] = 0; return 0; }
         case 0x29: r[0] = 0; r[1] = get_info((unsigned)r[1]); return 0;
-        case 0x2c: case 0x2d: r[0] = 0; return 0;
+        case 0x2c: { /* MapPhysicalMemory(addr, size): commit anonymous alias pages */
+            uint64_t addr = r[0], size = r[1];
+            if (!size || (addr & 0xfff) || (size & 0xfff) ||
+                !alias_space || addr < (uintptr_t)alias_space || addr + size > (uintptr_t)alias_space + alias_size) {
+                fprintf(stderr, "[totk-android] MapPhysicalMemory %#llx+%#llx outside alias\n",
+                        (unsigned long long)addr, (unsigned long long)size);
+                r[0] = 0xd401; return r[0];
+            }
+            if (mprotect((void *)(uintptr_t)addr, (size_t)size, PROT_READ | PROT_WRITE)) {
+                fprintf(stderr, "[totk-android] MapPhysicalMemory mprotect: %s\n", strerror(errno));
+                r[0] = 0xd401; return r[0];
+            }
+            r[0] = 0; return 0;
+        }
+        case 0x2d: { /* UnmapPhysicalMemory(addr, size) */
+            uint64_t addr = r[0], size = r[1];
+            if (!size || (addr & 0xfff) || (size & 0xfff) ||
+                !alias_space || addr < (uintptr_t)alias_space || addr + size > (uintptr_t)alias_space + alias_size) {
+                r[0] = 0xd401; return r[0];
+            }
+            if (mprotect((void *)(uintptr_t)addr, (size_t)size, PROT_NONE)) {
+                r[0] = 0xd401; return r[0];
+            }
+            r[0] = 0; return 0;
+        }
         default:
             fprintf(stderr, "[totk-android] unimplemented SVC %#x at %s+%#llx x0=%#llx x1=%#llx\n",
                     num, module, (unsigned long long)offset,

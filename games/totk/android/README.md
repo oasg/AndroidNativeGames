@@ -12,12 +12,15 @@ gate + HLE-stack thunks + a minimal SVC layer.
 - Runs the host gate on a real arm64 Android device:
   `main` PLT → `sdk` timer code → `gate_android.S` → `runtime_dispatch` → back.
 - Runs `nn::init::Start` through `nn::os` initialization and reaches the
-  `loader-ready` callback. Module initializers and `nnMain` are the next step.
+  `loader-ready` callback.
+- Implements CMIF domain sessions (`ConvertCurrentObjectToDomain`, domain
+  request/response headers, domain object tables and implicit domain object 1).
+- Registers a real `lm` service and the first `fsp-srv` setup commands.
+- Runs `main`, `subsdk0` and `sdk` `DT_INIT` and reaches the original
+  `nnMain` entry with `TOTK_ANDROID_INITS=1`; the process stops there by
+  default. `TOTK_ANDROID_RUN_NNMAIN=1` lets the original `nnMain` continue for
+  the next HLE milestone; it currently stops in the guest graphics setup.
 - HLE thunks switch to the per-thread HostContext stack.
-- The first module initializer (`lm`) is reached with
-  `TOTK_ANDROID_INITS=1`; it stops at CMIF domain control, which is the next
-  HLE/IPC milestone. `TOTK_ANDROID_IPC_STUB=1` is a diagnostic that answers
-  domain requests with zero data.
 
 ## Build
 
@@ -49,6 +52,18 @@ Expected results on an arm64 Android device:
 - `probe`: 4 threads × 1000 `GetSystemTick` calls, timer gate count 4000.
 - `probe-hle`: HLE thunk returns 7.
 - `boot-sdk`: reaches `{"stage":"loader-ready"}`.
+- `TOTK_ANDROID_INITS=1 boot-sdk`: runs the three module `DT_INIT`s and
+  reaches `{"stage":"nnMain-entry"}`.
+- `TOTK_ANDROID_STOP_AFTER_INITS=1`: stops after the constructors for
+  diagnostics; it implies `TOTK_ANDROID_INITS`.
+- `TOTK_ANDROID_FS_PROBE=1`: after the constructors, queries and mounts the
+  RomFS cache to exercise `fsp-srv` (diagnostic; storage commands are still
+  being filled in). `TOTK_ANDROID_STORAGE=<file>` backs
+  `OpenDataStorageByCurrentProcess` with that host file. The probe expects a
+  real RomFS image: with a placeholder file it reaches
+  `OpenDataStorageByCurrentProcess` and `IStorage::GetSize` and then stops in
+  the guest reader, and an unset or unreadable storage stops in the SDK's
+  unhandled error path.
 
 ## Android-specific notes
 
@@ -61,13 +76,17 @@ Expected results on an arm64 Android device:
   guest x18 and has a `bti c` landing pad.
 - **Page size**: the loader uses `sysconf(_SC_PAGESIZE)`; the test device is
   4 KiB. 16 KiB devices are not yet tested.
-- **Alias region**: the first host reserves 16 GiB at `0x7000000000`; the full
-  64 GiB / shrink logic from `services.c` is next.
+- **Alias region**: the host reserves up to 64 GiB at `0x7000000000`, halving
+  the size until the mapping succeeds; if the fixed window is unavailable it
+  takes a mapping of the same size at any host address. `GetInfo` reports
+  whichever base and size are used, and `MapPhysicalMemory` /
+  `UnmapPhysicalMemory` only accept that window.
 
 ## Next
 
-1. Port the remaining memory SVCs (`MapPhysicalMemory`, stack moves, precise
-   `QueryMemory`) and the HLE service registry.
-2. Run module `DT_INIT` constructors and stop at the first missing service.
-3. Port `nn::fs`/`nn::os`/`nn::oe` host overrides, then input/audio and the
-   Vulkan/NVN graphics layer.
+1. Finish the `fsp-srv` file-system protocol (`IFileSystem`/`IFile` objects)
+   and point `IStorage` at the extracted RomFS/save data.
+2. Continue past `nnMain` with the graphics/input/audio services; the first
+   call after focus setup currently stops in the guest graphics setup.
+3. Port the remaining memory SVCs (`MapPhysicalMemory` details, stack moves,
+   precise `QueryMemory`) and the rest of the HLE service registry.

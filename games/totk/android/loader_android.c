@@ -215,12 +215,13 @@ static void relocate(Module *m) {
         } else {
             need(r->kind == 257 || r->kind == 1025 || r->kind == 1026, "relocation kind");
             const Symbol *s = &m->symbols[r->symbol];
-            void *p = r->kind == 1026 ? runtime_observer(s->name) : NULL;
+            void *p = (r->kind == 1026 || !strcmp(s->name, "nnMain")) ? runtime_observer(s->name) : NULL;
+            if (!p) p = runtime_override(s->name);
+            if (p) p = runtime_hle_wrap_named(p, s->name);   /* host replacements run on the host stack */
             if (!p && s->defined) p = s->value < m->key_off ? m->base + s->value : NULL;
             if (!p) p = runtime_symbol(s->name);
             if (!p) {
-                p = runtime_override(s->name);
-                if (!p) p = runtime_hle_stub(s->name);
+                p = runtime_hle_stub(s->name);
                 if (p) p = runtime_hle_wrap_named(p, s->name);
             }
             if (!p && s->binding != 2) {
@@ -316,23 +317,50 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
 
 static uint64_t host_add(uint64_t a, uint64_t b) { return a + b; }
 
+/* STOP_AFTER_INITS is a diagnostic for the constructor pass, so it implies INITS. */
+static int inits_enabled(void) {
+    return getenv("TOTK_ANDROID_INITS") || getenv("TOTK_ANDROID_STOP_AFTER_INITS");
+}
+
 static void loader_ready(void) {
     printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"sdk-start\",\"stage\":\"loader-ready\"}\n");
     fflush(stdout);
-    if (!getenv("TOTK_ANDROID_INITS")) _exit(0);
+    if (!inits_enabled()) _exit(0);
+}
+
+static void fs_probe(void) {
+    uint64_t cache_size = 0;
+    int (*query_cache)(uint64_t *) = (int (*)(uint64_t *))runtime_symbol("_ZN2nn2fs22QueryMountRomCacheSizeEPm");
+    int (*mount_rom)(const char *, void *, uint64_t) = (int (*)(const char *, void *, uint64_t))runtime_symbol("_ZN2nn2fs8MountRomEPKcPvm");
+    need(query_cache && mount_rom, "nn::fs::MountRom symbols");
+    int qc = query_cache(&cache_size);
+    fprintf(stderr, "[totk-android] QueryMountRomCacheSize -> %d size=%#llx\n", qc, (unsigned long long)cache_size);
+    if (qc) return;
+    void *cache = calloc(1, (size_t)cache_size);
+    need(cache != NULL, "RomFS cache allocation");
+    fprintf(stderr, "[totk-android] MountRom -> %d\n", mount_rom("rom", cache, cache_size));
 }
 
 static void module_inits(void) {
-    if (getenv("TOTK_ANDROID_INITS")) {
+    if (inits_enabled()) {
         for (unsigned i = 0; i < NMODULES; i++) {
             fprintf(stderr, "[totk-android] ENTER %s DT_INIT\n", modules[i].name);
             ((void (*)(void))(modules[i].base + modules[i].init))();
-            fprintf(stderr, "[totk-android] RETURN %s DT_INIT\n", modules[i].name);
+            uint32_t state;
+            memcpy(&state, modules[i].base + modules[i].ctor_flag, 4);
+            fprintf(stderr, "[totk-android] RETURN %s DT_INIT state=%u init_array=%llu\n",
+                    modules[i].name, state, (unsigned long long)(modules[i].init_size / 8));
+            /* musl's __nnmusl_init_dso returns 2 after running .init_array and 1 when the
+               module has no fini callback; both mean the constructor pass completed. */
+            need(state == 1 || state == 2, "DT_INIT deferred or skipped constructors");
         }
+        if (getenv("TOTK_ANDROID_FS_PROBE")) fs_probe();
     }
-    printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"sdk-start\",\"stage\":\"module-inits\"}\n");
-    fflush(stdout);
-    _exit(0);
+    if (getenv("TOTK_ANDROID_STOP_AFTER_INITS")) {
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"sdk-start\",\"stage\":\"module-inits\"}\n");
+        fflush(stdout);
+        _exit(0);
+    }
 }
 
 static void module_finis(void) { }

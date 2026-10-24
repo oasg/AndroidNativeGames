@@ -32,7 +32,7 @@ void runtime_ipc_register(const char *name, IpcHandler handler, IpcOpen open, vo
 static IpcSession *session_new(const char *name, IpcHandler handler, void *state, void (*close)(void *)) {
     IpcSession *s = calloc(1, sizeof *s);
     if (!s) runtime_fail("IPC session allocation");
-    *s = (IpcSession){name, handler, state, close};
+    *s = (IpcSession){.name = name, .handler = handler, .state = state, .close = close};
     return s;
 }
 uint32_t runtime_ipc_new_session(const char *name, IpcHandler handler, void *state, void (*close)(void *)) {
@@ -40,8 +40,56 @@ uint32_t runtime_ipc_new_session(const char *name, IpcHandler handler, void *sta
 }
 void runtime_ipc_session_closed(void *p) {
     IpcSession *s = p;
-    if (s->close) s->close(s->state);
+    if (s->domain) {
+        for (unsigned i = 0; i < s->domain->nobjects; i++) {
+            IpcObject *o = &s->domain->objects[i];
+            if (o->owned && o->close) o->close(o->state);
+        }
+        free(s->domain);
+    }
+    if (s->close) s->close(s->state);   /* the base object's state belongs to the session */
     free(s);
+}
+
+/* ---------- Domain objects ---------- */
+static uint32_t domain_convert(IpcSession *s) {
+    if (s->domain) return s->self_id;
+    IpcDomain *d = calloc(1, sizeof *d);
+    if (!d) runtime_fail("IPC domain allocation");
+    s->domain = d;
+    d->next_id = 1;
+    s->self_id = d->next_id++;
+    d->objects[d->nobjects++] = (IpcObject){
+        .id = s->self_id, .name = s->name, .handler = s->handler,
+        .state = s->state, .close = NULL, .owned = 0,
+    };
+    return s->self_id;
+}
+uint32_t ipc_domain_add_object(IpcSession *s, const char *name, IpcHandler handler, void *state, void (*close)(void *)) {
+    if (!s || !s->domain) runtime_fail("IPC object registration outside a domain");
+    IpcDomain *d = s->domain;
+    if (d->nobjects == IPC_MAX_OBJECTS) runtime_fail("IPC domain object table full");
+    uint32_t id = d->next_id++;
+    if (!id) runtime_fail("IPC domain object id wrapped");
+    d->objects[d->nobjects++] = (IpcObject){
+        .id = id, .name = name, .handler = handler,
+        .state = state, .close = close, .owned = 1,
+    };
+    return id;
+}
+static IpcObject *domain_find(IpcDomain *d, uint32_t id) {
+    for (unsigned i = 0; i < d->nobjects; i++) if (d->objects[i].id == id) return &d->objects[i];
+    return NULL;
+}
+static int domain_remove(IpcDomain *d, uint32_t id) {
+    for (unsigned i = 0; i < d->nobjects; i++) {
+        if (d->objects[i].id != id) continue;
+        IpcObject *o = &d->objects[i];
+        if (o->owned && o->close) o->close(o->state);
+        d->objects[i] = d->objects[--d->nobjects];
+        return 1;
+    }
+    return 0;
 }
 void runtime_ipc_tmem_closed(void *p) { free(p); }
 
@@ -97,7 +145,7 @@ static void parse(const uint32_t *m, IpcRequest *rq, const uint32_t **data_words
     if ((const uint8_t *)recv - (const uint8_t *)m > MSG_BYTES) runtime_fail("IPC request exceeds message buffer");
 }
 
-static void respond(uint32_t *m, int tipc, const IpcResponse *rs) {
+static void respond(uint32_t *m, int tipc, int domain, const IpcResponse *rs) {
     uint32_t out[MSG_BYTES / 4]; memset(out, 0, sizeof out);
     unsigned special = rs->ncopy || rs->nmove;
     uint32_t *p = out + 2;
@@ -115,12 +163,19 @@ static void respond(uint32_t *m, int tipc, const IpcResponse *rs) {
     unsigned header = tipc ? 4 : 16;
     if (tipc) payload = words;
     else payload = (uint8_t *)out + (((words - (uint8_t *)out) + 15) & ~15);
-    unsigned used = (unsigned)(payload - words) + header + rs->data_size;
+    unsigned domain_header = domain && !tipc ? 16 : 0;
+    unsigned used = (unsigned)(payload - words) + domain_header + header + rs->data_size;
+    if (domain_header) used += rs->nobjects * 4;
     unsigned nwords = tipc ? (used + 3) / 4 : (used + 16 + 3) / 4;   /* CMIF keeps alignment slack like libnx */
     if ((size_t)(words - (uint8_t *)out) + nwords * 4 > MSG_BYTES) runtime_fail("IPC response exceeds message buffer");
+    if (domain_header) {
+        uint32_t dh[4] = {rs->nobjects, 0, 0, 0};
+        memcpy(payload, dh, sizeof dh); payload += sizeof dh;
+    }
     if (tipc) memcpy(payload, &rs->result, 4);
     else { uint32_t h[4] = {CMIF_OUT_MAGIC, 0, rs->result, 0}; memcpy(payload, h, 16); }
     memcpy(payload + header, rs->data, rs->data_size);
+    if (domain_header) memcpy(payload + header + rs->data_size, rs->objects, rs->nobjects * 4);
     out[0] = (rs->nxout & 0xf) << 16;
     out[1] = (nwords & 0x3ff) | (special ? 1u << 31 : 0);
     memcpy(m, out, MSG_BYTES);
@@ -128,40 +183,100 @@ static void respond(uint32_t *m, int tipc, const IpcResponse *rs) {
 
 /* ---------- Control requests (CMIF) ---------- */
 static void control(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
-#ifdef __ANDROID__
-    if (getenv("TOTK_ANDROID_IPC_STUB") && rq->cmd == 0) { s->state = (void *)1; return; }
-#endif
     switch (rq->cmd) {
+    case 0: {                                                                 /* ConvertCurrentObjectToDomain */
+        uint32_t id = domain_convert(s); IPC_OUT(rs, id); return;
+    }
     case 3: { uint16_t n = POINTER_BUFFER_SIZE; IPC_OUT(rs, n); return; }   /* QueryPointerBufferSize */
     case 2: case 4:                                                           /* CloneCurrentObject(Ex) */
         rs->move[rs->nmove++] = runtime_ipc_new_session(s->name, s->handler, s->state, NULL);
         return;
     default:
-        fprintf(stderr, "[totk-ipc] %s: control command %u (domains are not implemented)\n", s->name, rq->cmd);
+        fprintf(stderr, "[totk-ipc] %s: control command %u not implemented\n", s->name, rq->cmd);
         runtime_fail("IPC control command not implemented");
     }
 }
+
+static uint32_t read32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static uint16_t read16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
 
 static void dispatch(IpcSession *s, uint32_t *m) {
     IpcRequest rq; const uint32_t *words; unsigned ndata;
     parse(m, &rq, &words, &ndata);
     if (getenv("TOTK_IPC_DUMP") && rq.na + rq.nb) { fprintf(stderr, "[totk-ipc] raw %s:", s->name); for (unsigned i = 0; i < 20; i++) fprintf(stderr, " %08x", m[i]); fputc('\n', stderr); }
     IpcResponse rs; memset(&rs, 0, sizeof rs);
-#ifdef __ANDROID__
-    if (getenv("TOTK_ANDROID_IPC_STUB") && s->state == (void *)1) {
-        respond(m, rq.type >= T_TIPC_BASE, &rs);
-        return;
-    }
-#endif
     if (rq.type == T_CLOSE || rq.type == T_TIPC_CLOSE) return;
     int tipc = rq.type >= T_TIPC_BASE;
     const uint8_t *bytes = (const uint8_t *)words, *end = bytes + ndata * 4;
     if (tipc) { rq.cmd = rq.type - T_TIPC_BASE; rq.data = bytes; rq.data_size = (uint32_t)(end - bytes); }
     else if (rq.type == T_REQUEST || rq.type == T_REQUEST_CTX || rq.type == T_CONTROL || rq.type == T_CONTROL_CTX) {
         const uint8_t *payload = (const uint8_t *)m + (((bytes - (const uint8_t *)m) + 15) & ~15);
-        uint32_t h[4]; memcpy(h, payload, 16);
-        if (h[0] != CMIF_IN_MAGIC) { fprintf(stderr, "[totk-ipc] %s: bad CMIF magic %#x (domain sessions are not implemented)\n", s->name, h[0]); runtime_fail("IPC bad CMIF header"); }
-        rq.cmd = h[2]; rq.data = payload + 16; rq.data_size = payload + 16 <= end ? (uint32_t)(end - payload - 16) : 0;
+        if (payload + 16 > end) runtime_fail("IPC CMIF header beyond message");
+        const uint8_t *d = payload;
+        int domain_request = s->domain && (rq.type == T_REQUEST || rq.type == T_REQUEST_CTX);
+        /* Some SDK clients talk to a freshly opened service as an implicit domain
+           (the base object is id 1) without sending ConvertCurrentObjectToDomain. */
+        if (!domain_request && (rq.type == T_REQUEST || rq.type == T_REQUEST_CTX) &&
+            (d[0] == 1 || d[0] == 2) && payload + 32 <= end && read32(d + 16) == CMIF_IN_MAGIC) {
+            domain_convert(s);
+            domain_request = 1;
+        }
+        uint32_t object_id = 0;
+        if (domain_request) {
+            /* CmifDomainInHeader: type, num_in_objects, data_size, object_id, padding, token */
+            unsigned dtype = d[0], nin = d[1];
+            uint16_t dsize = read16(d + 2);
+            object_id = read32(d + 4);
+            if (dtype == 2) {                                              /* domain Close */
+                if (!domain_remove(s->domain, object_id)) {
+                    fprintf(stderr, "[totk-ipc] %s: close unknown domain object %u\n", s->name, object_id);
+                    rs.result = IPC_RESULT_UNKNOWN_COMMAND;
+                }
+                respond(m, 0, 1, &rs);
+                return;
+            }
+            if (dtype != 1) {
+                fprintf(stderr, "[totk-ipc] %s: domain request type %u\n", s->name, dtype);
+                runtime_fail("IPC domain request type not implemented");
+            }
+            if (dsize < 16 || d + 16 + dsize > end) runtime_fail("IPC domain request size");
+            if (nin > IPC_MAX_OBJECTS) runtime_fail("IPC too many input objects");
+            const uint8_t *objp = d + 16 + dsize;
+            for (unsigned i = 0; i < nin; i++, objp += 4) {
+                if (objp + 4 > end) runtime_fail("IPC input object beyond message");
+                rq.objects[i] = read32(objp);
+            }
+            rq.nobjects = nin;
+            rq.data = d + 32; rq.data_size = dsize - 16;                 /* skip CmifDomainInHeader + CmifInHeader */
+            uint32_t h[4]; memcpy(h, d + 16, 16);
+            if (h[0] != CMIF_IN_MAGIC) runtime_fail("IPC bad domain CMIF header");
+            rq.cmd = h[2];
+            IpcObject *obj = domain_find(s->domain, object_id);
+            if (!obj) {
+                fprintf(stderr, "[totk-ipc] %s: unknown domain object %u command %u\n", s->name, object_id, rq.cmd);
+                rs.result = IPC_RESULT_UNKNOWN_COMMAND;
+                respond(m, 0, 1, &rs);
+                return;
+            }
+            IpcSession view = *s;
+            view.name = obj->name; view.handler = obj->handler; view.state = obj->state;
+            view.close = NULL; view.self_id = obj->id;
+            obj->handler(&view, &rq, &rs);
+            respond(m, 0, 1, &rs);
+            return;
+        }
+        if (!domain_request) {
+            uint32_t h[4]; memcpy(h, payload, 16);
+            if (h[0] != CMIF_IN_MAGIC) {
+                fprintf(stderr, "[totk-ipc] %s: bad CMIF magic %#x type=%u domain=%d words:",
+                        s->name, h[0], rq.type, s->domain != NULL);
+                for (unsigned i = 0; i < 8; i++) fprintf(stderr, " %08x", payload[i * 4] | (payload[i * 4 + 1] << 8) |
+                        (payload[i * 4 + 2] << 16) | ((uint32_t)payload[i * 4 + 3] << 24));
+                fputc('\n', stderr);
+                runtime_fail("IPC bad CMIF header");
+            }
+            rq.cmd = h[2]; rq.data = payload + 16; rq.data_size = payload + 16 <= end ? (uint32_t)(end - payload - 16) : 0;
+        }
     } else {
         fprintf(stderr, "[totk-ipc] %s: message type %u at %p:", s->name, rq.type, (void *)m);
         for (unsigned i = 0; i < 16; i++) fprintf(stderr, " %08x", m[i]);
@@ -169,7 +284,7 @@ static void dispatch(IpcSession *s, uint32_t *m) {
     }
     if (rq.type == T_CONTROL || rq.type == T_CONTROL_CTX) control(s, &rq, &rs);
     else s->handler(s, &rq, &rs);
-    respond(m, tipc, &rs);
+    respond(m, tipc, 0, &rs);
 }
 
 /* ---------- sm: service manager ---------- */
