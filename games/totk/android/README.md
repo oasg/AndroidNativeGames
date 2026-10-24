@@ -15,7 +15,9 @@ gate + HLE-stack thunks + a minimal SVC layer.
   `loader-ready` callback.
 - Implements CMIF domain sessions (`ConvertCurrentObjectToDomain`, domain
   request/response headers, domain object tables and implicit domain object 1).
-- Registers a real `lm` service and the first `fsp-srv` setup commands.
+- Registers a real `lm` service. File I/O uses the macOS-style `nn::fs`
+  host overrides (`fs_host_android.c`, `romfs_android.c`); `fsp-srv` remains
+  registered as an optional/diagnostic protocol path.
 - Runs `main`, `subsdk0` and `sdk` `DT_INIT` and reaches the original
   `nnMain` entry with `TOTK_ANDROID_INITS=1`; the process stops there by
   default. `TOTK_ANDROID_RUN_NNMAIN=1` lets the original `nnMain` continue for
@@ -56,14 +58,15 @@ Expected results on an arm64 Android device:
   reaches `{"stage":"nnMain-entry"}`.
 - `TOTK_ANDROID_STOP_AFTER_INITS=1`: stops after the constructors for
   diagnostics; it implies `TOTK_ANDROID_INITS`.
-- `TOTK_ANDROID_FS_PROBE=1`: after the constructors, queries and mounts the
-  RomFS cache to exercise `fsp-srv` (diagnostic; storage commands are still
-  being filled in). `TOTK_ANDROID_STORAGE=<file>` backs
-  `OpenDataStorageByCurrentProcess` with that host file. The probe expects a
-  real RomFS image: with a placeholder file it reaches
-  `OpenDataStorageByCurrentProcess` and `IStorage::GetSize` and then stops in
-  the guest reader, and an unset or unreadable storage stops in the SDK's
-  unhandled error path.
+- `TOTK_ANDROID_FS_PROBE=1`: after the constructors, exercises the `nn::fs`
+  host overrides: temp write/read, save mount/create/write/commit, directory
+  listing, and (when `TOTK_ANDROID_ROMFS` is set) a RomFS mount/read.
+  `TOTK_ANDROID_PROFILE=<dir>` selects the save/temp/cache root;
+  `TOTK_ANDROID_ROMFS=<dir>` points at an extracted RomFS directory. Add
+  `TOTK_ANDROID_FS_BY_SERVICE=1` to send the probe through `fsp-srv` instead
+  of the host overrides.
+- `TOTK_ANDROID_STORAGE=<file>` still backs the optional `fsp-srv`
+  `OpenDataStorageByCurrentProcess` diagnostic path.
 
 ## Android-specific notes
 
@@ -84,8 +87,9 @@ Expected results on an arm64 Android device:
 
 ## Next
 
-1. Finish the `fsp-srv` file-system protocol (`IFileSystem`/`IFile` objects)
-   and point `IStorage` at the extracted RomFS/save data.
+1. Finish the optional `fsp-srv` file-system protocol (`IFileSystem`/`IFile`
+   objects) and point `IStorage` at the extracted RomFS/save data. The
+   production file path now uses the `nn::fs` host overrides instead.
 2. Continue past `nnMain` with the graphics/input/audio services; the first
    call after focus setup currently stops in the guest graphics setup.
 3. Port the remaining memory SVCs (`MapPhysicalMemory` details, stack moves,

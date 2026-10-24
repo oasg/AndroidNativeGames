@@ -9,6 +9,7 @@
 #include "sha256.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -328,17 +329,123 @@ static void loader_ready(void) {
     if (!inits_enabled()) _exit(0);
 }
 
+/* Use the host override when present; runtime_symbol() returns the guest SDK
+ * function, which would go through fsp-srv and defeat this probe. */
+static void *fs_entry(const char *name) {
+    if (getenv("TOTK_ANDROID_FS_BY_SERVICE")) return runtime_symbol(name);
+    void *p = runtime_override(name);
+    return p ? p : runtime_symbol(name);
+}
+
 static void fs_probe(void) {
-    uint64_t cache_size = 0;
-    int (*query_cache)(uint64_t *) = (int (*)(uint64_t *))runtime_symbol("_ZN2nn2fs22QueryMountRomCacheSizeEPm");
-    int (*mount_rom)(const char *, void *, uint64_t) = (int (*)(const char *, void *, uint64_t))runtime_symbol("_ZN2nn2fs8MountRomEPKcPvm");
-    need(query_cache && mount_rom, "nn::fs::MountRom symbols");
-    int qc = query_cache(&cache_size);
-    fprintf(stderr, "[totk-android] QueryMountRomCacheSize -> %d size=%#llx\n", qc, (unsigned long long)cache_size);
-    if (qc) return;
-    void *cache = calloc(1, (size_t)cache_size);
-    need(cache != NULL, "RomFS cache allocation");
-    fprintf(stderr, "[totk-android] MountRom -> %d\n", mount_rom("rom", cache, cache_size));
+    const char *profile = getenv("TOTK_ANDROID_PROFILE");
+    if (!profile) profile = getenv("TOTK_ANDROID_FSROOT");
+    if (!profile) profile = "/data/local/tmp/totk-android/user-data";
+    mkdir(profile, 0777);
+
+    uint8_t *sdk = runtime_module_base("sdk");
+    if (sdk) fprintf(stderr, "[totk-android] fs state=%u flag=%u\n", sdk[0xc688c0], sdk[0xc688d0]);
+    void (*fs_init)(void) = (void (*)(void))runtime_symbol("_ZN2nn2fs24InitializeForApplicationEv");
+    if (fs_init && sdk && sdk[0xc688c0] != 1 && !sdk[0xc688d0]) {
+        fprintf(stderr, "[totk-android] InitializeForApplication -> %d\n", ((int (*)(void))fs_init)());
+    }
+    int (*mount_temp)(const char *) = (int (*)(const char *))fs_entry("_ZN2nn2fs21MountTemporaryStorageEPKc");
+    int (*mount_save)(const char *, const uint64_t *) = (int (*)(const char *, const uint64_t *))fs_entry("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE");
+    int (*mount_rom)(const char *, void *, uint64_t) = (int (*)(const char *, void *, uint64_t))fs_entry("_ZN2nn2fs8MountRomEPKcPvm");
+    int (*create_file)(const char *, int64_t) = (int (*)(const char *, int64_t))fs_entry("_ZN2nn2fs10CreateFileEPKcl");
+    int (*delete_file)(const char *) = (int (*)(const char *))fs_entry("_ZN2nn2fs10DeleteFileEPKc");
+    int (*write_file)(uint64_t, int64_t, const void *, uint64_t, const int32_t *) = (int (*)(uint64_t, int64_t, const void *, uint64_t, const int32_t *))fs_entry("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE");
+    int (*commit)(const char *) = (int (*)(const char *))fs_entry("_ZN2nn2fs6CommitEPKc");
+    int (*open_file)(uint64_t *, const char *, int) = (int (*)(uint64_t *, const char *, int))fs_entry("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci");
+    int (*get_size)(int64_t *, uint64_t) = (int (*)(int64_t *, uint64_t))fs_entry("_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE");
+    int (*read_file)(uint64_t *, uint64_t, int64_t, void *, uint64_t) = (int (*)(uint64_t *, uint64_t, int64_t, void *, uint64_t))fs_entry("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm");
+    int (*open_dir)(uint64_t *, const char *, int) = (int (*)(uint64_t *, const char *, int))fs_entry("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci");
+    int (*read_dir)(int64_t *, void *, uint64_t, int64_t) = (int (*)(int64_t *, void *, uint64_t, int64_t))fs_entry("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl");
+    void (*close_file)(uint64_t) = (void (*)(uint64_t))fs_entry("_ZN2nn2fs9CloseFileENS0_10FileHandleE");
+    void (*close_dir)(uint64_t) = (void (*)(uint64_t))fs_entry("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE");
+    need(mount_temp && open_file && get_size && read_file && open_dir && read_dir, "nn::fs probe symbols");
+
+    int mr = mount_temp("temp");
+    fprintf(stderr, "[totk-android] MountTemporaryStorage -> %d\n", mr);
+    need(mr == 0, "MountTemporaryStorage");
+
+    /* mount_temp() creates/cleans <profile>/temp, so write the file afterwards. */
+    char temp_dir[PATH_MAX], test_path[PATH_MAX];
+    snprintf(temp_dir, sizeof temp_dir, "%s/temp", profile);
+    snprintf(test_path, sizeof test_path, "%s/test.txt", temp_dir);
+    int fd = open(test_path, O_CREAT | O_TRUNC | O_WRONLY, 0666);
+    need(fd >= 0, "create fs probe file");
+    need(write(fd, "hello", 5) == 5, "write fs probe file");
+    close(fd);
+
+    uint64_t file = 0;
+    int fr = open_file(&file, "temp:/test.txt", 1);
+    fprintf(stderr, "[totk-android] OpenFile -> %d handle=%#llx\n", fr, (unsigned long long)file);
+    need(fr == 0, "OpenFile temp:/test.txt");
+    int64_t size = -1;
+    int sr = get_size(&size, file);
+    fprintf(stderr, "[totk-android] GetFileSize -> %d size=%lld\n", sr, (long long)size);
+    need(sr == 0 && size == 5, "GetFileSize temp:/test.txt");
+    char data[32] = {0};
+    uint64_t read = 0;
+    int rr = read_file(&read, file, 0, data, sizeof data);
+    fprintf(stderr, "[totk-android] ReadFile -> %d read=%llu data=%.*s\n",
+            rr, (unsigned long long)read, (int)(read < sizeof data ? read : sizeof data), data);
+    need(rr == 0 && read == 5 && !memcmp(data, "hello", 5), "ReadFile temp:/test.txt");
+    if (close_file) close_file(file);
+    uint64_t dir = 0;
+    int dr = open_dir(&dir, "temp:/", 3);
+    fprintf(stderr, "[totk-android] OpenDirectory -> %d handle=%#llx\n", dr, (unsigned long long)dir);
+    need(dr == 0, "OpenDirectory temp:/");
+    uint8_t entries[0x310 * 8];
+    int64_t count = 0;
+    int er = read_dir(&count, entries, dir, 8);
+    fprintf(stderr, "[totk-android] ReadDirectory -> %d count=%lld\n", er, (long long)count);
+    need(er == 0 && count >= 1, "ReadDirectory temp:/");
+    if (close_dir) close_dir(dir);
+    if (mount_save && create_file && write_file && commit) {
+        const uint64_t uid[2] = {0, 0};
+        int mr = mount_save("save", uid);
+        fprintf(stderr, "[totk-android] MountSaveData -> %d\n", mr);
+        need(mr == 0, "MountSaveData save");
+        if (delete_file) delete_file("save:/probe.sav");   /* keep the probe repeatable */
+        int cr = create_file("save:/probe.sav", 4);
+        fprintf(stderr, "[totk-android] CreateFile save:/probe.sav -> %d\n", cr);
+        need(cr == 0, "CreateFile save:/probe.sav");
+        uint64_t save_file = 0;
+        int ofr = open_file(&save_file, "save:/probe.sav", 2);
+        fprintf(stderr, "[totk-android] OpenFile save:/probe.sav -> %d handle=%#llx\n",
+                ofr, (unsigned long long)save_file);
+        need(ofr == 0, "OpenFile save:/probe.sav");
+        int wr = write_file(save_file, 0, "save", 4, NULL);
+        fprintf(stderr, "[totk-android] WriteFile save:/probe.sav -> %d\n", wr);
+        need(wr == 0, "WriteFile save:/probe.sav");
+        if (close_file) close_file(save_file);
+        int comr = commit("save");
+        fprintf(stderr, "[totk-android] Commit save -> %d\n", comr);
+        need(comr == 0, "Commit save");
+    }
+    if (getenv("TOTK_ANDROID_ROMFS") && mount_rom) {
+        int mrr = mount_rom("rom", NULL, 0);
+        fprintf(stderr, "[totk-android] MountRom -> %d\n", mrr);
+        need(mrr == 0, "MountRom rom");
+        uint64_t rom_file = 0;
+        int ror = open_file(&rom_file, "rom:/hello.txt", 1);
+        fprintf(stderr, "[totk-android] OpenFile rom:/hello.txt -> %d handle=%#llx\n",
+                ror, (unsigned long long)rom_file);
+        need(ror == 0, "OpenFile rom:/hello.txt");
+        char rom_data[32] = {0};
+        uint64_t rom_read = 0;
+        int rrr = read_file(&rom_read, rom_file, 0, rom_data, sizeof rom_data);
+        fprintf(stderr, "[totk-android] ReadFile rom:/hello.txt -> %d read=%llu data=%.*s\n",
+                rrr, (unsigned long long)rom_read,
+                (int)(rom_read < sizeof rom_data ? rom_read : sizeof rom_data), rom_data);
+        need(rrr == 0 && rom_read == 10 && !memcmp(rom_data, "hello-rom\n", 10), "ReadFile rom:/hello.txt");
+        if (close_file) close_file(rom_file);
+    }
+    printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"fs\",\"read\":%llu,\"entries\":%lld}\n",
+           (unsigned long long)read, (long long)count);
+    fflush(stdout);
 }
 
 static void module_inits(void) {

@@ -166,14 +166,14 @@ Verified on an arm64 Android 17 device (4 KiB pages):
 - `boot-sdk`: `nn::init::Start` reaches the `loader-ready` callback.
 - CMIF domain sessions are implemented (`ConvertCurrentObjectToDomain`, domain
   request/response headers, object tables, implicit object 1).
-- `lm` is a registered service; `fsp-srv` answers the process/access-log
-  setup commands and exposes a host-file `IStorage` through
-  `OpenDataStorageByCurrentProcess` (`Read`/`GetSize`). The higher
-  `IFileSystem`/`IFile` protocol is the next step.
+- `lm` is a registered service; file I/O uses the macOS-style `nn::fs` host
+  overrides (`fs_host_android.c`, directory-backed `romfs_android.c`). The
+  `fsp-srv` service and host-file `IStorage` remain available as an optional
+  diagnostic path; the full `IFileSystem`/`IFile` protocol is not needed for
+  the production file path.
 - `TOTK_ANDROID_INITS=1 boot-sdk` runs `main`, `subsdk0` and `sdk` `DT_INIT`
   and reaches the original `nnMain` entry, where the probe stops. The next
-  HLE milestone is the `fsp-srv` storage protocol and the graphics/input/audio
-  services after `nnMain`.
+  HLE milestone is the graphics/input/audio services after `nnMain`.
 
 The Android host uses native TLS (`-fno-emulated-tls`, 64-byte-aligned
 `__thread` variables), maps the image `R-X` first and makes data/key page
@@ -183,9 +183,9 @@ writable afterwards, and restores guest x18 in the gate.
 
 - TOTK 1.0.0 only.
 - The Android host loader, gate, HLE-stack, SDK-start probe, CMIF domain
-  layer and module `DT_INIT`/`nnMain` milestone live in `games/totk/android/`;
-  the full `fsp-srv` storage protocol, graphics, audio, input, packaging and
-  gameplay remain out of scope.
+  layer, `nn::fs` host overrides and module `DT_INIT`/`nnMain` milestone live
+  in `games/totk/android/`; the optional full `fsp-srv` file-system protocol,
+  graphics, audio, input, packaging and gameplay remain out of scope.
 - `svc`/timer gate semantics are not executed offline; only their structure is
   checked. On-device probes cover the timer gate and SDK start.
 - The Android host must close the x18/SCS and `TPIDRRO_EL0` gaps described

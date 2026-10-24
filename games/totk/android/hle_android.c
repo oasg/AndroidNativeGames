@@ -87,7 +87,7 @@ void *runtime_override(const char *name) {
     };
     for (size_t i = 0; i < sizeof map / sizeof *map; i++)
         if (!strcmp(name, map[i].name)) return map[i].fn;
-    return NULL;
+    return runtime_fs_override(name);   /* nn::fs runs on the host, not through fsp-srv */
 }
 
 /* The milestone stops at the original nnMain entry.  TOTK_ANDROID_RUN_NNMAIN=1
