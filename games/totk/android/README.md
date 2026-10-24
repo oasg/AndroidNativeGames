@@ -49,6 +49,43 @@ adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android
 TOTK_ANDROID_TRACE_SVC=1 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android boot-sdk
 ```
 
+### Host-call and IPC tracing
+
+```sh
+TOTK_ANDROID_INITS=1 TOTK_ANDROID_RUN_NNMAIN=1 \
+TOTK_ANDROID_TRACE_HLE=2 TOTK_IPC_TRACE=1 \
+adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android boot-sdk
+```
+
+- `TOTK_ANDROID_TRACE_HLE=1` counts every wrapped HLE call and prints a
+  summary sorted by call count at exit.
+- `=2` also prints the first call of each function with its time, guest thread
+  handle and name (`[hle]    0.123 h=0x... nn::oe::Initialize`).
+- `=0` counts quietly and prints only the exit summary.
+- While tracing is on, the last wrapped call is remembered so a crash report
+  can name it.
+- `TOTK_IPC_TRACE=1` prints one line per request:
+  `[ipc] service=lm command=0 object=1 type=6 data=8 result=0`, plus lines for
+  opened/unknown `sm:` services, unknown domain objects and unknown commands.
+
+### Crash report
+
+`SIGSEGV`/`SIGBUS`/`SIGILL` now print module-relative `pc` and `lr`, the guest
+frame-pointer chain, the last HLE call, the last IPC request and the guest
+thread handle:
+
+```
+[crash] sig=11 pc=main+0xeba4f4 lr=main+0x... fault=0x48 sp=0x... x8=0
+[crash] frame 0: fp=0x... lr=main+0x...
+[crash] frame 1: fp=0x... lr=main+0x...
+[crash] last HLE: nn::os::GetTlsValue
+[crash] last IPC: service=lm command=0 object=1 type=6 data=8 result=0
+[crash] guest thread handle=0x...
+```
+
+See `docs/android-hle-phase0.md` for the first `nnMain` gap and the next HLE
+service list.
+
 Expected results on an arm64 Android device:
 
 - `probe`: 4 threads × 1000 `GetSystemTick` calls, timer gate count 4000.
