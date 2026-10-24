@@ -5,6 +5,7 @@
 #include "runtime.h"
 #include "ipc.h"
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,58 @@ static Service services[32];
 static unsigned nservices;
 static __thread uint64_t trace_fp, trace_lr;   /* guest frame of the current request, for failure reports */
 static pthread_mutex_t registry = PTHREAD_MUTEX_INITIALIZER;
+
+/* TOTK_IPC_TRACE=1 logs one line per request:
+ *   [ipc] service=lm command=0 object=1 type=6 data=8 result=0
+ * The same record is kept for the crash handler even when tracing is off. */
+static RuntimeIpcRecord ipc_last;
+static _Atomic unsigned ipc_last_seq;
+static pthread_mutex_t ipc_last_lock = PTHREAD_MUTEX_INITIALIZER;
+static int ipc_trace = -1;
+
+static int ipc_trace_enabled(void) {
+    int v = __atomic_load_n(&ipc_trace, __ATOMIC_RELAXED);
+    if (v < 0) {
+        const char *e = getenv("TOTK_IPC_TRACE");
+        v = e && *e && strcmp(e, "0") ? 1 : 0;
+        __atomic_store_n(&ipc_trace, v, __ATOMIC_RELAXED);
+    }
+    return v;
+}
+
+static void ipc_record(const IpcSession *s, const IpcRequest *rq, uint32_t object, uint32_t result) {
+    RuntimeIpcRecord rec;
+    memset(&rec, 0, sizeof rec);
+    rec.valid = 1;
+    snprintf(rec.service, sizeof rec.service, "%s", s && s->name ? s->name : "?");
+    rec.command = rq ? rq->cmd : 0;
+    rec.object = object;
+    rec.type = rq ? rq->type : 0;
+    rec.data_size = rq ? rq->data_size : 0;
+    rec.result = result;
+    pthread_mutex_lock(&ipc_last_lock);
+    unsigned seq = atomic_load_explicit(&ipc_last_seq, memory_order_relaxed);
+    atomic_store_explicit(&ipc_last_seq, seq + 1, memory_order_relaxed);
+    memcpy(&ipc_last, &rec, sizeof rec);
+    atomic_store_explicit(&ipc_last_seq, seq + 2, memory_order_release);
+    pthread_mutex_unlock(&ipc_last_lock);
+    if (!ipc_trace_enabled()) return;
+    fprintf(stderr, "[ipc] service=%s command=%u object=%u type=%u data=%u result=%u\n",
+            rec.service, rec.command, rec.object, rec.type, rec.data_size, rec.result);
+}
+
+int runtime_ipc_last(RuntimeIpcRecord *out) {
+    if (!out) return 0;
+    for (int tries = 0; tries < 4; tries++) {
+        unsigned a = atomic_load_explicit(&ipc_last_seq, memory_order_acquire);
+        if (a & 1u) continue;
+        memcpy(out, &ipc_last, sizeof *out);
+        unsigned b = atomic_load_explicit(&ipc_last_seq, memory_order_acquire);
+        if (a == b) return out->valid;
+    }
+    memset(out, 0, sizeof *out);
+    return 0;
+}
 
 void runtime_ipc_register(const char *name, IpcHandler handler, IpcOpen open, void (*close)(void *)) {
     pthread_mutex_lock(&registry);
@@ -107,6 +160,9 @@ void ipc_out(IpcResponse *rs, const void *p, uint32_t n) {
     memcpy(rs->data + rs->data_size, p, n); rs->data_size += n;
 }
 _Noreturn void ipc_unimplemented(const IpcSession *s, const IpcRequest *rq) {
+    if (ipc_trace_enabled())
+        fprintf(stderr, "[ipc] unknown command service=%s command=%u type=%u data=%u\n",
+                s->name, rq->cmd, rq->type, rq->data_size);
     fprintf(stderr, "[totk-ipc] %s: command %u not implemented (type %u, data %u bytes, x%u a%u b%u w%u c%u)\n",
             s->name, rq->cmd, rq->type, rq->data_size, rq->nx, rq->na, rq->nb, rq->nw, rq->nc);
     runtime_trace_guest(trace_fp, trace_lr);
@@ -193,6 +249,9 @@ static void control(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
         return;
     default:
         fprintf(stderr, "[totk-ipc] %s: control command %u not implemented\n", s->name, rq->cmd);
+        if (ipc_trace_enabled())
+            fprintf(stderr, "[ipc] unknown command service=%s command=%u type=%u\n",
+                    s->name, rq->cmd, rq->type);
         runtime_fail("IPC control command not implemented");
     }
 }
@@ -207,6 +266,7 @@ static void dispatch(IpcSession *s, uint32_t *m) {
     IpcResponse rs; memset(&rs, 0, sizeof rs);
     if (rq.type == T_CLOSE || rq.type == T_TIPC_CLOSE) return;
     int tipc = rq.type >= T_TIPC_BASE;
+    uint32_t object_id = 0;
     const uint8_t *bytes = (const uint8_t *)words, *end = bytes + ndata * 4;
     if (tipc) { rq.cmd = rq.type - T_TIPC_BASE; rq.data = bytes; rq.data_size = (uint32_t)(end - bytes); }
     else if (rq.type == T_REQUEST || rq.type == T_REQUEST_CTX || rq.type == T_CONTROL || rq.type == T_CONTROL_CTX) {
@@ -221,7 +281,6 @@ static void dispatch(IpcSession *s, uint32_t *m) {
             domain_convert(s);
             domain_request = 1;
         }
-        uint32_t object_id = 0;
         if (domain_request) {
             /* CmifDomainInHeader: type, num_in_objects, data_size, object_id, padding, token */
             unsigned dtype = d[0], nin = d[1];
@@ -230,8 +289,12 @@ static void dispatch(IpcSession *s, uint32_t *m) {
             if (dtype == 2) {                                              /* domain Close */
                 if (!domain_remove(s->domain, object_id)) {
                     fprintf(stderr, "[totk-ipc] %s: close unknown domain object %u\n", s->name, object_id);
+                    if (ipc_trace_enabled())
+                        fprintf(stderr, "[ipc] unknown object service=%s object=%u command=close\n",
+                                s->name, object_id);
                     rs.result = IPC_RESULT_UNKNOWN_COMMAND;
                 }
+                ipc_record(s, &rq, object_id, rs.result);
                 respond(m, 0, 1, &rs);
                 return;
             }
@@ -254,7 +317,11 @@ static void dispatch(IpcSession *s, uint32_t *m) {
             IpcObject *obj = domain_find(s->domain, object_id);
             if (!obj) {
                 fprintf(stderr, "[totk-ipc] %s: unknown domain object %u command %u\n", s->name, object_id, rq.cmd);
+                if (ipc_trace_enabled())
+                    fprintf(stderr, "[ipc] unknown object service=%s object=%u command=%u\n",
+                            s->name, object_id, rq.cmd);
                 rs.result = IPC_RESULT_UNKNOWN_COMMAND;
+                ipc_record(s, &rq, object_id, rs.result);
                 respond(m, 0, 1, &rs);
                 return;
             }
@@ -262,6 +329,7 @@ static void dispatch(IpcSession *s, uint32_t *m) {
             view.name = obj->name; view.handler = obj->handler; view.state = obj->state;
             view.close = NULL; view.self_id = obj->id;
             obj->handler(&view, &rq, &rs);
+            ipc_record(&view, &rq, object_id, rs.result);
             respond(m, 0, 1, &rs);
             return;
         }
@@ -284,6 +352,7 @@ static void dispatch(IpcSession *s, uint32_t *m) {
     }
     if (rq.type == T_CONTROL || rq.type == T_CONTROL_CTX) control(s, &rq, &rs);
     else s->handler(s, &rq, &rs);
+    ipc_record(s, &rq, object_id, rs.result);
     respond(m, tipc, 0, &rs);
 }
 
@@ -296,6 +365,9 @@ static void android_stub_service(IpcSession *s, const IpcRequest *rq, IpcRespons
     if (logged++ < 200)
         fprintf(stderr, "[totk-ipc] stub service %s command %u (type %u, %u bytes)\n",
                 s->name, rq->cmd, rq->type, rq->data_size);
+    if (ipc_trace_enabled())
+        fprintf(stderr, "[ipc] unknown command service=%s command=%u type=%u\n",
+                s->name, rq->cmd, rq->type);
     rs->result = 0;
 }
 #endif
@@ -311,7 +383,12 @@ static void sm(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
 #ifdef __ANDROID__
         if (!found) {
             fprintf(stderr, "[totk-ipc] sm: opening stub service \"%s\"\n", name);
-            rs->move[rs->nmove++] = runtime_ipc_new_session("stub", android_stub_service, NULL, NULL);
+            if (ipc_trace_enabled())
+                fprintf(stderr, "[ipc] sm unknown service \"%s\" (stubbed)\n", name);
+            /* Keep the requested name so later request lines name the real
+               missing service instead of the generic "stub". */
+            char *copy = strdup(name);
+            rs->move[rs->nmove++] = runtime_ipc_new_session(copy ? copy : "stub", android_stub_service, NULL, NULL);
             return;
         }
 #else
@@ -319,6 +396,7 @@ static void sm(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
 #endif
         rs->move[rs->nmove++] = runtime_ipc_new_session(found->name, found->handler, found->open ? found->open() : NULL, found->close);
         fprintf(stderr, "[totk-ipc] opened service %s\n", found->name);
+        if (ipc_trace_enabled()) fprintf(stderr, "[ipc] sm opened service=%s\n", found->name);
         return;
     }
     default: ipc_unimplemented(s, rq);

@@ -88,3 +88,12 @@ void runtime_ipc_tmem_closed(void *tmem);
 typedef struct { uint64_t addr, size; uint32_t perm; } IpcTransferMemory;
 
 #define IPC_RESULT_UNKNOWN_COMMAND 0xf601u   /* sf: unknown command (module 10, description 123) */
+
+/* Last request seen by the dispatcher, for the crash report (ipc.c). */
+typedef struct {
+    int valid;
+    char service[32];
+    uint32_t command, object, type, data_size, result;
+} RuntimeIpcRecord;
+
+int runtime_ipc_last(RuntimeIpcRecord *out);   /* 1 when a request was recorded */
