@@ -50,7 +50,9 @@ def header(out_dir, mod):
     h = {}
     for line in open(f'{out_dir}/{mod}.fixups.tsv'):
         if not line.startswith('#'): break
-        k, v = line[1:].split(); h[k] = int(v, 0)      # 0x 开头为偏移，十进制为槽号 | A 0x prefix means an offset, decimal means a slot number
+        k, v = line[1:].split()
+        try: h[k] = int(v, 0)      # 0x 开头为偏移，十进制为槽号 | A 0x prefix means an offset, decimal means a slot number
+        except ValueError: h[k] = v  # Android/darwin target tags are strings.
     return h
 
 def mod0(img):

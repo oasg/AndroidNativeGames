@@ -31,6 +31,7 @@
 #  ⑪ Branch gates introduced by cuts (hle.h registry 「分支门」(branch gate) rows): block = template word for word, x8 restored on both paths, matches gates.tsv
 #  ⑥ Thread slots: the four key numbers in the header are mutually distinct and < 512; every mrs xN, tpidrro_el0 in the patch area is followed (skipping adrp/add that do not write xN) by ldr/str xM,[xN,#key number×8]
 import sys, os, re, struct, subprocess, tempfile
+import capstone
 sys.path.insert(0, os.path.dirname(__file__))
 import nsoimg
 DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # 工作区根目录（游戏文件、产物、运行现场都在它下面） | Workspace root (game files, build outputs and run artifacts are all under it)
@@ -39,25 +40,49 @@ LLVM = os.environ.get('LLVM_BIN', '/opt/homebrew/opt/llvm@23/bin')
 out_dir, mod, nso = sys.argv[1:4]
 orig = nsoimg.load(nso)
 h = nsoimg.header(out_dir, mod)
+TARGET = h.get('TARGET', 'darwin')
+assert TARGET in ('darwin', 'android'), TARGET
 PO, TE = h['PATCH_OFF'], h['TEXT_END']
 pat = open(f'{out_dir}/{mod}.patched.bin', 'rb').read()
 W = lambda b, o: struct.unpack_from('<I', b, o)[0]
 fails = []
+def func_starts():
+    if h.get('FUNCS'): return {int(x, 16) for x in h['FUNCS'].split(',') if x}
+    return set(nsoimg.func_starts(orig, TE))
 def bad(msg):
     fails.append(msg)
     if len(fails) <= 30: print('FAIL', msg)
 
+def elf_wrap(blob):
+    """Minimal ELF64/AArch64 wrapper around raw code at address 0 (no llvm-objcopy needed)."""
+    shstr = b'\0.text\0.shstrtab\0'
+    off = 0x1000
+    shoff = off + ((len(blob) + 7) & ~7)
+    ehdr = struct.pack('<16sHHIQQQIHHHHHH',
+                       b'\x7fELF' + bytes([2, 1, 1, 0, 0]) + bytes(7),
+                       1, 183, 1, 0, 0, shoff, 0, 64, 0, 0, 64, 3, 2)
+    sh = b''
+    sh += struct.pack('<IIQQQQIIQQ', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    sh += struct.pack('<IIQQQQIIQQ', 1, 1, 6, 0, off, len(blob), 0, 0, 4, 0)
+    sh += struct.pack('<IIQQQQIIQQ', 7, 3, 0, 0, shoff + 3 * 64, len(shstr), 0, 0, 1, 0)
+    out = bytearray(shoff + 3 * 64 + len(shstr))
+    out[0:64] = ehdr
+    out[off:off + len(blob)] = blob
+    out[shoff:shoff + 3 * 64] = sh
+    out[shoff + 3 * 64:shoff + 3 * 64 + len(shstr)] = shstr
+    return bytes(out)
+
 def llvm_dis(blob, base):
     """按原始字节反汇编，返回相关行 {偏移: 小写指令文本}。 | Disassemble from raw bytes and return the relevant lines {offset: lowercase instruction text}."""
     with tempfile.TemporaryDirectory() as td:
-        b, e = os.path.join(td, 'x.bin'), os.path.join(td, 'x.elf')
-        open(b, 'wb').write(blob)
-        subprocess.run([f'{LLVM}/llvm-objcopy', '-I', 'binary', '-O', 'elf64-littleaarch64',
-                        '--rename-section', '.data=.text,code', b, e], check=True)
+        e = os.path.join(td, 'x.elf')
+        open(e, 'wb').write(elf_wrap(blob))
         # 只留可能相关的行（x18/w18、tpidr、svc、cnt?ct），几百万行的筛选交给 grep
+        # Android does not virtualize x18, so it is not part of the denominator.
         # Keep only potentially relevant lines (x18/w18, tpidr, svc, cnt?ct); filtering millions of lines is left to grep
+        pattern = r'[xw]18|tpidr|svc|cnt[pv]ct' if TARGET == 'darwin' else r'tpidr|svc|cnt[pv]ct'
         od = subprocess.Popen([f'{LLVM}/llvm-objdump', '-d', '--no-show-raw-insn', e], stdout=subprocess.PIPE)
-        r = subprocess.run(['/usr/bin/grep', '-iE', r'[xw]18|tpidr|svc|cnt[pv]ct'], stdin=od.stdout, capture_output=True, text=True)
+        r = subprocess.run(['/usr/bin/grep', '-iE', pattern], stdin=od.stdout, capture_output=True, text=True)
         od.stdout.close(); assert od.wait() == 0
     out = {}
     for line in r.stdout.splitlines():
@@ -150,7 +175,7 @@ for a, n in _hostcall.items():
         elif t != int(mt[1], 16): bad(f'宿主调用 svc #{n:#x} {a:#x}：原 bl 目标 {t:#x} ≠ 登记 {mt[1]}')
         if len(nbw) != 4: bad(f'宿主调用 svc #{n:#x} {a:#x}：调用点形剪口只许换这一条指令')
     elif '入口' in form:
-        if a not in set(nsoimg.func_starts(orig, TE)): bad(f'宿主调用 svc #{n:#x} {a:#x}：登记为入口形，不是 eh_frame 函数入口')
+        if a not in func_starts(): bad(f'宿主调用 svc #{n:#x} {a:#x}：登记为入口形，不是 eh_frame 函数入口')
         if nbw[4:8] != (0xD65F03C0).to_bytes(4, 'little'): bad(f'宿主调用 svc #{n:#x} {a:#x}：入口形新字节不是 svc ; ret')
     else: bad(f'宿主调用 svc #{n:#x}：登记表形态认不出（须含「bl 0x目标」或「入口」）：{form}')
 if cutb & {a + i for a in list(sites) + list(inwin) if a not in _hostcall for i in range(4)}: bad('剪口与改写点 / 窗口重叠')
@@ -219,7 +244,7 @@ def cached_dis(blob):
 D = cached_dis(orig[:TE])
 ind = {}
 for o, t in D.items():
-    if RX18.search(t): ind[o] = 'x18'
+    if TARGET == 'darwin' and RX18.search(t): ind[o] = 'x18'
     k = sysk(t)
     if k: ind[o] = k
 miss = sorted(o for o in ind if o not in sites and o not in inwin)
@@ -233,7 +258,12 @@ nwin_ref = sum(1 for o in ind if o in inwin)
 # ④ 补丁区干净
 # ④ Patch area is clean
 P = llvm_dis(pat[PO:], PO)
-left = sorted(o for o, t in P.items() if RX18.search(t) or sysk(t) not in (None, 'tpidrro_r'))
+if TARGET == 'darwin':
+    left = sorted(o for o, t in P.items() if RX18.search(t) or sysk(t) not in (None, 'tpidrro_r'))
+else:
+    # Android patch blocks use mrs tpidr_el0 as the slot base; no other
+    # system-register access, svc, counter or x18 may survive in the patch area.
+    left = sorted(o for o, t in P.items() if RX18.search(t) or sysk(t) not in (None, 'tpidr_r'))
 if left: bad(f'补丁区残留 x18/系统寄存器/svc：{len(left)} 例 {[(hex(x), P[x]) for x in left[:5]]}')
 
 # ⑤ 宿主门
@@ -251,6 +281,37 @@ def keyseq(at):
         return None
     d = q[2].operands[1].mem.disp
     return (q[3].address + 4, d // 8) if d % 8 == 0 and 0 <= d // 8 < 8 else None
+
+def keyref_android(at):
+    """adrp xR, keypage ; ldr xR,[xR,#idx*8] -> (next address, index)."""
+    q = list(_md.disasm(pat[at:at + 12], at))
+    if len(q) < 2 or q[0].mnemonic != 'adrp' or q[0].operands[1].imm != h['KEY_PAGE_OFF'] \
+            or q[1].mnemonic != 'ldr' or q[1].operands[1].mem.base != q[0].operands[0].reg:
+        return None
+    d = q[1].operands[1].mem.disp
+    return (q[1].address + 4, d // 8) if d % 8 == 0 and 0 <= d // 8 < 8 else None
+
+def slotseq_android(at):
+    """mrs xN,tpidr_el0 ; adrp ; ldr [KCTX] ; add ; ldr [xN] ; add #idx*8 -> (slot addr, KCTX index, slot index)."""
+    q = list(_md.disasm(pat[at:at + 28], at))
+    if len(q) < 6 or q[0].mnemonic != 'mrs' or 'tpidr_el0' not in q[0].op_str:
+        return None
+    kr = keyref_android(at + 4)
+    if not kr: return None
+    after, kidx = kr
+    if after != at + 12: return None
+    if q[3].mnemonic != 'add' or q[3].operands[0].reg != q[0].operands[0].reg \
+            or q[3].operands[1].reg != q[0].operands[0].reg or q[3].operands[2].reg != q[1].operands[0].reg:
+        return None
+    if q[4].mnemonic != 'ldr' or q[4].operands[0].reg != q[0].operands[0].reg \
+            or q[4].operands[1].mem.base != q[0].operands[0].reg:
+        return None
+    if q[5].mnemonic != 'add' or q[5].operands[0].reg != q[0].operands[0].reg \
+            or q[5].operands[1].reg != q[0].operands[0].reg or q[5].operands[2].type != capstone.arm64.ARM64_OP_IMM:
+        return None
+    imm = q[5].operands[2].imm
+    if imm % 8: return None
+    return (q[5].address + 4, kidx, imm // 8)
 # C windows intentionally change the call word as well as the preceding head.
 # Inspect the actual decoded sequence, including the original link-producing PC.
 for prefix, call in calls.items():
@@ -293,6 +354,17 @@ def paramseq(at, r):
         return None
     d = q[3].operands[1].mem.disp
     return (q[6].address + 4, d // 8)
+
+def paramseq_android(at, r, target):
+    q = list(_md.disasm(pat[at:at + 12], at))
+    if len(q) < 3 or q[0].mnemonic != 'adrp' or q[0].operands[1].imm != h['KEY_PAGE_OFF'] \
+            or q[1].mnemonic != 'ldr' or q[1].operands[0].reg != q[0].operands[0].reg \
+            or q[1].operands[1].mem.base != q[0].operands[0].reg:
+        return None
+    d = q[1].operands[1].mem.disp
+    if d % 8: return None
+    if q[2].mnemonic != 'b' or q[2].operands[0].imm != target: return None
+    return (q[2].address, d // 8)
 gates = {}
 for l in open(f'{out_dir}/{mod}.gates.tsv'):
     r, k, arg, oa = l.split(); gates[int(r, 16)] = (k, int(arg), int(oa, 16))
@@ -304,19 +376,28 @@ gsites = sorted(a for a, k in sites.items() if k in ('svc', 'cntpct', 'cntvct'))
 seen = set()
 for a in gsites:
     s = btarget(a); ow = W(orig, a) if a not in _hostcall else (0xD4000001 | _hostcall[a] << 5)
-    ks = keyseq(s + 4)
-    if W(pat, s) != 0xA9BF7BFD or not ks or ks[1] != KEY.get('KGATE') \
-            or W(pat, ks[0]) & 0xFFC00000 != 0xF9400000 or W(pat, ks[0] + 4) != LDR_X29_SP or W(pat, ks[0] + 8) != 0xD63F03C0 \
-            or W(pat, ks[0] + 12) != 0xA8C17BFD or W(pat, ks[0] + 16) != B(ks[0] + 16, a + 4):
-        bad(f'门块不符键页模板 {a:#x}'); continue
+    if TARGET == 'android':
+        kr = keyref_android(s + 4)
+        if W(pat, s) != 0xA9BF7BFD or not kr or kr[1] != KEY.get('KGATE') \
+                or W(pat, s + 12) != 0xD63F03C0 or W(pat, s + 16) != 0xA8C17BFD \
+                or btarget(s + 20) != a + 4:
+            bad(f'Android 门块不符模板 {a:#x}'); continue
+        ret = s + 16
+    else:
+        ks = keyseq(s + 4)
+        if W(pat, s) != 0xA9BF7BFD or not ks or ks[1] != KEY.get('KGATE') \
+                or W(pat, ks[0]) & 0xFFC00000 != 0xF9400000 or W(pat, ks[0] + 4) != LDR_X29_SP or W(pat, ks[0] + 8) != 0xD63F03C0 \
+                or W(pat, ks[0] + 12) != 0xA8C17BFD or W(pat, ks[0] + 16) != B(ks[0] + 16, a + 4):
+            bad(f'门块不符键页模板 {a:#x}'); continue
+        ret = ks[0] + 12
     arg = (ow >> 5) & 0xFFFF if sites[a] == 'svc' else ow & 31
-    g = gates.get(ks[0] + 12)
+    g = gates.get(ret)
     if g != (sites[a], arg, a): bad(f'gates.tsv 不符 {a:#x}：表 {g} 期望 {(sites[a], arg, a)}')
-    seen.add(ks[0] + 12)
+    seen.add(ret)
 # ⑦ 观测门
 # ⑦ Observation gates
 import bisect as _bs
-_starts = set(nsoimg.func_starts(orig, TE))
+_starts = func_starts()
 _busy = {a + i for a in list(sites) + list(inwin) for i in range(4)} | cutb
 for off, oid, ow, why in obs:
     if W(orig, off) != ow: bad(f'观测门 {off:#x} 原指令字不符：映像 {W(orig, off):08x} 登记 {ow:08x}'); continue
@@ -332,14 +413,23 @@ for off, oid, ow, why in obs:
     if set(range(off, off + 4)) & _busy: bad(f'观测门 {off:#x} 与改写点 / 窗口 / 剪口重叠')
     s_ = btarget(off)
     if s_ is None or not (PO <= s_ < len(pat)): bad(f'观测门头 {off:#x} 不是跳进补丁区的 B'); continue
-    ks = keyseq(s_ + 4)
-    if W(pat, s_) != 0xA9BF7BFD or not ks or ks[1] != KEY.get('KGATE') \
-            or W(pat, ks[0]) & 0xFFC00000 != 0xF9400000 or W(pat, ks[0] + 4) != LDR_X29_SP or W(pat, ks[0] + 8) != 0xD63F03C0 \
-            or W(pat, ks[0] + 12) != 0xA8C17BFD or W(pat, ks[0] + 16) != ow \
-            or W(pat, ks[0] + 20) != B(ks[0] + 20, off + 4):
-        bad(f'观测门块不符键页模板 {off:#x}'); continue
-    if gates.get(ks[0] + 12) != ('obs', oid, off): bad(f'观测门行不符 {off:#x}：表 {gates.get(ks[0] + 12)}')
-    seen.add(ks[0] + 12)
+    if TARGET == 'android':
+        kr = keyref_android(s_ + 4)
+        if W(pat, s_) != 0xA9BF7BFD or not kr or kr[1] != KEY.get('KGATE') \
+                or W(pat, s_ + 12) != 0xD63F03C0 or W(pat, s_ + 16) != 0xA8C17BFD \
+                or W(pat, s_ + 20) != ow or btarget(s_ + 24) != off + 4:
+            bad(f'Android 观测门块不符模板 {off:#x}'); continue
+        ret = s_ + 16
+    else:
+        ks = keyseq(s_ + 4)
+        if W(pat, s_) != 0xA9BF7BFD or not ks or ks[1] != KEY.get('KGATE') \
+                or W(pat, ks[0]) & 0xFFC00000 != 0xF9400000 or W(pat, ks[0] + 4) != LDR_X29_SP or W(pat, ks[0] + 8) != 0xD63F03C0 \
+                or W(pat, ks[0] + 12) != 0xA8C17BFD or W(pat, ks[0] + 16) != ow \
+                or W(pat, ks[0] + 20) != B(ks[0] + 20, off + 4):
+            bad(f'观测门块不符键页模板 {off:#x}'); continue
+        ret = ks[0] + 12
+    if gates.get(ret) != ('obs', oid, off): bad(f'观测门行不符 {off:#x}：表 {gates.get(ret)}')
+    seen.add(ret)
 # ⑪ 剪口引入的分支门（hle.h 登记表形态「分支门：x8≠0 跳 0x目标，否则执行原指令回 0x原处+4」）：原处换成 B 进补丁区，块逐字 =
 #   stp x8,xzr,[sp,#-16]! ; stp x29,x30,[sp,#-16]! ; 键页取 KGATE ; ldr x30,[x30] ; ldr x29,[sp] ; blr x30 ; ldp x29,x30 ; cbz w8,+12 ;
 #   ldp x8,xzr ; b 目标 ; ldp x8,xzr ; 原指令 ; b 原处+4 —— x8 两路都恢复为原值，宿主结果只用于选路；gates.tsv 记 (svc, 号, 原处)
@@ -365,26 +455,54 @@ if set(gates) != seen: bad(f'gates.tsv 有多余行 {len(set(gates) - seen)}')
 
 # ⑥ 线程槽
 # ⑥ Thread slots
-_base = {'K18', 'KTLS', 'KTLR', 'KGATE'}; _extra = set(KEY) - _base   # 额外键 = 参数门键（KRES* / KASPECT* …；改写器全局键表，三模块表头都列）：须是 K 开头大写名、键号低于基础四键 | Extra keys = parameter-gate keys (KRES* / KASPECT* ...; the rewriter's global key table, listed in the headers of all three modules): must be uppercase names starting with K, with key numbers below the four base keys
-if set(KEY) != {'K18', 'KTLS', 'KTLR', 'KGATE', 'KRES0', 'KRES1', 'KASPECT', 'KASPECTUI'} \
-        or not {k for *_, k in params} <= set(KEY) or set(KEY.values()) != set(range(8)):
-    bad(f'表头键页下标不合规：{KEY}（须含八个键且下标恰为 0..7）')
-kv = {v: k for k, v in KEY.items()}; nk = {}
-for o in range(PO, len(pat) - 4, 4):
-    w = W(pat, o)
-    if w & 0xFFFFFFE0 != 0xD53BD060: continue           # mrs xN, tpidrro_el0
-    n = w & 31; ks = keyseq(o); k = kv.get(ks[1]) if ks else None
-    if not ks or k is None:
-        bad(f'补丁区 {o:#x} 读 tpidrro 后不是键页间接槽序列'); continue
-    nk[k] = nk.get(k, 0) + 1
-expected = {}
-for kind in sites.values():
-    key = {'x18': 'K18', 'W': 'K18', 'C': 'K18', 'tpidr_r': 'KTLS', 'tpidr_w': 'KTLS', 'tpidrro_r': 'KTLR'}.get(kind)
-    if key: expected[key] = expected.get(key, 0) + 1
-expected['KGATE'] = len(gsites) + len(obs) + nbranch
-for _, _, _, key in params: expected[key] = expected.get(key, 0) + 1
-if any(nk.get(k, 0) != v for k, v in expected.items()) or any(k not in expected and v for k, v in nk.items()):
-    bad(f'键页槽访问计数不符：期望 {expected} 实际 {nk}')
+if TARGET == 'android':
+    if set(KEY) != {'KCTX', 'KTLS', 'KTLR', 'KGATE', 'KRES0', 'KRES1', 'KASPECT', 'KASPECTUI'} \
+            or not {k for *_, k in params} <= set(KEY) or set(KEY.values()) != set(range(8)):
+        bad(f'Android 键页下标不合规：{KEY}（须含八个键且下标恰为 0..7）')
+    kv = {v: k for k, v in KEY.items()}; nk = {}
+    for o in range(PO, len(pat) - 8, 4):
+        kr = keyref_android(o)
+        if not kr: continue
+        k = kv.get(kr[1])
+        if k is None: bad(f'补丁区 {o:#x} 键页下标 {kr[1]} 未登记'); continue
+        nk[k] = nk.get(k, 0) + 1
+    nslot = 0
+    for o in range(PO, len(pat) - 4, 4):
+        if W(pat, o) & 0xFFFFFFE0 != 0xD53BD040: continue   # mrs xN, tpidr_el0
+        ss = slotseq_android(o)
+        if not ss: bad(f'补丁区 {o:#x} 的 mrs tpidr_el0 不是 KCTX/GuestSlots 槽序列'); continue
+        if ss[1] != KEY['KCTX']: bad(f'补丁区 {o:#x} 槽基址不是 KCTX：{ss[1]}')
+        if ss[2] not in (KEY['KTLS'], KEY['KTLR']): bad(f'补丁区 {o:#x} GuestSlots 下标 {ss[2]} 不是 KTLS/KTLR')
+        nslot += 1
+    expected = {}
+    for kind in sites.values():
+        if kind in ('tpidr_r', 'tpidr_w', 'tpidrro_r'): expected['KCTX'] = expected.get('KCTX', 0) + 1
+    if nslot != expected.get('KCTX', 0): bad(f'Android 槽序列数 {nslot} ≠ tpidr 站点数 {expected.get("KCTX", 0)}')
+    expected['KGATE'] = len(gsites) + len(obs) + nbranch
+    for _, _, _, key in params: expected[key] = expected.get(key, 0) + 1
+    if any(nk.get(k, 0) != v for k, v in expected.items()) or any(k not in expected and v for k, v in nk.items()):
+        bad(f'Android 键页访问计数不符：期望 {expected} 实际 {nk}')
+else:
+    _base = {'K18', 'KTLS', 'KTLR', 'KGATE'}; _extra = set(KEY) - _base   # 额外键 = 参数门键（KRES* / KASPECT* …；改写器全局键表，三模块表头都列）：须是 K 开头大写名、键号低于基础四键 | Extra keys = parameter-gate keys (KRES* / KASPECT* ...; the rewriter's global key table, listed in the headers of all three modules): must be uppercase names starting with K, with key numbers below the four base keys
+    if set(KEY) != {'K18', 'KTLS', 'KTLR', 'KGATE', 'KRES0', 'KRES1', 'KASPECT', 'KASPECTUI'} \
+            or not {k for *_, k in params} <= set(KEY) or set(KEY.values()) != set(range(8)):
+        bad(f'表头键页下标不合规：{KEY}（须含八个键且下标恰为 0..7）')
+    kv = {v: k for k, v in KEY.items()}; nk = {}
+    for o in range(PO, len(pat) - 4, 4):
+        w = W(pat, o)
+        if w & 0xFFFFFFE0 != 0xD53BD060: continue           # mrs xN, tpidrro_el0
+        n = w & 31; ks = keyseq(o); k = kv.get(ks[1]) if ks else None
+        if not ks or k is None:
+            bad(f'补丁区 {o:#x} 读 tpidrro 后不是键页间接槽序列'); continue
+        nk[k] = nk.get(k, 0) + 1
+    expected = {}
+    for kind in sites.values():
+        key = {'x18': 'K18', 'W': 'K18', 'C': 'K18', 'tpidr_r': 'KTLS', 'tpidr_w': 'KTLS', 'tpidrro_r': 'KTLR'}.get(kind)
+        if key: expected[key] = expected.get(key, 0) + 1
+    expected['KGATE'] = len(gsites) + len(obs) + nbranch
+    for _, _, _, key in params: expected[key] = expected.get(key, 0) + 1
+    if any(nk.get(k, 0) != v for k, v in expected.items()) or any(k not in expected and v for k, v in nk.items()):
+        bad(f'键页槽访问计数不符：期望 {expected} 实际 {nk}')
 
 # ⑧ 参数门（PARAMS，仅宿主）：原处 movz xR,#lo / movk xR,#hi,lsl #32 造的 64 位常数，等长换成 mrs xR,tpidrro_el0 / ldr xR,[xR,#键*8]
 #   核：A 原字是 64 位 movz（hw=0）写 xR、B 原字是 64 位 movk（hw=2）写 xR；新字逐位 = 模板；A、B 之间的指令不读写 xR；
@@ -404,7 +522,7 @@ if params:
         if w & 0x7C000000 == 0x14000000: d = ((w & 0x3FFFFFF) ^ 0x2000000) - 0x2000000; _tg.add(o + 4 * d)
         elif w & 0xFF000010 == 0x54000000 or w & 0x7E000000 == 0x34000000: d = (((w >> 5) & 0x7FFFF) ^ 0x40000) - 0x40000; _tg.add(o + 4 * d)
         elif w & 0x7E000000 == 0x36000000: d = (((w >> 5) & 0x3FFF) ^ 0x2000) - 0x2000; _tg.add(o + 4 * d)
-    _fs = set(nsoimg.func_starts(orig, TE))
+    _fs = func_starts()
     _busy8 = {a for a in sites} | set(inwin) | obs_heads | {o & ~3 for o in cutb}
     for a, b, r, k in params:
         wa, wb = W(orig, a), W(orig, b)
@@ -418,7 +536,8 @@ if params:
             bad(f'参数门 {a:#x}/{b:#x}：原指令 {wa:#010x}/{wb:#010x} 不是 movz/movk 造常数对（64 位 lsl #32 或 32 位 lsl #16）写 x{r}')
         if not a < b: bad(f'参数门 {a:#x}/{b:#x} 顺序不对')
         if k not in KEY: bad(f'参数门 {a:#x} 键 {k} 未在表头登记'); continue
-        s = btarget(a); ks = paramseq(s, r) if s is not None else None
+        s = btarget(a)
+        ks = (paramseq_android(s, r, a + 4) if TARGET == 'android' else paramseq(s, r)) if s is not None else None
         ok = ks and ks[1] == KEY[k] and W(pat, b) == 0xD503201F
         if not ok: bad(f'参数门 {a:#x}/{b:#x}：键页间接模板不符')
         for o in range(a + 4, b, 4):
@@ -552,7 +671,7 @@ if calls:
     for address in range(0, TE, 4):
         if _bt(W(orig, address), address) in second_words:
             bad(f'known branch enters call without preparation {address:#x}')
-    if second_words & set(nsoimg.func_starts(orig, TE)):
+    if second_words & func_starts():
         bad('function entry enters call without preparation')
     for _, typ, _, value, addend in nsoimg.relocs(orig):
         if (typ == 1027 and addend in second_words) or value in second_words:

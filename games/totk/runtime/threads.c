@@ -28,8 +28,12 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <time.h>
+#ifdef __ANDROID__
+#include "../android/thread_compat_android.h"
+#else
 #include <mach/mach.h>
 #include <pthread/qos.h>
+#endif
 #include <dlfcn.h>
 
 #define R_TIMEOUT     0xEA01u   // 内核模块 1，描述 117 | Kernel module 1, description 117
@@ -666,7 +670,7 @@ int svc_thread(int num, uint64_t *regs) {
         pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);   // 退出即回收宿主资源（客体经句柄等待，不 join） | Host resources are reclaimed on exit (the guest waits through the handle, no join)
         if (pthread_create(&t->pt, &a, thread_main, t)) die("pthread_create");
         pthread_attr_destroy(&a);
-        LOG("CreateThread h=%#x entry=%#llx sp=%#llx", t->handle,t->entry,t->stack_top);
+        LOG("CreateThread h=%#x entry=%#llx sp=%#llx", t->handle,(unsigned long long)t->entry,(unsigned long long)t->stack_top);
         regs[0] = 0; regs[1] = t->handle; return 1;
     }
     case 0x09: {  // StartThread(w0)
@@ -976,7 +980,9 @@ void runtime_event_signal(uint32_t hw) {
 }
 
 // ---------- Diagnostics: TOTK_DUMP_AFTER=<seconds> prints every guest thread's wait state and guest return chain ----------
+#ifndef __ANDROID__
 #include "mach_vm_compat.h"
+#endif
 #include <unistd.h>
 __attribute__((weak)) void runtime_describe_address(uint64_t a, char *out, size_t n) { snprintf(out, n, "%#llx", (unsigned long long)a); }   // loader.c names modules
 __attribute__((weak)) uint64_t runtime_account_lock_owner(void) { return 0; }   // account.c is not linked into the thread probe
@@ -1050,6 +1056,7 @@ static void dump_threads(unsigned secs) {
         if (!t->wkind && !t->exited && t->mport && nrun < 64) run[nrun++] = t;
     }
     if (locked) pthread_mutex_unlock(&G);
+#ifndef __ANDROID__
     for (int i = 0; i < nrun; i++) { thr_t *t = run[i];
 #ifdef GAME_BOTW
             if (t->mport == pthread_mach_thread_np(pthread_self())) continue;   /* dumping from a crashing guest thread: never suspend ourselves */
@@ -1067,6 +1074,7 @@ static void dump_threads(unsigned secs) {
                 usleep(20000);
             }
     }
+#endif
 }
 void runtime_dump_threads(void) { dump_threads(0); }   // TOTK_INPUT_FILE "threads"
 __attribute__((constructor)) static void dump_init(void) {

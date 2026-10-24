@@ -31,9 +31,20 @@ SP0 = 0x800000
 DIR, MOD = A.dir, A.mod
 hdr = nsoimg.header(DIR, MOD)                  # 表头：段边界与写死进指令的线程槽号 | Header: segment boundaries and the thread slot numbers hard-coded into instructions
 PATCH_OFF = hdr['PATCH_OFF']
+TARGET = hdr.get('TARGET', 'darwin')
+assert TARGET in ('darwin', 'android'), TARGET
 KEY_IDX = {k[4:-4]: v for k, v in hdr.items() if k.startswith('KEY_') and k.endswith('_IDX')}
-KEY_SLOT = {k: 300 + i for i, k in enumerate(sorted(KEY_IDX, key=KEY_IDX.get))}
-SLOT18, SLOTTLS, SLOTTLR = (KEY_SLOT[k] for k in ('K18', 'KTLS', 'KTLR'))
+if TARGET == 'android':
+    # GuestSlots indices are the same KEY_*_IDX values; KCTX is the offset of
+    # the thread's GuestSlots pointer from TPIDR_EL0.
+    KCTX_IDX = KEY_IDX['KCTX']; SLOTTLS = KEY_IDX['KTLS']; SLOTTLR = KEY_IDX['KTLR']
+    SLOT18 = None
+    KCTX_OFF = 0x100
+    TCB = TSD
+    SLOTS = TSD + 0x10000
+else:
+    KEY_SLOT = {k: 300 + i for i, k in enumerate(sorted(KEY_IDX, key=KEY_IDX.get))}
+    SLOT18, SLOTTLS, SLOTTLR = (KEY_SLOT[k] for k in ('K18', 'KTLS', 'KTLR'))
 KEY_PAGE_OFF = hdr['KEY_PAGE_OFF']
 pat = bytearray(open(f'{DIR}/{MOD}.patched.bin', 'rb').read())
 orig = nsoimg.load(A.nso)
@@ -92,9 +103,23 @@ def plain_block(a):
     if ins[5].mnemonic != 'ldr' or ins[5].operands[1].mem.base != T: return None              # ldr xS,[xT]：读槽 | ldr xS,[xT]: read the slot
     if ins[7].mnemonic != 'str' or ins[7].operands[1].mem.base != T: return None              # str xS,[xT]：写回槽——只有普通块有，条件块没有（与旧版口径相同） | str xS,[xT]: write back to the slot - only ordinary blocks have it, conditional blocks do not (same convention as the old version)
     return ins[6].address
+
+def android_block_site(a):
+    """The GuestSlots access in an Android tpidr block (mrs; adrp; ldr; add; ldr; add; ldr/str)."""
+    s = btarget(pat, a)
+    ins = list(md.disasm(bytes(pat[s:s + 64]), s))
+    mi = next((i for i, x in enumerate(ins) if x.mnemonic == 'mrs' and 'tpidr_el0' in x.op_str), None)
+    if mi is None or mi + 6 >= len(ins): return None
+    x = ins[mi + 6]
+    if x.mnemonic not in ('ldr', 'str'): return None
+    return x.address
+
 mut_sites = []
 if A.mutate:
-    cand = [a for a in sites if a not in winend and a not in brinfo and plain_block(a)]
+    if TARGET == 'android':
+        cand = [a for a in sites if a not in winend and a not in brinfo]
+    else:
+        cand = [a for a in sites if a not in winend and a not in brinfo and plain_block(a)]
     mut_sites = sorted(random.Random(A.seed).sample(cand, min(A.mutate, len(cand))))
     pat_mut = bytearray(pat)
     def exit_b(a):   # 改写块回 text 的那条 b（块内第一条目标落回 text 的无条件 b） | The b by which a rewrite block returns to text (the first unconditional b in the block whose target lands back in text)
@@ -108,8 +133,16 @@ if A.mutate:
     mut_kind = {}
     for i, a in enumerate(mut_sites):
         eb = exit_b(a) if i % 2 else None
-        if eb: k, w = eb; struct.pack_into('<I', pat_mut, k, (w & 0xFC000000) | ((w + 1) & 0x3FFFFFF)); mut_kind[a] = 'exit+4'
-        else: struct.pack_into('<I', pat_mut, plain_block(a), 0xD503201F); mut_kind[a] = 'nop'
+        if eb:
+            k, w = eb; struct.pack_into('<I', pat_mut, k, (w & 0xFC000000) | ((w + 1) & 0x3FFFFFF)); mut_kind[a] = 'exit+4'
+        else:
+            at = android_block_site(a) if TARGET == 'android' else plain_block(a)
+            if at is None:
+                eb = exit_b(a)
+                if not eb: continue
+                k, w = eb; struct.pack_into('<I', pat_mut, k, (w & 0xFC000000) | ((w + 1) & 0x3FFFFFF)); mut_kind[a] = 'exit+4'
+            else:
+                struct.pack_into('<I', pat_mut, at, 0xD503201F); mut_kind[a] = 'nop'
     pat_mut = bytes(pat_mut)
 
 GP = [getattr(sys.modules['unicorn.arm64_const'], f'UC_ARM64_REG_X{i}') for i in range(29)] + [UC_ARM64_REG_X29, UC_ARM64_REG_X30]
@@ -120,8 +153,11 @@ def mk(image, arena0):
     sz = (len(image) + 0xFFFF) & ~0xFFFF
     u.mem_map(IB, sz, UC_PROT_ALL); u.mem_write(IB, bytes(image))
     u.mem_map(ARENA, ARENA_SZ); u.mem_write(ARENA, arena0)
-    u.mem_map(TSD, 0x10000)
-    u.reg_write(UC_ARM64_REG_TPIDRRO_EL0, TSD)
+    u.mem_map(TSD, 0x20000 if TARGET == 'android' else 0x10000)
+    if TARGET == 'darwin':
+        u.reg_write(UC_ARM64_REG_TPIDRRO_EL0, TSD)
+    else:
+        u.reg_write(UC_ARM64_REG_TPIDR_EL0, TCB)
     st = {'w': [], 'fault': None, 'arena': arena0}
     def wr(uc, acc, addr, size, val, d): st['w'].append((addr, size, val & ((1 << (8 * size)) - 1)))
     def bad(uc, acc, addr, size, val, d): st['fault'] = (acc, addr); return False
@@ -144,12 +180,17 @@ def restore(u, st):
 def state(u, st, patched):
     g = [u.reg_read(r) for r in GP]
     tp = u.reg_read(UC_ARM64_REG_TPIDR_EL0)
-    if patched: g[18] = struct.unpack('<Q', u.mem_read(TSD + 8 * SLOT18, 8))[0]; tp = struct.unpack('<Q', u.mem_read(TSD + 8 * SLOTTLS, 8))[0]
+    if TARGET == 'darwin':
+        if patched: g[18] = struct.unpack('<Q', u.mem_read(TSD + 8 * SLOT18, 8))[0]; tp = struct.unpack('<Q', u.mem_read(TSD + 8 * SLOTTLS, 8))[0]
+        private_slots = {TSD + 8 * slot for slot in KEY_SLOT.values()}
+    else:
+        # x18 is a native guest register on Android; do not substitute it.
+        if patched: tp = struct.unpack('<Q', u.mem_read(SLOTS + 8 * SLOTTLS, 8))[0]
+        private_slots = {SLOTS + 8 * SLOTTLS, SLOTS + 8 * SLOTTLR}
     g = g + [tp]
     # Only the runtime's actual TLS slots are private. A guest register-offset
     # store may legitimately land elsewhere in the mapped TSD page (v1.1.2
     # main+0x24dd68 did so in the fixed random corpus). Do not hide that write.
-    private_slots = {TSD + 8 * slot for slot in KEY_SLOT.values()}
     w = [x for x in st['w'] if not (patched and x[0] in private_slots and x[1] == 8)]
     return g, u.reg_read(UC_ARM64_REG_SP), u.reg_read(UC_ARM64_REG_NZCV), [u.reg_read(r) for r in VR], w, st['fault']
 
@@ -161,12 +202,21 @@ def run(u, st, start, patched, init):
     u.reg_write(UC_ARM64_REG_TPIDR_EL0, init['tls'])
     if not patched: u.reg_write(UC_ARM64_REG_TPIDRRO_EL0, init['tlr'])
     if patched:
-        for key, idx in KEY_IDX.items():
-            u.mem_write(IB + KEY_PAGE_OFF + 8 * idx, struct.pack('<Q', KEY_SLOT[key] * 8))
-        u.mem_write(TSD + 8 * SLOT18, struct.pack('<Q', init['g'][18]))
-        u.mem_write(TSD + 8 * SLOTTLS, struct.pack('<Q', init['tls']))
-        u.mem_write(TSD + 8 * SLOTTLR, struct.pack('<Q', init['tlr']))
-        u.reg_write(GP[18], 0xDEADBEEFDEADBEEF)
+        if TARGET == 'darwin':
+            for key, idx in KEY_IDX.items():
+                u.mem_write(IB + KEY_PAGE_OFF + 8 * idx, struct.pack('<Q', KEY_SLOT[key] * 8))
+            u.mem_write(TSD + 8 * SLOT18, struct.pack('<Q', init['g'][18]))
+            u.mem_write(TSD + 8 * SLOTTLS, struct.pack('<Q', init['tls']))
+            u.mem_write(TSD + 8 * SLOTTLR, struct.pack('<Q', init['tlr']))
+            u.reg_write(GP[18], 0xDEADBEEFDEADBEEF)
+        else:
+            for key, idx in KEY_IDX.items():
+                u.mem_write(IB + KEY_PAGE_OFF + 8 * idx, struct.pack('<Q', 0))
+            u.mem_write(IB + KEY_PAGE_OFF + 8 * KCTX_IDX, struct.pack('<Q', KCTX_OFF))
+            u.mem_write(TCB + KCTX_OFF, struct.pack('<Q', SLOTS))
+            u.mem_write(SLOTS + 8 * SLOTTLS, struct.pack('<Q', init['tls']))
+            u.mem_write(SLOTS + 8 * SLOTTLR, struct.pack('<Q', init['tlr']))
+            u.reg_write(UC_ARM64_REG_TPIDR_EL0, TCB)
     end = {'pc': None}
     if patched:
         seen = {'patch': False}
@@ -264,10 +314,10 @@ if __name__ == '__main__':
         mres = runall(mut_sites, 1)
         caught = sum(1 for r in mres if r[3])
         for a, n, eff, d in mres:
-            if not d: i = ins_of(a); print(f'MUTMISS {a:#x} {mut_kind[a]} {i.mnemonic} {i.op_str} trials={n} eff={eff}')
+            if not d: i = ins_of(a); print(f'MUTMISS {a:#x} {mut_kind.get(a, "?")} {i.mnemonic} {i.op_str} trials={n} eff={eff}')
         miss = len(mres) - caught
         mk_ = {}
-        for a, n, eff, d in mres: c = mk_.setdefault(mut_kind[a], [0, 0]); c[0] += 1; c[1] += bool(d)
+        for a, n, eff, d in mres: c = mk_.setdefault(mut_kind.get(a, '?'), [0, 0]); c[0] += 1; c[1] += bool(d)
         mut_by = ' '.join(f'{k}:{v[1]}/{v[0]}' for k, v in sorted(mk_.items()))
     if A.tsv:
         with open(A.tsv, 'w') as f:

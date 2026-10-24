@@ -39,7 +39,10 @@ for name in ['main', 'subsdk0', 'sdk']:
     layout = {}
     for line in (ROOT / f'rewritten/{version}/{name}.fixups.tsv').read_text().splitlines():
         _, key, value = line.split()
-        layout[key] = int(value, 0)
+        try:
+            layout[key] = int(value, 0)
+        except ValueError:
+            continue          # TARGET / KEY_PAGE_LAYOUT tags are strings
     mod0 = struct.unpack_from('<I', image, 4)[0]
     assert image[mod0:mod0 + 4] == b'MOD0'
     dyn = mod0 + struct.unpack_from('<i', image, mod0 + 4)[0]

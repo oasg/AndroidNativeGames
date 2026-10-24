@@ -27,7 +27,44 @@ from capstone import *
 from call_window import BLR_X18, BLR_X30, prepare_call
 from relr import decode_relr
 
-src, outdir, NAME = sys.argv[1], sys.argv[2], sys.argv[3]
+# Rewrite target.  darwin keeps the original behaviour (macOS/iOS build);
+# android emits modules for Linux/Android: x18 is native, TPIDR_EL0 is the
+# per-thread base, and the host gate is a global address in the key page.
+# The command line is kept compatible with the build script (three positional
+# arguments); --target and --funcs are optional.
+TARGET = os.environ.get('PATCH_TARGET', 'darwin')
+FUNCS_FILE = None
+TEST_PARAMS = []
+TEST_OBS = []
+_args, _pos = sys.argv[1:], []
+_i = 0
+while _i < len(_args):
+    if _args[_i] == '--target':
+        if _i + 1 >= len(_args): raise SystemExit('--target needs darwin|android')
+        TARGET = _args[_i + 1]; _i += 2
+    elif _args[_i] == '--funcs':
+        if _i + 1 >= len(_args): raise SystemExit('--funcs needs a file')
+        FUNCS_FILE = _args[_i + 1]; _i += 2
+    elif _args[_i] == '--params':
+        if _i + 1 >= len(_args): raise SystemExit('--params needs a file')
+        for line in open(_args[_i + 1]):
+            if line.startswith('#') or not line.strip(): continue
+            oa, wa, ob, wb, r, key, why = line.rstrip('\n').split('\t')
+            TEST_PARAMS.append((int(oa, 16), wa.lower(), int(ob, 16), wb.lower(), int(r), key, why))
+        _i += 2
+    elif _args[_i] == '--obs':
+        if _i + 1 >= len(_args): raise SystemExit('--obs needs a file')
+        for line in open(_args[_i + 1]):
+            if line.startswith('#') or not line.strip(): continue
+            off, oid, word, why = line.rstrip('\n').split('\t')
+            TEST_OBS.append((int(off, 16), int(oid), word.lower(), why))
+        _i += 2
+    else:
+        _pos.append(_args[_i]); _i += 1
+if len(_pos) != 3:
+    raise SystemExit('usage: patch_nso.py <NSO> <outdir> <module> [--target darwin|android] [--funcs FILE]')
+assert TARGET in ('darwin', 'android'), f'unknown target {TARGET}'
+src, outdir, NAME = _pos
 d = open(src, 'rb').read()
 assert d[:4] == b'NSO0'
 flags = struct.unpack_from('<I', d, 0xc)[0]
@@ -172,6 +209,8 @@ RULESET = os.environ.get('DM_RULESET', 'native')
 assert RULESET in ('native', 'touch-run-v4'), f'未知规则域 {RULESET}'
 RULE_BUILD = 'db0507f36b84200ac05f75d76ed5026f'
 RULE_RUN = RULESET == 'touch-run-v4' and NAME == 'main'
+if TARGET == 'android' and RULE_RUN:
+    raise SystemExit('android target: touch-run-v4 ruleset is not supported')
 if RULE_RUN:
     import hashlib
     assert BUILD_ID == RULE_BUILD, f'Run规则构建号不符 {BUILD_ID}'
@@ -245,7 +284,12 @@ for off, ob, nb, why, scope in cuts:
 # 键页下标固定；键页内容由装载器写入“实际键号 × 8”。
 # Key page indices are fixed; the key page content is written by the loader as "actual key number × 8".
 KEYS = {'K18': 508, 'KTLS': 509, 'KTLR': 510, 'KGATE': 511, 'KRES0': 506, 'KRES1': 507, 'KASPECT': 505, 'KASPECTUI': 504}   # KRES*：分辨率参数位；KASPECT：画面宽高比上限（见 PARAMS） | KRES*: resolution parameter slots; KASPECT: picture aspect ratio cap (see PARAMS)
-KEY_INDEX = {k: i for i, k in enumerate(('K18', 'KTLS', 'KTLR', 'KGATE', 'KRES0', 'KRES1', 'KASPECT', 'KASPECTUI'))}
+if TARGET == 'android':
+    # Android key page: KCTX is the offset of the thread's GuestSlots pointer
+    # from TPIDR_EL0; KGATE and the parameter slots are global values.
+    KEY_INDEX = {k: i for i, k in enumerate(('KCTX', 'KTLS', 'KTLR', 'KGATE', 'KRES0', 'KRES1', 'KASPECT', 'KASPECTUI'))}
+else:
+    KEY_INDEX = {k: i for i, k in enumerate(('K18', 'KTLS', 'KTLR', 'KGATE', 'KRES0', 'KRES1', 'KASPECT', 'KASPECTUI'))}
 
 md = Cs(CS_ARCH_ARM64, CS_MODE_ARM); md.detail = True
 patch = bytearray(); fix = []; gates = []; stats = {}
@@ -259,7 +303,15 @@ def emit_key_addr(reg, kind):
     fix.append((len(patch), kind)); emit(ADRP(reg, here(), KEY_PAGE_OFF)); emit(LDRX(reg, reg, KEY_INDEX[kind]))
 
 def emit_slot_addr(base, key_reg, kind):
-    emit_key_addr(key_reg, kind); emit(ADDR(base, base, key_reg))
+    if TARGET == 'darwin':
+        emit_key_addr(key_reg, kind); emit(ADDR(base, base, key_reg))
+    else:
+        # base already holds TPIDR_EL0.  The key page holds the offset of the
+        # thread's GuestSlots pointer; the slot itself is at GuestSlots+8*idx.
+        emit_key_addr(key_reg, 'KCTX')
+        emit(ADDR(base, base, key_reg))
+        emit(LDRX(base, base))
+        emit(ADDI(base, base, KEY_INDEX[kind] * 8))
 
 # ---- 编码器 ----
 # ---- Encoders ----
@@ -275,6 +327,10 @@ def LDUR(t, n, off): return 0xF8400000 | ((off & 0x1FF) << 12) | (n << 5) | t   
 def LDRX(t, n, imm12=0): return 0xF9400000 | (imm12 << 10) | (n << 5) | t
 def STRX(t, n, imm12=0): return 0xF9000000 | (imm12 << 10) | (n << 5) | t
 def MRS_TPIDRRO(t): return 0xD53BD060 | t
+def MRS_TPIDR(t): return 0xD53BD040 | t
+def emit_thread_base(reg):
+    """Load the per-thread base into reg: TPIDRRO_EL0 on Darwin, TPIDR_EL0 on Android."""
+    emit(MRS_TPIDRRO(reg) if TARGET == 'darwin' else MRS_TPIDR(reg))
 def ADRP(dd, pc, target):
     imm = ((target & ~0xFFF) - (pc & ~0xFFF)) >> 12; assert -(1 << 20) <= imm < (1 << 20)
     return 0x90000000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7FFFF) << 5) | dd
@@ -334,7 +390,7 @@ def site_plain(ins):
     save = -16 if dlt == 0 else -112          # 改 sp 的指令会写到 sp 下方，暂存放到保留区深处 | Instructions that modify sp write below sp, so the scratch save is placed deep in the reserved area
     assert dlt == 0 or dlt >= -96, f'sp delta {dlt} at {ins.address:x}'
     start = here()
-    emit(STP(S, T, 31, save)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
+    emit(STP(S, T, 31, save)); emit_thread_base(T); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
     emit(subst(ins, S))
     emit(STRX(S, T))                 # 一律写回：capstone 会漏报写入（adds w18 实例） | Always write back: capstone can miss reporting a write (the adds w18 instance)
     emit(LDP(S, T, 31, save - dlt)); emit(B(here(), ins.address + 4))
@@ -345,7 +401,7 @@ def site_cond(ins):
     S, T = pick(regs_in(ins))
     tgt = ins.operands[-1].imm
     start = here()
-    emit(STP(S, T, 31, -16)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
+    emit(STP(S, T, 31, -16)); emit_thread_base(T); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
     m = ins.mnemonic
     taken = here() + 4 * 3
     off = (taken - here()) >> 2
@@ -361,7 +417,7 @@ def site_pcrel(ins):
     tgt = ins.operands[1].imm
     S, T = pick(set())
     start = here()
-    emit(STP(S, T, 31, -16)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18')   # S 先作键页偏移暂存，下一条再装目标值 | S first serves as a temporary for the key page offset; the next instruction then loads the target value
+    emit(STP(S, T, 31, -16)); emit_thread_base(T); emit_slot_addr(T, S, 'K18')   # S 先作键页偏移暂存，下一条再装目标值 | S first serves as a temporary for the key page offset; the next instruction then loads the target value
     pc = here(); emit(ADRP(S, pc, tgt))
     if ins.mnemonic == 'adr': emit(ADDI(S, S, tgt & 0xFFF))
     emit(STRX(S, T))
@@ -372,7 +428,7 @@ def site_br(ins, base, count):
     """跳转表 br x18：目标 = base + 4i。x16 暂存红区 → 等距落地垫 → 恢复 x16 → 原目标。 | Jump table br x18: target = base + 4i. Stash x16 in the red zone → equally spaced landing pads → restore x16 → original target."""
     start = here()
     emit(STUR(16, 31, -16)); emit(STUR(17, 31, -24))   # x16 / x17 是函数内可存活的临时寄存器，借用前存红区 | x16 / x17 are temporary registers that can stay live within a function; save them to the red zone before borrowing
-    emit(MRS_TPIDRRO(16)); emit_slot_addr(16, 17, 'K18'); emit(LDRX(16, 16)); emit(LDUR(17, 31, -24))
+    emit_thread_base(16); emit_slot_addr(16, 17, 'K18'); emit(LDRX(16, 16)); emit(LDUR(17, 31, -24))
     padbase = start + 4 * 24
     delta = padbase - base
     op = ADDI if delta >= 0 else SUBI; dl = abs(delta)
@@ -395,7 +451,7 @@ def site_sysreg_read(ins, kind):
     N = ins.bytes[0] & 31
     tmp = 16 if N != 16 else 17
     start = here()
-    emit(STUR(tmp, 31, -16)); emit(MRS_TPIDRRO(N)); emit_slot_addr(N, tmp, kind); emit(LDRX(N, N)); emit(LDUR(tmp, 31, -16))   # tmp 存红区借用 | tmp is saved by borrowing the red zone
+    emit(STUR(tmp, 31, -16)); emit_thread_base(N); emit_slot_addr(N, tmp, kind); emit(LDRX(N, N)); emit(LDUR(tmp, 31, -16))   # tmp 存红区借用 | tmp is saved by borrowing the red zone
     emit(B(here(), ins.address + 4))
     return start
 
@@ -405,7 +461,7 @@ def site_tpidr_write(ins):
     start = here()
     emit(0xF81F0000 | (31 << 5) | T)           # stur xT,[sp,#-16]
     tmp = next(x for x in (16, 17) if x not in (N, T))
-    emit(STUR(tmp, 31, -24)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, tmp, 'KTLS'); emit(STRX(N, T)); emit(LDUR(tmp, 31, -24))
+    emit(STUR(tmp, 31, -24)); emit_thread_base(T); emit_slot_addr(T, tmp, 'KTLS'); emit(STRX(N, T)); emit(LDUR(tmp, 31, -24))
     emit(0xF85F0000 | (31 << 5) | T)           # ldur xT,[sp,#-16]
     emit(B(here(), ins.address + 4))
     return start
@@ -419,7 +475,11 @@ def emit_gate_call():
         Fetching the slot through the key page needs a second register to be borrowed; x29 is borrowed and then immediately restored from the stack: the x29 saved by _dm_gate must be the guest's original value --
         the host identifies the caller by [x29+8] (skill binding observation gate 6, private aiming gate svc86), and the crash backtrace also walks the x29 chain
         (since r24 plan C it was borrowed and not returned, the x29 the host got was the slot offset from the key page, and skill icons fell back to placeholder text)."""
-    emit(MRS_TPIDRRO(30)); emit_slot_addr(30, 29, 'KGATE'); emit(LDRX(30, 30)); emit(LDRX(29, 31))
+    if TARGET == 'darwin':
+        emit_thread_base(30); emit_slot_addr(30, 29, 'KGATE'); emit(LDRX(30, 30)); emit(LDRX(29, 31))
+    else:
+        # The gate address is global; the key page slot holds it directly.
+        emit_key_addr(30, 'KGATE')
 
 def site_gate(ins, kind, arg):
     """svc / mrs cntpct_el0 → 宿主门。门地址取自线程槽 KGATE；门按返回点（本块 ldp 的地址）查 gates.tsv。 | svc / mrs cntpct_el0 → host gate. The gate address is taken from thread slot KGATE; the gate looks up gates.tsv by return point (the address of this block's ldp)."""
@@ -509,7 +569,7 @@ def site_window_group(segments):
     entries = {}; entry_branches = []
     for seg in segments:
         entries[seg[0].address] = here()
-        emit(STP(S, T, 31, -16)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
+        emit(STP(S, T, 31, -16)); emit_thread_base(T); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
         entry_branches.append((len(patch), seg[0].address)); emit(NOP)
     copied = {}; cursor = here()
     for seg in segments:
@@ -554,7 +614,7 @@ def site_window(seg):
     S, T = pick(used)
     lo, hi = seg[0].address, seg[-1].address + 4
     start = here()
-    emit(STP(S, T, 31, -16)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
+    emit(STP(S, T, 31, -16)); emit_thread_base(T); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
     copy0 = here(); n = len(seg)
     exits = copy0 + 4 * n
     # The copied body falls through to the first exit stub. That stub MUST be
@@ -585,27 +645,37 @@ def site_window(seg):
 # ---- Function boundaries (eh_frame_hdr) ----
 m0 = struct.unpack_from('<I', IMG, 4)[0]
 assert IMG[m0:m0 + 4] == b'MOD0'
-ehs = m0 + struct.unpack_from('<i', IMG, m0 + 16)[0]
-def rd(o, enc):
-    fmt, app = enc & 0xF, enc & 0x70
-    v, sz = {0x3: (struct.unpack_from('<I', IMG, o)[0], 4), 0xB: (struct.unpack_from('<i', IMG, o)[0], 4),
-             0x4: (struct.unpack_from('<Q', IMG, o)[0], 8)}[fmt]
-    if app == 0x10: v += o
-    if app == 0x30: v += ehs
-    return v, sz
-_, penc, cenc, tenc = IMG[ehs:ehs + 4]
-o = ehs + 4
-_, s = rd(o, penc); o += s
-nfde, s = rd(o, cenc); o += s
-starts = set()
-for _ in range(nfde):
-    a, s = rd(o, tenc); o += s
-    _, s = rd(o, tenc); o += s
-    starts.add(a)
-starts = sorted(x for x in starts if x < TEXT_END)
+if FUNCS_FILE:
+    # Test-only hook for synthetic fixtures: a plain list of function starts
+    # (one hex address per line) replaces eh_frame_hdr discovery.
+    starts = sorted({int(x, 16) for line in open(FUNCS_FILE) for x in line.split('#')[0].split()})
+    starts = [x for x in starts if x < TEXT_END]
+else:
+    ehs = m0 + struct.unpack_from('<i', IMG, m0 + 16)[0]
+    def rd(o, enc):
+        fmt, app = enc & 0xF, enc & 0x70
+        v, sz = {0x3: (struct.unpack_from('<I', IMG, o)[0], 4), 0xB: (struct.unpack_from('<i', IMG, o)[0], 4),
+                 0x4: (struct.unpack_from('<Q', IMG, o)[0], 8)}[fmt]
+        if app == 0x10: v += o
+        if app == 0x30: v += ehs
+        return v, sz
+    _, penc, cenc, tenc = IMG[ehs:ehs + 4]
+    o = ehs + 4
+    _, s = rd(o, penc); o += s
+    nfde, s = rd(o, cenc); o += s
+    starts = set()
+    for _ in range(nfde):
+        a, s = rd(o, tenc); o += s
+        _, s = rd(o, tenc); o += s
+        starts.add(a)
+    starts = sorted(x for x in starts if x < TEXT_END)
 
 # ---- 线性扫描找全部改写点（不靠寄存器读写报告）----
 # ---- Linear scan to find all rewrite points (not relying on register read/write reports) ----
+import bisect
+def func_of(a):
+    i = bisect.bisect_right(starts, a) - 1
+    return (starts[i], starts[i + 1] if i + 1 < len(starts) else TEXT_END) if i >= 0 else (a, a + 4)
 kinds = {}
 for o in range(0, TEXT_END, 4):
     w = struct.unpack_from('<I', IMG, o)[0]
@@ -615,16 +685,38 @@ for o in range(0, TEXT_END, 4):
     if w & 0xFFFFFFE0 == 0xD53BD060: kinds[o] = ('tpidrro_r', None); continue
     if w & 0xFFFFFFE0 == 0xD53BE020: kinds[o] = ('cntpct', w & 31); continue
     if w & 0xFFFFFFE0 == 0xD53BE040: kinds[o] = ('cntvct', w & 31); continue
-    for ins in md.disasm(IMG[o:o + 4], o):
-        if has18(ins): kinds[o] = ('x18', None)
+    if TARGET == 'darwin':
+        for ins in md.disasm(IMG[o:o + 4], o):
+            if has18(ins): kinds[o] = ('x18', None)
 
 # 按函数取指令表，找窗口与跳转表
 # Take the instruction table per function, find the windows and jump tables
-import bisect
-def func_of(a):
-    i = bisect.bisect_right(starts, a) - 1
-    return (starts[i], starts[i + 1] if i + 1 < len(starts) else TEXT_END) if i >= 0 else (a, a + 4)
 done = set(); windows = []; window_groups = []; jumps = {}; calls = {}
+
+# Android: a rewrite inside an LDXR/STXR reservation interval is not just a
+# code-size problem; the host gate (or the slot store) would execute inside the
+# interval and can clear the exclusive monitor.  The original design avoided
+# that by moving the whole window only for x18 sites; on Android there is no
+# x18 site, so first prove that no remaining site sits inside a window.  The
+# 1.0.0 modules are expected to have none; if a future version has one, the
+# window needs a dedicated (non-gate) lowering instead of silently breaking it.
+if TARGET == 'android' and kinds:
+    site_addrs = set(kinds)
+    bad_windows = []
+    for fa, fb in sorted({func_of(a) for a in site_addrs}):
+        insl = list(md.disasm(bytes(IMG[fa:fb]), fa))
+        for i, ins in enumerate(insl):
+            if ins.mnemonic not in EXCL_LD: continue
+            j = i + 1
+            while j < len(insl) and insl[j].mnemonic not in EXCL_ST + EXCL_LD: j += 1
+            if j >= len(insl) or j - i >= 16 or insl[j].mnemonic not in EXCL_ST: continue
+            if j + 1 < len(insl) and insl[j + 1].mnemonic in ('cbz', 'cbnz'): j += 1
+            seg = insl[i:j + 1]
+            hit = [x.address for x in seg if x.address in site_addrs]
+            if hit: bad_windows.append((seg[0].address, seg[-1].address + 4, hit))
+    if bad_windows:
+        text = ', '.join(f'{lo:#x}..{hi:#x} sites {[hex(x) for x in hit]}' for lo, hi, hit in bad_windows[:8])
+        raise RuntimeError(f'Android: rewrite site inside an exclusive window ({len(bad_windows)}): {text}')
 # Signed 32-bit offset tables added in TOTK 1.4.3. Validate both the dispatch
 # instructions and every table entry before using a bounded landing-pad span.
 # Each tuple is (ADR base, table address, expected offsets, dispatch bytes).
@@ -842,7 +934,7 @@ elif RULE_RUN:
     patch.extend(bytes(0x80))
     stat('private_gates_reserved')
 
-obs = list(OBS.get(BUILD_ID, []))
+obs = list(OBS.get(BUILD_ID, [])) + TEST_OBS
 if RULE_RUN and PRIVATE_GATES:
     obs.append((0x43ecc8, 6, "b8686953", "private touch-run-v4 PRE-ldr; full800 host ABI"))
     obs.append((0x1237c60, 8, "d10143ff", "ui world anchor: camera world->screen entry (camera, point, out); host swaps x0 to a copy whose projection is shifted by the UI rect y (iPad UI kept 16:9 inside a taller screen), game camera untouched"))
@@ -995,7 +1087,7 @@ PARAMS = {'db0507f36b84200ac05f75d76ed5026f': [
     (0xb152bc, '52838e48', 0xb152c0, '72a800e8', 8, 'KASPECT', '新画面模式视口：边距 = (屏宽 − 屏高 × 上限) / 2，经 0x85bc90 设居中视口'),
     (0x23e888, '52838e48', 0x23e88c, '72a800e8', 8, 'KASPECT', '新画面模式坐标钳制（0x23e760）：x 夹进 [边距, 边距 + 屏高 × 上限]，宽屏两侧的指针 / 触摸不再被夹回中间'),
 ]}
-params = PARAMS.get(BUILD_ID, [])
+params = PARAMS.get(BUILD_ID, []) + TEST_PARAMS
 for oa, wa, ob_, wb, r, key, why in params:
     for o, w0 in ((oa, wa), (ob_, wb)):
         w = struct.unpack_from('<I', IMG, o)[0]
@@ -1006,7 +1098,10 @@ for oa, wa, ob_, wb, r, key, why in params:
         assert r not in regs_in(ins), f'参数位中间用到 x{r}：{o:#x} {ins.mnemonic} {ins.op_str}'
     start = here()
     tmp = 16 if r != 16 else 17
-    emit(STUR(tmp, 31, -16)); emit(MRS_TPIDRRO(r)); emit_slot_addr(r, tmp, key); emit(LDRX(r, r)); emit(LDUR(tmp, 31, -16)); emit(B(here(), oa + 4))
+    if TARGET == 'android':
+        emit_key_addr(r, key); emit(B(here(), oa + 4))
+    else:
+        emit(STUR(tmp, 31, -16)); emit_thread_base(r); emit_slot_addr(r, tmp, key); emit(LDRX(r, r)); emit(LDUR(tmp, 31, -16)); emit(B(here(), oa + 4))
     struct.pack_into('<I', IMG, oa, B(oa, start)); struct.pack_into('<I', IMG, ob_, NOP); stat('param')
 
 # 既有三块原生规则跳板均只使用后继覆盖的死临时w8，不改w0/stat返回、sp或NZCV。
@@ -1067,6 +1162,9 @@ if RULE_RUN:
 elif os.path.exists(P('rules.tsv')):
     os.unlink(P('rules.tsv'))  # 重出native时清本模块旧规则登记，不让旧manifest混入原资源域 | When rebuilding native, clear this module's old rule registration so the old manifest does not leak into the original-resource domain
 with open(P('fixups.tsv'), 'w') as f:
+    f.write(f'# TARGET\t{TARGET}\n# KEY_PAGE_LAYOUT\t{"android-v1" if TARGET == "android" else "darwin-v1"}\n')
+    if FUNCS_FILE:
+        f.write('# FUNCS\t' + ','.join(f'{x:#x}' for x in starts) + '\n')
     f.write(f'# PATCH_OFF\t{PATCH_OFF:#x}\n# KEY_PAGE_OFF\t{KEY_PAGE_OFF:#x}\n# KEY_PAGE_SIZE\t0x4000\n# TEXT_END\t{TEXT_END:#x}\n# RO_OFF\t{RO_OFF:#x}\n# DATA_OFF\t{DATA_OFF:#x}\n')
     for k in KEY_INDEX: f.write(f'# KEY_{k}_IDX\t{KEY_INDEX[k]}\n')
 with open(P('gates.tsv'), 'w') as f:

@@ -569,7 +569,7 @@ def step_code(tree, game, keys, env, logs, *, version="v0", mod=None):
             continue
         say(f'1/4 code: rewriting {name} for Apple silicon' + (' (the big one: about a minute)' if name == 'main' else ''))
         run([py, 'third_party/d2r/patch_nso.py', source, out, name], logs / f'rewrite_{version}_{name}.log', cwd=tree,
-            env=dict(env, DM_RULESET='native', DM_PRIVATE_GATES='0'))
+            env=dict(env, DM_RULESET='native', DM_PRIVATE_GATES='0', PATCH_TARGET='darwin'))
         if modded:
             # The rewrite of the merged module is not the verified retail rewrite any more: the mod's own edits are
             # bound by the module's hash instead (the report says so, and the loader binds itself to this digest).
@@ -1579,7 +1579,7 @@ def step_code_botw(tree, botw, game, keys, env, logs, *, version='botw160'):
             continue
         say(f'1/4 code: rewriting {name} for Apple silicon' + (' (the big one: about a minute)' if name == 'main' else ''))
         run([py, 'third_party/d2r/patch_nso.py', exefs / name, out, name], logs / f'rewrite_{version}_{name}.log', cwd=tree,
-            env=dict(env, DM_RULESET='native', DM_PRIVATE_GATES='0'))
+            env=dict(env, DM_RULESET='native', DM_PRIVATE_GATES='0', PATCH_TARGET='darwin'))
         check(f'rewritten {name}', sha256(image), h)
     # scripts/prepare_runtime.py binds the loader to these images (verify_rewrites.py --version <version> re-runs the site-by-site check)
     report = dict(format=1, status='pass', rom_version=version, scope=f'hash match with verified {expected["display_version"]} rewrite',

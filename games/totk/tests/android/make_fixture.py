@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Build the tiny Android CPU rewrite fixture.
+
+The fixture is a synthetic, uncompressed NSO containing one function per
+rewrite kind.  It is not game code: the point is to exercise the emitted
+instruction sequences on a real arm64 Android device/emulator.
+
+Outputs (in --out):
+  fixture.nso          synthetic NSO input
+  funcs.txt            function starts for patch_nso.py --funcs
+  rewritten/main.patched.bin
+  fixture_config.h     constants consumed by fixture_probe.c
+"""
+import argparse
+import json
+import os
+import struct
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]          # games/totk
+D2R = ROOT / 'third_party' / 'd2r'
+
+TEXT = 0x400
+RO = 0x100
+DATA = 0x100
+FUNCS = {
+    'svc': 0x100,
+    'tls_read': 0x110,
+    'tls_write': 0x120,
+    'tlr_read': 0x130,
+    'cnt': 0x140,
+    'excl': 0x150,
+    'param': 0x170,
+    'obs': 0x180,
+}
+
+
+def put(text, off, words):
+    for i, w in enumerate(words):
+        struct.pack_into('<I', text, off + 4 * i, w)
+
+
+def branch(at, to):
+    return 0x14000000 | (((to - at) >> 2) & 0x3FFFFFF)
+
+
+def cbnz_w(at, to, rt=2):
+    delta = to - at
+    assert delta % 4 == 0 and -(1 << 20) <= delta < (1 << 20)
+    return 0x35000000 | (((delta >> 2) & 0x7FFFF) << 5) | rt
+
+
+def build_nso(path):
+    text = bytearray(TEXT)
+    ro = bytearray(RO)
+    data = bytearray(DATA)
+
+    # MOD0 at 0x200; m0 is read from image offset 4.
+    struct.pack_into('<I', text, 4, 0x200)
+    text[0x200:0x204] = b'MOD0'
+
+    put(text, FUNCS['svc'], [0xD4000841, 0xD65F03C0])                    # svc #0x42 ; ret
+    put(text, FUNCS['tls_read'], [0xD53BD040, 0xD65F03C0])               # mrs x0,tpidr_el0 ; ret
+    put(text, FUNCS['tls_write'], [0xD2824680, 0xD51BD040, 0xD53BD040, 0xD65F03C0])
+    put(text, FUNCS['tlr_read'], [0xD53BD060, 0xD65F03C0])               # mrs x0,tpidrro_el0 ; ret
+    put(text, FUNCS['cnt'], [0xD53BE040, 0xD65F03C0])                    # mrs x0,cntvct_el0 ; ret
+    put(text, FUNCS['excl'], [0x885F7C01, 0x11000421, 0x88027C01,
+                              cbnz_w(FUNCS['excl'] + 12, FUNCS['excl']),
+                              0x52800020, 0xD65F03C0])   # mov w0,#1 ; ret
+    # movz x9,#0x1234 ; movk x9,#0xabcd,lsl #32 ; mov x0,x9 ; ret
+    put(text, FUNCS['param'], [0xD2824689, 0xF2D579A9, 0xAA0903E0, 0xD65F03C0])
+    put(text, FUNCS['obs'], [0xD10043FF, 0x910043FF, 0xD65F03C0])   # sub sp,#16 ; add sp,#16 ; ret
+
+    hdr = bytearray(0x100)
+    hdr[0:4] = b'NSO0'
+    struct.pack_into('<I', hdr, 0x0C, 0)                                  # uncompressed
+    struct.pack_into('<III', hdr, 0x10, 0x100, 0, TEXT)
+    struct.pack_into('<III', hdr, 0x20, 0x100 + TEXT, 0x400, RO)
+    struct.pack_into('<III', hdr, 0x30, 0x100 + TEXT + RO, 0x500, DATA)
+    struct.pack_into('<I', hdr, 0x3C, 0)
+    hdr[0x40:0x50] = bytes(range(0x10))                                  # synthetic build id
+    struct.pack_into('<III', hdr, 0x60, TEXT, RO, DATA)
+    path.write_bytes(bytes(hdr) + bytes(text) + bytes(ro) + bytes(data))
+
+
+def parse_header(path):
+    h = {}
+    for line in path.read_text().splitlines():
+        if not line.startswith('#'):
+            break
+        k, v = line[1:].split()
+        try:
+            h[k] = int(v, 0)
+        except ValueError:
+            h[k] = v
+    return h
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--out', type=Path, default=Path(__file__).resolve().parent / 'build')
+    ap.add_argument('--python', default=sys.executable)
+    args = ap.parse_args()
+    out = args.out.resolve()
+    (out / 'rewritten').mkdir(parents=True, exist_ok=True)
+    nso = out / 'fixture.nso'
+    funcs = out / 'funcs.txt'
+    params = out / 'params.txt'
+    obs = out / 'obs.txt'
+    build_nso(nso)
+    funcs.write_text('\n'.join(f'{x:#x}' for x in FUNCS.values()) + '\n')
+    params.write_text(f'{FUNCS["param"]:#x}\tD2824689\t{FUNCS["param"] + 4:#x}\tF2D579A9\t9\tKRES0\tfixture parameter\n')
+    obs.write_text(f'{FUNCS["obs"]:#x}\t1\tD10043FF\tfixture observation\n')
+
+    env = os.environ.copy()
+    env['PATCH_TARGET'] = 'android'
+    subprocess.run([args.python, str(D2R / 'patch_nso.py'), str(nso), str(out / 'rewritten'),
+                    'main', '--target', 'android', '--funcs', str(funcs),
+                    '--params', str(params), '--obs', str(obs)],
+                   cwd=D2R, env=env, check=True)
+
+    h = parse_header(out / 'rewritten' / 'main.fixups.tsv')
+    cfg = {
+        'TEXT_END': h['TEXT_END'],
+        'KEY_PAGE_OFF': h['KEY_PAGE_OFF'],
+        'PATCH_OFF': h['PATCH_OFF'],
+        'KCTX_IDX': h['KEY_KCTX_IDX'],
+        'KTLS_IDX': h['KEY_KTLS_IDX'],
+        'KTLR_IDX': h['KEY_KTLR_IDX'],
+        'KGATE_IDX': h['KEY_KGATE_IDX'],
+        'KRES0_IDX': h['KEY_KRES0_IDX'],
+        'KCTX_OFF': 0x100,
+        'FUNCS': FUNCS,
+    }
+    lines = ['/* generated by make_fixture.py; do not edit */', '#pragma once', '#include <stdint.h>']
+    for k, v in cfg.items():
+        if k == 'FUNCS':
+            continue
+        lines.append(f'#define FIX_{k} {v:#x}')
+    for k, v in FUNCS.items():
+        lines.append(f'#define FIX_FUNC_{k.upper()} {v:#x}')
+    (out / 'fixture_config.h').write_text('\n'.join(lines) + '\n')
+    (out / 'fixture.json').write_text(json.dumps(cfg, indent=2) + '\n')
+    print(json.dumps(cfg, indent=2))
+
+
+if __name__ == '__main__':
+    main()

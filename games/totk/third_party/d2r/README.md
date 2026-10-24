@@ -29,6 +29,22 @@ main/sdk/subsdk0 均已使用本地版本重新生成并完成全量结构和逐
 另有未简化的 LDXR/STXR 成功路径与注入失败状态测试。
 复现入口：`make verify`，完整范围说明见项目 README 与 claude.md。
 
+## Android target
+
+The rewriter is multi-target:
+
+```sh
+patch_nso.py <NSO> <outdir> <module> --target darwin   # default, unchanged
+patch_nso.py <NSO> <outdir> <module> --target android  # Linux/Android arm64
+```
+
+The Android target does not virtualize x18, uses `TPIDR_EL0` plus a
+`__thread GuestSlots*` offset instead of Darwin's TSD key page, and puts the
+host gate address and parameter values directly in the key page. `structck.py`
+and `equiv.py` read `# TARGET` from `main.fixups.tsv` and check the matching
+templates. The ABI and the synthetic fixture/harness are described in
+[`docs/android-cpu-rewrite.md`](../../../../docs/android-cpu-rewrite.md).
+
 `../../runtime/gate.S` adapts the register-preserving `dm_gate` section of
 `dm/host/entry.S` from the same pinned upstream commit, under the included MIT
 license. The loader and service dispatch are separate TOTK-specific code.

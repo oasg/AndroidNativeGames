@@ -128,6 +128,9 @@ static void respond(uint32_t *m, int tipc, const IpcResponse *rs) {
 
 /* ---------- Control requests (CMIF) ---------- */
 static void control(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+#ifdef __ANDROID__
+    if (getenv("TOTK_ANDROID_IPC_STUB") && rq->cmd == 0) { s->state = (void *)1; return; }
+#endif
     switch (rq->cmd) {
     case 3: { uint16_t n = POINTER_BUFFER_SIZE; IPC_OUT(rs, n); return; }   /* QueryPointerBufferSize */
     case 2: case 4:                                                           /* CloneCurrentObject(Ex) */
@@ -144,6 +147,12 @@ static void dispatch(IpcSession *s, uint32_t *m) {
     parse(m, &rq, &words, &ndata);
     if (getenv("TOTK_IPC_DUMP") && rq.na + rq.nb) { fprintf(stderr, "[totk-ipc] raw %s:", s->name); for (unsigned i = 0; i < 20; i++) fprintf(stderr, " %08x", m[i]); fputc('\n', stderr); }
     IpcResponse rs; memset(&rs, 0, sizeof rs);
+#ifdef __ANDROID__
+    if (getenv("TOTK_ANDROID_IPC_STUB") && s->state == (void *)1) {
+        respond(m, rq.type >= T_TIPC_BASE, &rs);
+        return;
+    }
+#endif
     if (rq.type == T_CLOSE || rq.type == T_TIPC_CLOSE) return;
     int tipc = rq.type >= T_TIPC_BASE;
     const uint8_t *bytes = (const uint8_t *)words, *end = bytes + ndata * 4;
@@ -164,6 +173,17 @@ static void dispatch(IpcSession *s, uint32_t *m) {
 }
 
 /* ---------- sm: service manager ---------- */
+#ifdef __ANDROID__
+/* First Android milestone: unknown services/commands are logged and answered
+ * with result 0 so the next missing dependency is visible instead of aborting. */
+static void android_stub_service(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    static unsigned logged;
+    if (logged++ < 200)
+        fprintf(stderr, "[totk-ipc] stub service %s command %u (type %u, %u bytes)\n",
+                s->name, rq->cmd, rq->type, rq->data_size);
+    rs->result = 0;
+}
+#endif
 static void sm(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     switch (rq->cmd) {
     case 0: return;                                          /* RegisterClient / Initialize */
@@ -173,7 +193,15 @@ static void sm(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
         const Service *found = NULL;
         for (unsigned i = 0; i < nservices; i++) if (!strcmp(services[i].name, name)) found = &services[i];
         pthread_mutex_unlock(&registry);
+#ifdef __ANDROID__
+        if (!found) {
+            fprintf(stderr, "[totk-ipc] sm: opening stub service \"%s\"\n", name);
+            rs->move[rs->nmove++] = runtime_ipc_new_session("stub", android_stub_service, NULL, NULL);
+            return;
+        }
+#else
         if (!found) { fprintf(stderr, "[totk-ipc] sm: service \"%s\" not implemented\n", name); runtime_trace_guest(trace_fp, trace_lr); runtime_fail("IPC service not implemented"); }
+#endif
         rs->move[rs->nmove++] = runtime_ipc_new_session(found->name, found->handler, found->open ? found->open() : NULL, found->close);
         fprintf(stderr, "[totk-ipc] opened service %s\n", found->name);
         return;

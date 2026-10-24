@@ -15,6 +15,7 @@ TOTK_build/
 *.app/
 games/totk/.venv
 games/totk/build/
+games/totk/tests/android/build/
 games/totk/extracted/
 games/totk/rewritten/
 games/totk/analysis/
