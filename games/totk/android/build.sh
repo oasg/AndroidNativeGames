@@ -23,7 +23,8 @@ out="$work/build/android-v0"
   -fno-stack-protector -ffixed-x18 -fno-sanitize=shadow-call-stack -fno-emulated-tls \
   -I"$here/../runtime" -I"$out" \
   "$here/loader_android.c" "$here/hle_android.c" "$here/hle_stack_android.c" \
-  "$here/services_android.c" "$here/fs_service_android.c" \
+  "$here/services_android.c" "$here/fs_service_android.c" "$here/vi_android.c" \
+  "$here/account_android.c" "$here/nvn_android.c" "$here/hid_android.c" \
   "$here/fs_host_android.c" "$here/romfs_android.c" \
   "$here/../runtime/threads.c" "$here/../runtime/ipc.c" \
   "$here/sha256.c" "$here/gate_android.S" "$here/hle_stack_android.S" \

@@ -31,16 +31,18 @@ static uint64_t timer_calls, svc_calls;
 
 typedef struct {
     uintptr_t host_stack_top;   /* offset 0: gate_android.S reads this */
-    uintptr_t host_stack_base;
+    uintptr_t host_stack_base;  /* offset 8 */
     uint8_t *guest_tls;         /* guest TPIDR_EL0 value (zeroed 8 KiB) */
     uint8_t *guest_tlr;         /* guest TPIDRRO_EL0 value (zeroed 0x200) */
     uint8_t *dummy;
+    uintptr_t guest_stack_top;  /* guest code entry stack (not the HLE stack) */
 } HostContext;
 
 typedef struct {
     uint64_t k18, ktls, ktlr, reserved[5];
 } GuestSlots;
 
+static int tls_probe_mode;
 static __thread HostContext *g_host __attribute__((aligned(64)));
 static __thread GuestSlots *g_slots __attribute__((aligned(64)));
 uint64_t runtime_host_ctx_off;
@@ -75,16 +77,45 @@ static uintptr_t read_tpidr_el0(void) {
     return p;
 }
 
+void runtime_guest_stack_info(uint64_t *base, uint64_t *size);
+void runtime_guest_commit(uintptr_t base, uintptr_t size);
+
 void runtime_thread_init(void) {
     if (g_host) return;
     HostContext *hc = calloc(1, sizeof *hc);
     GuestSlots *gs = calloc(1, sizeof *gs);
     need(hc && gs, "thread context allocation");
-    hc->guest_tls = calloc(1, 8192);
-    hc->guest_tlr = calloc(1, 0x200);
-    hc->dummy = calloc(1, 0x400);
-    need(hc->guest_tls && hc->guest_tlr && hc->dummy, "guest TLS/TLR allocation");
+
+    /* The SDK's GetCurrentStackInfo (rewritten for Android) reads the thread
+     * object from TLR+0x1f8 and requires the TLR itself to be inside the
+     * reported [base, base+size).  On Horizon the TLS lives in the thread's
+     * stack, so carve a per-thread TLS/ThreadType block out of the guest stack
+     * instead of using unrelated heap allocations. */
+    uint64_t stack_base = 0, stack_size = 0;
+    runtime_guest_stack_info(&stack_base, &stack_size);
+    static uint64_t stack_index;
+    uint64_t idx = __atomic_fetch_add(&stack_index, 1, __ATOMIC_RELAXED);
+    const uint64_t area = 1u << 20;
+    need(stack_size >= (idx + 1) * area, "guest stack area");
+    uintptr_t area_base = (uintptr_t)(stack_base + stack_size - (idx + 1) * area);
+    need(mprotect((void *)area_base, area, PROT_READ | PROT_WRITE) == 0, "guest stack mapping");
+    runtime_guest_commit(area_base, area);
+
+    /* Put the TLS/TLR/ThreadType at the bottom of this thread's stack area.
+     * nn::os discovers the committed area as the thread stack, so the TLR is
+     * inside the range GetCurrentStackInfo later returns. */
+    hc->guest_tls = (uint8_t *)area_base;       /* 8 KiB TLS, TPIDR_EL0 guest value */
+    hc->guest_tlr = hc->guest_tls + 0x2000;     /* 0x200 ThreadLocalRegion */
+    hc->dummy = hc->guest_tls + 0x3000;         /* ThreadType read from TLR+0x1f8 */
+    uint64_t tb = area_base, ts = area;
+    memcpy(hc->dummy + 0x50, &tb, 8);           /* ThreadType::stack_base */
+    memcpy(hc->dummy + 0x58, &ts, 8);           /* ThreadType::stack_size */
     memcpy(hc->guest_tlr + 0x1f8, &hc->dummy, 8);
+    hc->guest_stack_top = area_base + area - 16;
+    if (getenv("TOTK_ANDROID_TLS_TRACE") || getenv("TOTK_ANDROID_CTOR_PROBE") || tls_probe_mode)
+        fprintf(stderr, "[totk-android] thread tls tlr=%p dummy=%p stack=%#llx+%#llx sp=%#llx\n",
+                hc->guest_tlr, hc->dummy, (unsigned long long)area_base,
+                (unsigned long long)area, (unsigned long long)hc->guest_stack_top);
     gs->ktls = (uintptr_t)hc->guest_tls;
     gs->ktlr = (uintptr_t)hc->guest_tlr;
     pthread_once(&ipc_key_once, ipc_key_init);
@@ -108,6 +139,12 @@ void runtime_thread_init(void) {
     if (!runtime_guest_slots_off) runtime_guest_slots_off = so;
     else need(so == runtime_guest_slots_off, "per-thread TLS offset changed (guest slots)");
 }
+
+uintptr_t runtime_guest_stack_top(void) { return g_host ? g_host->guest_stack_top : 0; }
+
+uint64_t runtime_guest_call(void *fn, uintptr_t stack_top,
+                            uint64_t a0, uint64_t a1, uint64_t a2,
+                            uint64_t a3, uint64_t a4);
 
 void runtime_hle_stack_set(uintptr_t top) { (void)top; }
 void runtime_hle_stack_init(uint64_t off) { (void)off; }
@@ -222,7 +259,7 @@ static void relocate(Module *m) {
             if (p) p = runtime_hle_wrap_named(p, s->name);   /* host replacements run on the host stack */
             if (!p && s->defined) p = s->value < m->key_off ? m->base + s->value : NULL;
             if (!p) p = runtime_symbol(s->name);
-            if (!p) {
+            if (!p && s->binding != 2) {
                 p = runtime_hle_stub(s->name);
                 if (p) p = runtime_hle_wrap_named(p, s->name);
             }
@@ -322,6 +359,23 @@ static int crash_read(uint64_t addr, void *out, size_t n) {
     return pread(mem, out, n, (off_t)addr) == (ssize_t)n;
 }
 
+/* Used by the SVC layer for non-fatal guest Break/asserts. */
+void runtime_guest_frame_report(uint64_t fp, uint64_t lr) {
+    char d[128];
+    describe_address(lr, d, sizeof d);
+    fprintf(stderr, "[guest] lr=%s fp=%#llx\n", d, (unsigned long long)fp);
+    uint64_t chain_fp = fp;
+    for (unsigned n = 0; n < 12 && chain_fp && !(chain_fp & 7); n++) {
+        uint64_t pair[2];
+        if (!crash_read(chain_fp, pair, sizeof pair)) break;
+        describe_address(pair[1], d, sizeof d);
+        fprintf(stderr, "[guest] frame %u: fp=%#llx lr=%s\n",
+                n, (unsigned long long)chain_fp, d);
+        if (!pair[0] || (pair[0] & 7) || pair[0] <= chain_fp) break;
+        chain_fp = pair[0];
+    }
+}
+
 static void crash_handler(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *u = ctx;
     uint64_t pc = u->uc_mcontext.pc;
@@ -331,9 +385,85 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
     char pcd[128], lrd[128];
     describe_address(pc, pcd, sizeof pcd);
     describe_address(lr, lrd, sizeof lrd);
-    fprintf(stderr, "[crash] sig=%d pc=%s lr=%s fault=%p sp=%#llx x8=%#llx\n",
+    fprintf(stderr, "[crash] sig=%d pc=%s lr=%s fault=%p sp=%#llx x0=%#llx x1=%#llx x8=%#llx\n",
             sig, pcd, lrd, si ? si->si_addr : NULL, (unsigned long long)sp,
+            (unsigned long long)u->uc_mcontext.regs[0], (unsigned long long)u->uc_mcontext.regs[1],
             (unsigned long long)u->uc_mcontext.regs[8]);
+
+    if (getenv("TOTK_ANDROID_CRASH_DUMP")) {
+        const unsigned long long *rr = (const unsigned long long *)u->uc_mcontext.regs;
+        fprintf(stderr, "[crash] regs x0=%#llx x1=%#llx x2=%#llx x3=%#llx x4=%#llx x5=%#llx x6=%#llx x7=%#llx\n",
+                (unsigned long long)rr[0], (unsigned long long)rr[1], (unsigned long long)rr[2],
+                (unsigned long long)rr[3], (unsigned long long)rr[4], (unsigned long long)rr[5],
+                (unsigned long long)rr[6], (unsigned long long)rr[7]);
+        fprintf(stderr, "[crash] regs x19=%#llx x20=%#llx x21=%#llx x22=%#llx x23=%#llx x24=%#llx x25=%#llx x26=%#llx x27=%#llx x28=%#llx\n",
+                (unsigned long long)rr[19], (unsigned long long)rr[20], (unsigned long long)rr[21],
+                (unsigned long long)rr[22], (unsigned long long)rr[23], (unsigned long long)rr[24],
+                (unsigned long long)rr[25], (unsigned long long)rr[26], (unsigned long long)rr[27],
+                (unsigned long long)rr[28]);
+        for (unsigned i = 0; i < 4; i++) {
+            uint64_t obj = rr[i];
+            uint64_t q[9] = {0};
+            if (!obj || (obj & 7) || !crash_read(obj, q, sizeof q)) continue;
+            fprintf(stderr, "[crash] [x%u]: +0=%#llx +8=%#llx +0x20=%#llx +0x38=%#llx +0x40=%#llx\n",
+                    i, (unsigned long long)q[0], (unsigned long long)q[1],
+                    (unsigned long long)q[4], (unsigned long long)q[7], (unsigned long long)q[8]);
+        }
+        if (rr[22]) {
+            uint64_t v[12] = {0};
+            if (crash_read(rr[22], v, sizeof v))
+                fprintf(stderr, "[crash] [x22] +0=%#llx +8=%#llx +0x10=%#llx +0x18=%#llx +0x20=%#llx\n",
+                        (unsigned long long)v[0], (unsigned long long)v[1],
+                        (unsigned long long)v[2], (unsigned long long)v[3],
+                        (unsigned long long)v[4]);
+        }
+        /* The two callee-saved pointers around the nn::gfx allocation path:
+         * x20 is the argument struct, x21 the object that owns the allocation.
+         * Follow one level so a null heap/allocator is visible without a
+         * debugger. */
+        for (unsigned i = 19; i <= 22; i++) {
+            uint64_t obj = rr[i], q[32] = {0};
+            if (!obj || (obj & 7) || !crash_read(obj, q, sizeof q)) continue;
+            fprintf(stderr, "[crash] [x%u]=%#llx: +0=%#llx +8=%#llx +0x10=%#llx +0x18=%#llx"
+                    " +0x20=%#llx +0x28=%#llx +0x30=%#llx +0x38=%#llx\n",
+                    i, (unsigned long long)obj,
+                    (unsigned long long)q[0], (unsigned long long)q[1],
+                    (unsigned long long)q[2], (unsigned long long)q[3],
+                    (unsigned long long)q[4], (unsigned long long)q[5],
+                    (unsigned long long)q[6], (unsigned long long)q[7]);
+            for (unsigned j = 0; j < 8; j++) {
+                uint64_t p = q[j], v = 0;
+                if (!p || (p & 7) || !crash_read(p, &v, 8)) continue;
+                fprintf(stderr, "[crash]   [x%u+%#x] -> %#llx: [0]=%#llx\n", i, j * 8,
+                        (unsigned long long)p, (unsigned long long)v);
+            }
+        }
+        uint8_t *mb = runtime_module_base("main");
+        if (mb) {
+            static const struct { uint32_t off; const char *name; } globals[] = {
+                {0x4557768, "alloc-global"}, {0x4557798, "current-thread"},
+                {0x4563010, "gfx-mgr"}, {0x4563018, "gfx-mgr-2"},
+                {0x45586f0, "gfx-device-slot"},
+            };
+            for (unsigned i = 0; i < sizeof globals / sizeof *globals; i++) {
+                uint64_t p = 0, v = 0;
+                if (!crash_read((uintptr_t)(mb + globals[i].off), &p, 8)) continue;
+                if (p && !(p & 7) && crash_read(p, &v, 8)) {
+                    fprintf(stderr, "[crash] %s @%#x: %#llx -> [0]=%#llx\n",
+                            globals[i].name, globals[i].off,
+                            (unsigned long long)p, (unsigned long long)v);
+                } else {
+                    fprintf(stderr, "[crash] %s @%#x: %#llx (null)\n",
+                            globals[i].name, globals[i].off, (unsigned long long)p);
+                }
+            }
+            uint64_t g[16] = {0};
+            if (crash_read((uintptr_t)(mb + 0x463c000), g, sizeof g))
+                for (unsigned i = 0; i < 16; i += 2)
+                    fprintf(stderr, "[crash] sead+%#x: %#llx %#llx\n", i * 8,
+                            (unsigned long long)g[i], (unsigned long long)g[i + 1]);
+        }
+    }
 
     /* Guest frame-pointer chain: at x29 the pair is {caller fp, return address}. */
     uint64_t chain_fp = fp;
@@ -345,6 +475,19 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
             describe_address(pair[1], fd, sizeof fd);
             fprintf(stderr, "[crash] frame %u: fp=%#llx lr=%s\n",
                     n, (unsigned long long)chain_fp, fd);
+            if (getenv("TOTK_ANDROID_CRASH_DUMP") && n == 1) {
+                /* 0x811784 saves x23 (the sead heap the allocation uses) at
+                 * fp+0x30; the 0x810c68 caller keeps it at fp-0xa9898. */
+                uint64_t v[16] = {0};
+                if (crash_read(chain_fp + 0x20, v, sizeof v))
+                    fprintf(stderr, "[crash] frame 1 saved x24..x27=%#llx %#llx %#llx %#llx\n",
+                            (unsigned long long)v[0], (unsigned long long)v[1],
+                            (unsigned long long)v[2], (unsigned long long)v[3]);
+                if (crash_read(chain_fp + 0x30, v, 8))
+                    fprintf(stderr, "[crash] frame 1 heap x23=%#llx\n", (unsigned long long)v[0]);
+                if (crash_read(chain_fp - 0xa9898, v, 8))
+                    fprintf(stderr, "[crash] frame 2 saved resource=%#llx\n", (unsigned long long)v[0]);
+            }
             uint64_t next = pair[0];
             if (!next || (next & 7) || next <= chain_fp || next - chain_fp > (64u << 20)) break;
             chain_fp = next;
@@ -372,9 +515,78 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
 
 static uint64_t host_add(uint64_t a, uint64_t b) { return a + b; }
 
+static uint64_t guest_call1(void *fn, uint64_t a0) {
+    return runtime_guest_call(fn, runtime_guest_stack_top(), a0, 0, 0, 0, 0);
+}
+static uint64_t guest_call2(void *fn, uint64_t a0, uint64_t a1) {
+    return runtime_guest_call(fn, runtime_guest_stack_top(), a0, a1, 0, 0, 0);
+}
+
+typedef struct { uint32_t slot; uint64_t value; int ok; } TlsThreadProbe;
+static void *tls_probe_thread(void *p) {
+    TlsThreadProbe *t = p;
+    runtime_thread_init();
+    void *set = runtime_symbol("_ZN2nn2os11SetTlsValueENS0_7TlsSlotEm");
+    void *get = runtime_symbol("_ZN2nn2os11GetTlsValueENS0_7TlsSlotE");
+    if (!set || !get) { t->ok = 0; return NULL; }
+    guest_call2(set, t->slot, t->value);
+    uint64_t v = guest_call1(get, t->slot);
+    t->ok = v == t->value;
+    fprintf(stderr, "[totk-tls] thread slot=%u get=%#llx ok=%d\n",
+            t->slot, (unsigned long long)v, t->ok);
+    return NULL;
+}
+
+static void tls_probe(void) {
+    void *alloc = runtime_symbol("_ZN2nn2os15AllocateTlsSlotEPNS0_7TlsSlotEPFvmE");
+    void *set = runtime_symbol("_ZN2nn2os11SetTlsValueENS0_7TlsSlotEm");
+    void *get = runtime_symbol("_ZN2nn2os11GetTlsValueENS0_7TlsSlotE");
+    void *free_slot = runtime_symbol("_ZN2nn2os11FreeTlsSlotENS0_7TlsSlotE");
+    void *cur = runtime_symbol("_ZN2nn2os16GetCurrentThreadEv");
+    void *stack = runtime_symbol("_ZN2nn2os19GetCurrentStackInfoEPmS1_");
+    fprintf(stderr, "[totk-tls] symbols alloc=%p set=%p get=%p free=%p cur=%p stack=%p\n",
+            alloc, set, get, free_slot, cur, stack);
+    need(alloc && set && get && free_slot && cur && stack, "nn::os TLS symbols");
+
+    uint32_t slot = 0xffffffffu;
+    uint32_t ar = (uint32_t)guest_call2(alloc, (uintptr_t)&slot, 0);
+    fprintf(stderr, "[totk-tls] AllocateTlsSlot -> result=%#x slot=%u\n", ar, slot);
+    need(ar == 0 && slot != 0xffffffffu, "AllocateTlsSlot");
+    guest_call2(set, slot, 0x1122334455667788ull);
+    uint64_t gv = guest_call1(get, slot);
+    fprintf(stderr, "[totk-tls] GetTlsValue(main) -> %#llx\n", (unsigned long long)gv);
+    need(gv == 0x1122334455667788ull, "GetTlsValue(main)");
+
+    void *thread = (void *)(uintptr_t)guest_call1(cur, 0);
+    uint64_t base = 0, size = 0;
+    uint64_t sb = 0, ss = 0;
+    runtime_guest_call(stack, runtime_guest_stack_top(), (uintptr_t)&sb, (uintptr_t)&ss, 0, 0, 0);
+    base = sb; size = ss;
+    fprintf(stderr, "[totk-tls] GetCurrentThread=%p stack=%#llx+%#llx\n",
+            thread, (unsigned long long)base, (unsigned long long)size);
+    need(thread != NULL, "GetCurrentThread");
+    uint64_t tlr = 0;
+    if (g_slots) tlr = g_slots->ktlr;
+    need(base && size && tlr >= base && tlr < base + size, "GetCurrentStackInfo covers TLR");
+
+    TlsThreadProbe tp = {.slot = slot, .value = 0xaabbccddeeff0011ull, .ok = 0};
+    pthread_t th;
+    need(pthread_create(&th, NULL, tls_probe_thread, &tp) == 0, "TLS probe thread");
+    need(pthread_join(th, NULL) == 0, "TLS probe join");
+    need(tp.ok, "per-thread TLS value");
+    need(guest_call1(get, slot) == 0x1122334455667788ull, "TLS value leaked across threads");
+
+    guest_call1(free_slot, slot);
+    printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"tls\","
+           "\"slot\":%u,\"thread_independent\":true,\"stack\":\"%#llx+%#llx\"}\n",
+           slot, (unsigned long long)base, (unsigned long long)size);
+    fflush(stdout);
+    _exit(0);
+}
+
 /* STOP_AFTER_INITS is a diagnostic for the constructor pass, so it implies INITS. */
 static int inits_enabled(void) {
-    return getenv("TOTK_ANDROID_INITS") || getenv("TOTK_ANDROID_STOP_AFTER_INITS");
+    return tls_probe_mode || getenv("TOTK_ANDROID_INITS") || getenv("TOTK_ANDROID_STOP_AFTER_INITS");
 }
 
 static void loader_ready(void) {
@@ -505,19 +717,86 @@ static void fs_probe(void) {
     fflush(stdout);
 }
 
+/* Run a module's .init_array on the host.  The guest DT_INIT wrapper only
+ * runs this loop when __nnmusl_init_dso reports a fini callback (state 2); when
+ * the module has none it returns 1 and the wrapper skips every constructor.
+ * On this 1.0.0 Android rewrite that leaves SEAD's globals uninitialised, so
+ * the loader performs the constructor pass itself after the guest's musl
+ * bookkeeping has run.  This is an init hook: the guest image is untouched. */
+static uint64_t run_init_array(Module *m) {
+    uint64_t n = m->init_size / 8, called = 0;
+    uint64_t watch_before = 0;
+    uint8_t *main_base = runtime_module_base("main");
+    int watch = getenv("TOTK_ANDROID_CTOR_PROBE") && main_base;
+    if (watch) memcpy(&watch_before, main_base + 0x463c048, 8);
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t fn = 0;
+        memcpy(&fn, m->base + m->init_array + i * 8, 8);
+        if (!fn) continue;
+        ((void (*)(void))(uintptr_t)fn)();
+        called++;
+        if (watch) {
+            uint64_t now = 0;
+            memcpy(&now, main_base + 0x463c048, 8);
+            if (now != watch_before) {
+                fprintf(stderr, "[totk-android] constructor %llu sets main+0x463c048 = %#llx\n",
+                        (unsigned long long)i, (unsigned long long)now);
+                watch_before = now;
+            }
+        }
+    }
+    return called;
+}
+
 static void module_inits(void) {
     if (inits_enabled()) {
         for (unsigned i = 0; i < NMODULES; i++) {
             fprintf(stderr, "[totk-android] ENTER %s DT_INIT\n", modules[i].name);
-            ((void (*)(void))(modules[i].base + modules[i].init))();
+            if (getenv("TOTK_ANDROID_CTOR_PROBE")) {
+                const Module *m = &modules[i];
+                uint32_t before = 0;
+                memcpy(&before, m->base + m->ctor_flag, 4);
+                uint64_t entries = m->init_size / 8, nonnull = 0;
+                for (uint64_t k = 0; k < entries; k++) {
+                    uint64_t fn = 0;
+                    memcpy(&fn, m->base + m->init_array + k * 8, 8);
+                    if (fn) nonnull++;
+                }
+                fprintf(stderr, "[totk-android] ctor probe %s state_before=%u .init_array=%llu entries (%llu non-null)\n",
+                        m->name, before, (unsigned long long)entries, (unsigned long long)nonnull);
+            }
+            uint64_t ret = ((uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                          uint64_t, uint64_t, uint64_t, uint64_t))
+                            (modules[i].base + modules[i].init))(0, 0, 0, 0, 0, 0, 0, 0, 0);
             uint32_t state;
             memcpy(&state, modules[i].base + modules[i].ctor_flag, 4);
-            fprintf(stderr, "[totk-android] RETURN %s DT_INIT state=%u init_array=%llu\n",
-                    modules[i].name, state, (unsigned long long)(modules[i].init_size / 8));
-            /* musl's __nnmusl_init_dso returns 2 after running .init_array and 1 when the
-               module has no fini callback; both mean the constructor pass completed. */
-            need(state == 1 || state == 2, "DT_INIT deferred or skipped constructors");
+            fprintf(stderr, "[totk-android] RETURN %s DT_INIT state=%u ret=%#llx init_array=%llu\n",
+                    modules[i].name, state, (unsigned long long)ret,
+                    (unsigned long long)(modules[i].init_size / 8));
+            need(state == 1 || state == 2, "DT_INIT deferred or failed");
+            if (state == 1) {
+                uint64_t called = run_init_array(&modules[i]);
+                fprintf(stderr, "[totk-android] constructors %s (host pass): %llu of %llu\n",
+                        modules[i].name, (unsigned long long)called,
+                        (unsigned long long)(modules[i].init_size / 8));
+            }
         }
+        if (getenv("TOTK_ANDROID_CTOR_PROBE")) {
+            uint64_t tlr = 0, tt = 0, tb = 0, ts = 0, t70 = 0;
+            if (g_slots) { tlr = g_slots->ktlr; memcpy(&tt, (void *)(uintptr_t)(tlr + 0x1f8), 8); }
+            if (tt) { memcpy(&tb, (void *)(uintptr_t)(tt + 0x50), 8); memcpy(&ts, (void *)(uintptr_t)(tt + 0x58), 8); memcpy(&t70, (void *)(uintptr_t)(tt + 0x70), 8); }
+            fprintf(stderr, "[totk-android] tls state ktlr=%#llx tt=%#llx base=%#llx size=%#llx t70=%#llx\n",
+                    (unsigned long long)tlr, (unsigned long long)tt,
+                    (unsigned long long)tb, (unsigned long long)ts, (unsigned long long)t70);
+            uint8_t *mb = runtime_module_base("main");
+            if (mb) {
+                uint64_t thread_mgr = 0;
+                memcpy(&thread_mgr, mb + 0x463c000, 8);   /* 1.0.0-only diagnostic */
+                fprintf(stderr, "[totk-android] after inits sead::ThreadMgr=%#llx\n",
+                        (unsigned long long)thread_mgr);
+            }
+        }
+        if (tls_probe_mode) tls_probe();
         if (getenv("TOTK_ANDROID_FS_PROBE")) fs_probe();
     }
     if (getenv("TOTK_ANDROID_STOP_AFTER_INITS")) {
@@ -535,8 +814,10 @@ static int boot_sdk(void) {
     void *start = runtime_symbol("_ZN2nn4init5StartEmmPFvvES2_S2_");
     need(start != NULL, "nn::init::Start symbol");
     fprintf(stderr, "[totk-android] ENTER nn::init::Start\n");
-    ((void (*)(uint64_t, uint64_t, void (*)(void), void (*)(void), void (*)(void)))start)
-        (main_handle, 0, loader_ready, module_inits, module_finis);
+    runtime_guest_call(start, runtime_guest_stack_top(), main_handle, 0,
+                       (uint64_t)(uintptr_t)loader_ready,
+                       (uint64_t)(uintptr_t)module_inits,
+                       (uint64_t)(uintptr_t)module_finis);
     runtime_fail("nn::init::Start returned");
     return 1;
 }
@@ -582,6 +863,7 @@ int main(int argc, char **argv) {
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
+
     fprintf(stderr, "[totk-android] main start\n");
     need(argc == 3, "usage: totk-android <rewritten-dir> probe");
     runtime_thread_init();
@@ -595,6 +877,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[totk-android] sealed all\n");
     if (!strcmp(argv[2], "probe")) return probe();
     if (!strcmp(argv[2], "probe-hle")) return probe_hle();
+    if (!strcmp(argv[2], "probe-tls")) { tls_probe_mode = 1; return boot_sdk(); }
     if (!strcmp(argv[2], "boot-sdk")) return boot_sdk();
     runtime_fail("unknown mode");
 }

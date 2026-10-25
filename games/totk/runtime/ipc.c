@@ -365,9 +365,13 @@ static void android_stub_service(IpcSession *s, const IpcRequest *rq, IpcRespons
     if (logged++ < 200)
         fprintf(stderr, "[totk-ipc] stub service %s command %u (type %u, %u bytes)\n",
                 s->name, rq->cmd, rq->type, rq->data_size);
-    if (ipc_trace_enabled())
-        fprintf(stderr, "[ipc] unknown command service=%s command=%u type=%u\n",
+    if (ipc_trace_enabled()) {
+        fprintf(stderr, "[ipc] unknown command service=%s command=%u type=%u data=",
                 s->name, rq->cmd, rq->type);
+        for (unsigned i = 0; i * 4 + 4 <= rq->data_size; i++)
+            fprintf(stderr, "%s%08x", i ? " " : "", IPC_ARG(rq, uint32_t, i * 4));
+        fputc('\n', stderr);
+    }
     rs->result = 0;
 }
 #endif

@@ -38,6 +38,57 @@ static int oe_performance_config(int mode, int config) { fprintf(stderr, "[totk-
 static int oe_cpu_boost(int mode) { fprintf(stderr, "[totk-android] CPU boost mode %d\n", mode); return 0; }
 static int oe_notification(unsigned char enabled) { (void)enabled; return 0; }
 static uint64_t applet_resource_user_id(void) { return 1; }
+void *runtime_nvn_bootstrap(const char *name);
+void *runtime_hid_override(const char *name);
+
+/* Host-side vi layer/window lifecycle.  The SDK's CreateLayer validates an
+ * indirect-layer table that only a real compositor populates; there is no
+ * compositor in Phase 1.  Keep the SDK's display/initialize/vsync path (it
+ * talks to vi:m), but hand the game a real host layer object and a real host
+ * native-window object.  NVN stores the latter in its window builder; no
+ * rendering backend is connected yet. */
+static uint64_t vi_layer_object;
+static uint64_t vi_native_window_object;
+static uint32_t vi_create_layer_host(void **out, void *display) {
+    (void)display;
+    if (!out) return 0xf601;
+    *out = &vi_layer_object;
+    return 0;
+}
+static uint32_t vi_get_native_window_host(void **out, void *layer) {
+    if (!out || layer != &vi_layer_object) return 0xf601;
+    *out = &vi_native_window_object;
+    return 0;
+}
+
+/* nn::am::GetSelfController returns a pointer to the ISelfController proxy.
+ * Until the am service is implemented, give the SDK a valid object whose
+ * virtual calls succeed; the first method it needs (CreateLayer -> vtable+0xd0)
+ * only checks the result.  A zeroed pointer here is what used to crash. */
+static uint64_t am_self_vtable[0x40];
+static uint64_t am_self_object[0x20];
+static uint64_t am_virtual_stub(void) { return 0; }
+/* ISelfController vtable+0xd0: CreateManagedDisplaySeparableLayer(Out<u64>,
+ * Out<u64>).  nn::vi::CreateLayer calls it before it asks the display service
+ * for a layer; a success with no written layer ids leaves the caller with
+ * uninitialised objects. */
+static uint64_t am_create_managed_layer(void *self, uint64_t *layer, uint64_t *separable) {
+    (void)self;
+    if (layer) *layer = 1;
+    if (separable) *separable = 2;
+    return 0;
+}
+static void *am_get_self_controller(void) {
+    static int ready;
+    if (!ready) {
+        for (unsigned i = 0; i < sizeof am_self_vtable / sizeof *am_self_vtable; i++)
+            am_self_vtable[i] = (uintptr_t)am_virtual_stub;
+        am_self_vtable[0xd0 / 8] = (uintptr_t)am_create_managed_layer;
+        am_self_object[0] = (uintptr_t)am_self_vtable;
+        ready = 1;
+    }
+    return am_self_object;
+}
 static void apm_init(void) { fprintf(stderr, "[totk-android] nn::apm initialized on the host\n"); }
 static void apm_finalize(void) { }
 static int apm_performance_mode(void) { return handheld() ? 0 : 1; }
@@ -56,6 +107,14 @@ static void pctl_init(void) { fprintf(stderr, "[totk-android] parental controls:
 static void err_init(void) { fprintf(stderr, "[totk-android] error contexts: local diagnostics\n"); }
 static void diag_abort_init(void) { fprintf(stderr, "[totk-android] native crash observer initialized\n"); }
 
+/* The launch-parameter channel is an applet storage object.  Boot has no
+ * pending parameters yet, so report an empty queue instead of dereferencing
+ * the uninitialised applet proxy. */
+static int applet_try_pop_parameter(void *storage, int kind) {
+    (void)storage; (void)kind;
+    return 0;
+}
+
 void *runtime_override(const char *name) {
     static const struct { const char *name; void *fn; } map[] = {
         {"_ZN2nn2oe10InitializeEv", oe_init},
@@ -71,6 +130,7 @@ void *runtime_override(const char *name) {
         {"_ZN2nn2oe44SetPerformanceModeChangedNotificationEnabledEb", oe_notification},
         {"_ZN2nn6applet23GetAppletResourceUserIdEv", applet_resource_user_id},
         {"_ZN2nn2am23GetAppletResourceUserIdEv", applet_resource_user_id},
+        {"_ZN2nn2am17GetSelfControllerEv", am_get_self_controller},
         {"_ZN2nn3apm10InitializeEv", apm_init},
         {"_ZN2nn3apm8FinalizeEv", apm_finalize},
         {"_ZN2nn3apm18GetPerformanceModeEv", apm_performance_mode},
@@ -84,18 +144,29 @@ void *runtime_override(const char *name) {
         {"_ZN2nn4pctl10InitializeEv", pctl_init},
         {"_ZN2nn3err26InitializeContextWriterApiEv", err_init},
         {"_ZN2nn4diag34InitializeApplicationAbortObserverEv", diag_abort_init},
+        {"_ZN2nn6applet37TryPopFromApplicationParameterChannelEPNS0_13StorageHandleENS0_19LaunchParameterKindE", applet_try_pop_parameter},
+        {"nvnBootstrapLoader", runtime_nvn_bootstrap},
+        {"_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE", vi_create_layer_host},
+        {"_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE", vi_get_native_window_host},
     };
     for (size_t i = 0; i < sizeof map / sizeof *map; i++)
         if (!strcmp(name, map[i].name)) return map[i].fn;
+    void *hid = runtime_hid_override(name);
+    if (hid) return hid;
     return runtime_fs_override(name);   /* nn::fs runs on the host, not through fsp-srv */
 }
 
 /* The milestone stops at the original nnMain entry.  TOTK_ANDROID_RUN_NNMAIN=1
  * lets the original function continue for the next HLE milestone. */
+uintptr_t runtime_guest_stack_top(void);
+uint64_t runtime_guest_call(void *fn, uintptr_t stack_top,
+                            uint64_t a0, uint64_t a1, uint64_t a2,
+                            uint64_t a3, uint64_t a4);
+
 static void nnmain_entry(void) {
     fprintf(stderr, "[totk-android] ENTER nnMain\n");
     if (getenv("TOTK_ANDROID_RUN_NNMAIN")) {
-        ((void (*)(void))runtime_symbol("nnMain"))();
+        runtime_guest_call(runtime_symbol("nnMain"), runtime_guest_stack_top(), 0, 0, 0, 0, 0);
         return;
     }
     printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"sdk-start\",\"stage\":\"nnMain-entry\"}\n");

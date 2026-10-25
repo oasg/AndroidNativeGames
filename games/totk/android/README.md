@@ -20,8 +20,24 @@ gate + HLE-stack thunks + a minimal SVC layer.
   registered as an optional/diagnostic protocol path.
 - Runs `main`, `subsdk0` and `sdk` `DT_INIT` and reaches the original
   `nnMain` entry with `TOTK_ANDROID_INITS=1`; the process stops there by
-  default. `TOTK_ANDROID_RUN_NNMAIN=1` lets the original `nnMain` continue for
-  the next HLE milestone; it currently stops in the guest graphics setup.
+  default. `TOTK_ANDROID_RUN_NNMAIN=1` lets the original `nnMain` continue.
+- On 1.0.0 the guest `DT_INIT` state is 1 (no fini callback), which makes the
+  guest skip its `.init_array` loop. The loader runs the constructor pass on
+  the guest stack itself (`TOTK_ANDROID_CTOR_PROBE=1` prints the count). See
+  `docs/android-hle-phase1.md`.
+- Guest entry points run on a real guest stack; each thread has its own 8 KiB
+  TLS, ThreadLocalRegion and ThreadType, so `GetCurrentStackInfo` and
+  `GetTlsValue`/`SetTlsValue` see the layout the SDK expects.
+- `nvnBootstrapLoader`/`nvnDeviceGetProcAddress` and the NVN device
+  initialization path run on the host (`nvn_android.c`); the NVN device object
+  is created and the former SEAD task crash at `main+0x214a5e0` is gone.
+- `nn::vi` uses the SDK display/initialize/vsync path, with host layer/native
+  window objects for `CreateLayer`/`GetNativeWindow` until a renderer exists.
+- `nn::hid::InitializeNpad` is a host no-pad backend for now (zero Npad/6-axis
+  state, vibration stub).
+- The guest thread stack guard uses accurate `QueryMemory` committed ranges and
+  SVC `MapMemory`/`UnmapMemory`; guest TLS/TLR live at the bottom of each
+  committed stack area.
 - HLE thunks switch to the per-thread HostContext stack.
 
 ## Build
@@ -46,6 +62,7 @@ adb push gamebin/TOTK_build/totk/rewritten/android-v0/*.patched.bin /data/local/
 adb shell chmod 755 /data/local/tmp/totk-android/totk-android
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-hle
+adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-tls
 TOTK_ANDROID_TRACE_SVC=1 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android boot-sdk
 ```
 
@@ -83,18 +100,27 @@ thread handle:
 [crash] guest thread handle=0x...
 ```
 
-See `docs/android-hle-phase0.md` for the first `nnMain` gap and the next HLE
-service list.
+See `docs/android-hle-phase0.md` for the first `nnMain` gap and
+`docs/android-hle-phase1.md` for the SEAD constructor fix, TLS verification,
+the service trace and the current next gap.
 
 Expected results on an arm64 Android device:
 
 - `probe`: 4 threads × 1000 `GetSystemTick` calls, timer gate count 4000.
 - `probe-hle`: HLE thunk returns 7.
+- `probe-tls`: allocates a TLS slot, checks `SetTlsValue`/`GetTlsValue` on the
+  main thread and on a second thread, verifies the values do not leak between
+  threads, and checks `GetCurrentStackInfo` covers the TLR.
 - `boot-sdk`: reaches `{"stage":"loader-ready"}`.
 - `TOTK_ANDROID_INITS=1 boot-sdk`: runs the three module `DT_INIT`s and
   reaches `{"stage":"nnMain-entry"}`.
 - `TOTK_ANDROID_STOP_AFTER_INITS=1`: stops after the constructors for
   diagnostics; it implies `TOTK_ANDROID_INITS`.
+- `TOTK_ANDROID_CTOR_PROBE=1`: logs the `DT_INIT` state before/after each
+  module, the `.init_array` entry count, and the number of constructors the
+  loader calls. Use it to confirm the 1.0.0 state-1 path.
+- `TOTK_ANDROID_TLS_TRACE=1`: logs each thread's guest TLS/TLR/ThreadType and
+  guest stack top.
 - `TOTK_ANDROID_FS_PROBE=1`: after the constructors, exercises the `nn::fs`
   host overrides: temp write/read, save mount/create/write/commit, directory
   listing, and (when `TOTK_ANDROID_ROMFS` is set) a RomFS mount/read.
@@ -127,7 +153,9 @@ Expected results on an arm64 Android device:
 1. Finish the optional `fsp-srv` file-system protocol (`IFileSystem`/`IFile`
    objects) and point `IStorage` at the extracted RomFS/save data. The
    production file path now uses the `nn::fs` host overrides instead.
-2. Continue past `nnMain` with the graphics/input/audio services; the first
-   call after focus setup currently stops in the guest graphics setup.
-3. Port the remaining memory SVCs (`MapPhysicalMemory` details, stack moves,
-   precise `QueryMemory`) and the rest of the HLE service registry.
+2. Continue past `nnMain` with the graphics/input/audio services. The current
+   stop is the `nn::gfx` window/queue object at `main+0x1123f7c`, after NVN/VI
+   initialization; see `docs/android-hle-phase1.md`.
+3. Port the remaining memory SVCs (`MapMemory` is currently a copy, not a
+   shared alias; `MapPhysicalMemory` details) and the rest of the HLE service
+   registry.
