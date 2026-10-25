@@ -56,4 +56,9 @@ int gfx_backend_surface_present(float r, float g, float b, float a);
  * clear, GPU copy-back and pixel verification. */
 int gfx_backend_selftest(void);
 
+/* Validate a translated SPIR-V module with the real Android Vulkan driver by
+ * creating a VkShaderModule.  This is the Android-side check of the offline
+ * NVN -> SPIR-V chain; it rejects a bad magic/alignment before the driver. */
+int gfx_backend_validate_spirv(const uint8_t *code, size_t size, const char *name);
+
 #endif

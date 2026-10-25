@@ -8,6 +8,7 @@
 #include "runtime.h"
 #include "ipc.h"
 #include "sha256.h"
+#include "gfx_backend_android.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -17,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <dirent.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -1061,8 +1063,39 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[totk-android] sealed all\n");
     if (!strcmp(argv[2], "probe")) return probe();
     if (!strcmp(argv[2], "probe-hle")) return probe_hle();
+    if (!strcmp(argv[2], "probe-spirv")) {
+        const char *dir = getenv("TOTK_ANDROID_SPV_DIR");
+        if (!dir) dir = "/data/local/tmp/totk-android/spv";
+        DIR *d = opendir(dir);
+        if (!d) { fprintf(stderr, "[totk-spv] ERROR cannot open %s\n", dir); return 1; }
+        unsigned total = 0, failed = 0;
+        struct dirent *ent;
+        while ((ent = readdir(d))) {
+            size_t n = strlen(ent->d_name);
+            if (n < 5 || strcmp(ent->d_name + n - 4, ".spv")) continue;
+            char path[PATH_MAX];
+            snprintf(path, sizeof path, "%s/%s", dir, ent->d_name);
+            int fd = open(path, O_RDONLY);
+            if (fd < 0) { fprintf(stderr, "[totk-spv] ERROR open %s\n", path); failed++; continue; }
+            struct stat st;
+            if (fstat(fd, &st) != 0 || st.st_size <= 0 || st.st_size > (off_t)(16 << 20)) {
+                fprintf(stderr, "[totk-spv] ERROR size %s\n", path); close(fd); failed++; continue;
+            }
+            uint8_t *buf = malloc((size_t)st.st_size);
+            ssize_t got = buf ? read(fd, buf, (size_t)st.st_size) : -1;
+            close(fd);
+            if (!buf || got != st.st_size) { fprintf(stderr, "[totk-spv] ERROR read %s\n", path); free(buf); failed++; continue; }
+            total++;
+            if (!gfx_backend_validate_spirv(buf, (size_t)got, ent->d_name)) failed++;
+            free(buf);
+        }
+        closedir(d);
+        if (!total) { fprintf(stderr, "[totk-spv] ERROR no .spv files in %s\n", dir); return 1; }
+        printf("{\"status\":\"%s\",\"host\":\"android\",\"probe\":\"spirv\",\"modules\":%u,\"failed\":%u}\n",
+               failed ? "fail" : "pass", total, failed);
+        return failed ? 1 : 0;
+    }
     if (!strcmp(argv[2], "probe-vulkan")) {
-        int gfx_backend_selftest(void);
         if (!gfx_backend_selftest()) { fprintf(stderr, "[totk-vk] selftest FAIL\n"); return 1; }
         printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"vulkan-offscreen\"}\n");
         return 0;

@@ -993,6 +993,37 @@ int gfx_backend_surface_present(float r, float g_, float b, float a) {
     return 1;
 }
 
+int gfx_backend_validate_spirv(const uint8_t *code, size_t size, const char *name) {
+    if (!code || !size) { vk_log("ERROR SPIR-V %s: empty module", name ? name : "?"); return 0; }
+    if (size < 20 || (size & 3)) {
+        vk_log("ERROR SPIR-V %s: size=%zu is not a whole SPIR-V header", name ? name : "?", size);
+        return 0;
+    }
+    uint32_t words[5];
+    memcpy(words, code, sizeof words);
+    if (words[0] != 0x07230203u) {
+        vk_log("ERROR SPIR-V %s: bad magic %#x", name ? name : "?", words[0]);
+        return 0;
+    }
+    if (!gfx_backend_vulkan_init()) return 0;
+    VkShaderModuleCreateInfo sci = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = size,
+        .pCode = (const uint32_t *)code,
+    };
+    VkShaderModule mod = VK_NULL_HANDLE;
+    VkResult r = vkCreateShaderModule(g.dev, &sci, NULL, &mod);
+    if (r != VK_SUCCESS) {
+        vk_log("ERROR SPIR-V %s: vkCreateShaderModule=%d generator=%u version=%u.%u",
+               name ? name : "?", (int)r, words[2], words[1] >> 16, (words[1] >> 8) & 0xff);
+        return 0;
+    }
+    vk_log("SPIR-V module OK name='%s' bytes=%zu version=%u.%u", name ? name : "?", size,
+           words[1] >> 16, (words[1] >> 8) & 0xff);
+    vkDestroyShaderModule(g.dev, mod, NULL);
+    return 1;
+}
+
 int gfx_backend_selftest(void) {
     if (!gfx_backend_vulkan_init()) {
         vk_log("ERROR Vulkan backend unavailable");

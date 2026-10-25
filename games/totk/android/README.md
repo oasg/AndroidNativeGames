@@ -56,6 +56,12 @@ gate + HLE-stack thunks + a minimal SVC layer.
   `ANativeWindow*`.  `TOTK_ANDROID_GFX_BACKEND=auto|vulkan|software` selects
   the path; forced Vulkan never falls back silently.  See
   `docs/android-hle-phase2b.md`.
+- Shader spike 2B.2: the existing Ryujinx `totk_xlate` translator already emits
+  Vulkan-targeted SPIR-V.  112 sampled system/tree/material shaders translated
+  with 0 failures and all 112 passed `vkCreateShaderModule` on the Android
+  GPU.  `tools/shader_spike.py` reproduces the sample and `probe-spirv`
+  validates a cache on-device.  See
+  `docs/android-hle-phase2b2-shader-spike.md`.
 - `nn::hid::InitializeNpad` is a host no-pad backend for now (zero Npad/6-axis
   state, vibration stub). Keyboard/mouse/touch/debug-pad/gesture initialization
   are host no-device initializers too, because the HID shared-memory service is
@@ -104,6 +110,20 @@ adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-vulkan
 TOTK_ANDROID_TRACE_SVC=1 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android boot-sdk
 ```
+
+### Shader SPIR-V spike
+
+```sh
+python3 games/totk/android/tools/shader_spike.py \
+  --romfs /tmp/totk-romfs-min --out /tmp/totk-shader-spike
+adb push /tmp/totk-shader-spike/out /data/local/tmp/totk-android/spv
+adb shell 'TOTK_ANDROID_SPV_DIR=/data/local/tmp/totk-android/spv \
+  /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-spirv'
+```
+
+`--all` translates every unique shader in the selected packages; the default
+is two per package.  The spike uses the macOS `totk_xlate` prebuilt and keeps
+game-derived output under `/tmp`.
 
 ### Host-call and IPC tracing
 
@@ -162,6 +182,8 @@ Expected results on an arm64 Android device:
   command buffer, submits it and presents it through Vulkan.  This is the
   first explicit `nvnQueueSubmitCommands`/`nvnQueuePresentTexture` point; it is
   a self-test, not the game's own frame.
+- `probe-spirv`: loads every `.spv` in `TOTK_ANDROID_SPV_DIR` and creates a
+  real `VkShaderModule` for each.  The 2B.2 sample was 112 modules, 0 failed.
 - `boot-sdk`: reaches `{"stage":"loader-ready"}`.
 - `TOTK_ANDROID_INITS=1 boot-sdk`: runs the three module `DT_INIT`s and
   reaches `{"stage":"nnMain-entry"}`.
@@ -217,12 +239,15 @@ Expected results on an arm64 Android device:
    `probe-vi`/`probe-nvn-submit` prove the builder round trip and the first
    submit/present points through the Vulkan backend.  The game's own first
    frame still depends on the `nn::gfx` context registration above.
-5. 2B.2+: move from the Vulkan bring-up target to real resources.  The next
-   steps are texture storage -> `VkImage` upload/format-modifier validation,
-   NVN `prog_t` -> `VkShaderModule`/`VkPipeline`, and command-buffer clear/draw
-   recording.  The Android Surface app shell is the step after that:
-   SurfaceView + JNI + a worker running the loader, attaching the
-   `ANativeWindow*` to the host native window.
-6. Port the remaining memory SVCs (`MapMemory` is currently a copy, not a
+5. 2B.2: ship an **offline SPIR-V shader cache**, not an on-device .NET
+   translator.  The 112-shader spike translated 112/112 and the Adreno driver
+   accepted 112/112 `VkShaderModule`s.  Next: translate the startup/title
+   subset, map NVN reflection to Vulkan descriptor sets, and create real
+   pipelines.  Missing variants fall back to clear/simple triangle; full game
+   visuals are not promised yet.  See `docs/android-hle-phase2b2-shader-spike.md`.
+6. 2B.3: texture storage -> `VkImage` upload/format-modifier validation and
+   the Android Surface app shell (SurfaceView + JNI + a worker running the
+   loader, attaching the `ANativeWindow*` to the host native window).
+7. Port the remaining memory SVCs (`MapMemory` is currently a copy, not a
    shared alias; `MapPhysicalMemory` details) and the rest of the HLE service
    registry.
