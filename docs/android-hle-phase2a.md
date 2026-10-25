@@ -314,7 +314,9 @@ calls `nvnQueuePresentTexture`.  The log contains the first explicit points:
 ```
 
 This proves the object graph and submit/present instrumentation, but it is a
-host self-test, not the game's first frame.
+host self-test, not the game's first frame.  Phase 2B.1 puts a real Vulkan
+offscreen target behind the same host native window; see
+`docs/android-hle-phase2b.md`.
 
 The Android app shell is deliberately still a follow-up.  To put the
 framebuffer on a Surface, the app needs:

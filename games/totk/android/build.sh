@@ -19,16 +19,16 @@ if [ ! -x "$cc" ]; then
 fi
 "$python" "$here/../scripts/prepare_android_runtime.py" --work "$work"
 out="$work/build/android-v0"
-"$cc" -std=c11 -O2 -static -Wall -Wextra \
+"$cc" -std=c11 -O2 -Wall -Wextra \
   -fno-stack-protector -ffixed-x18 -fno-sanitize=shadow-call-stack -fno-emulated-tls \
   -I"$here/../runtime" -I"$out" \
   "$here/loader_android.c" "$here/hle_android.c" "$here/hle_stack_android.c" \
   "$here/services_android.c" "$here/fs_service_android.c" "$here/vi_android.c" \
   "$here/account_android.c" "$here/nvn_android.c" "$here/nvdrv_android.c" \
-  "$here/native_window_android.c" "$here/hid_android.c" \
+  "$here/native_window_android.c" "$here/gfx_vulkan_android.c" "$here/hid_android.c" \
   "$here/fs_host_android.c" "$here/romfs_android.c" \
   "$here/../runtime/threads.c" "$here/../runtime/ipc.c" \
   "$here/sha256.c" "$here/gate_android.S" "$here/hle_stack_android.S" \
   "$here/thread_enter_android.S" -D__ANDROID__ \
-  -pthread -lc++abi -lunwind -o "$out/totk-android"
+  -pthread -lc++abi -lunwind -lvulkan -ldl -o "$out/totk-android"
 echo "built $out/totk-android"

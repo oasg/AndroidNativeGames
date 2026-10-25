@@ -35,11 +35,11 @@ gate + HLE-stack thunks + a minimal SVC layer.
   texture view, sampler and sampler pool, texture pool, program, queue, window,
   sync and event. Builders write real fields, mappings return the backing
   storage, handles are non-zero, and unknown object APIs are reported instead
-  of silently succeeding. The host is CPU-only; `nvnQueueSubmitCommands` logs
-  the first explicit GPU submission points but submits no GPU work. See
+  of silently succeeding.  The NVN object layer remains the source of truth;
+  `nvnQueueSubmitCommands` keeps the guest submission order.  See
   `docs/android-hle-phase2a.md`.
 - `nn::vi` uses the SDK display/initialize/vsync path, with host layer/native
-  window objects for `CreateLayer`/`GetNativeWindow` until a renderer exists.
+  window objects for `CreateLayer`/`GetNativeWindow`.
 - `nvdrv` is a real host service (`nvdrv_android.c`): Open/Close/Initialize/
   SetAruid/Ioctl3/MapSharedMem, nvmap create/alloc/free/id/param, nvhost-ctrl
   syncpoints, and a guest-visible 1 GiB nvmap window at `0x500000000` that
@@ -48,8 +48,14 @@ gate + HLE-stack thunks + a minimal SVC layer.
   protocol.
 - `nn::vi` has a host layer + offscreen `NativeWindow` (1920x1080 RGBA8,
   1280x720 in handheld); `probe-vi` checks the object and the NVN builder
-  round trip.  `probe-nvn-submit` records and submits one command buffer and
-  presents it to the host framebuffer.
+  round trip.  `probe-nvn-submit` records one command buffer, submits it and
+  presents through the selected graphics backend.
+- The Android graphics backend is Vulkan (`gfx_vulkan_android.c`): real
+  `VkInstance`/`VkDevice`/graphics queue, an offscreen `VkImage` target with
+  GPU clear and readback, and an optional `VkSwapchainKHR` over an
+  `ANativeWindow*`.  `TOTK_ANDROID_GFX_BACKEND=auto|vulkan|software` selects
+  the path; forced Vulkan never falls back silently.  See
+  `docs/android-hle-phase2b.md`.
 - `nn::hid::InitializeNpad` is a host no-pad backend for now (zero Npad/6-axis
   state, vibration stub). Keyboard/mouse/touch/debug-pad/gesture initialization
   are host no-device initializers too, because the HID shared-memory service is
@@ -80,6 +86,9 @@ This also regenerates `build/android-v0/runtime_tables.h` with
 `scripts/prepare_android_runtime.py`. Set `ANDROID_NDK_HOME` if the NDK is not
 at the Homebrew default (`/opt/homebrew/share/android-ndk`).
 
+The CLI is linked dynamically (`-lvulkan -ldl`) because Android's Vulkan loader
+is a shared library; a static executable cannot call the real driver.
+
 ## Run
 
 ```sh
@@ -92,6 +101,7 @@ adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-nvdrv
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-vi
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-nvn-submit
+adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-vulkan
 TOTK_ANDROID_TRACE_SVC=1 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android boot-sdk
 ```
 
@@ -145,10 +155,13 @@ Expected results on an arm64 Android device:
 - `probe-vi`: creates a host layer/native window, checks 1920x1080 RGBA8 and
   the 8,294,400-byte framebuffer, clears it and round-trips it through the NVN
   window builder.
+- `probe-vulkan`: creates a real Vulkan instance/device, a 1280x720 RGBA8
+  offscreen `VkImage`, clears it on the GPU, copies it back and verifies
+  `px=4080bfff`.  Device on the test target: Adreno 830, Vulkan 1.3.284.
 - `probe-nvn-submit`: builds a CPU-only NVN device/queue/window, records one
-  command buffer, submits it and presents it.  This is the first explicit
-  `nvnQueueSubmitCommands`/`nvnQueuePresentTexture` point; it is a self-test,
-  not the game's own frame.
+  command buffer, submits it and presents it through Vulkan.  This is the
+  first explicit `nvnQueueSubmitCommands`/`nvnQueuePresentTexture` point; it is
+  a self-test, not the game's own frame.
 - `boot-sdk`: reaches `{"stage":"loader-ready"}`.
 - `TOTK_ANDROID_INITS=1 boot-sdk`: runs the three module `DT_INIT`s and
   reaches `{"stage":"nnMain-entry"}`.
@@ -202,11 +215,14 @@ Expected results on an arm64 Android device:
    versioned GetStatus/display/scheduler ioctls used after the first frame.
 4. `vi` has a host layer/native-window object (`native_window_android.c`), and
    `probe-vi`/`probe-nvn-submit` prove the builder round trip and the first
-   submit/present points in the CPU-only NVN layer.  The game's own first
+   submit/present points through the Vulkan backend.  The game's own first
    frame still depends on the `nn::gfx` context registration above.
-5. Add the Android Surface app shell: SurfaceView + JNI + a worker running the
-   existing loader, attaching the `ANativeWindow*` to the host native window.
-   The offscreen mode is the supported Phase 2A target.
+5. 2B.2+: move from the Vulkan bring-up target to real resources.  The next
+   steps are texture storage -> `VkImage` upload/format-modifier validation,
+   NVN `prog_t` -> `VkShaderModule`/`VkPipeline`, and command-buffer clear/draw
+   recording.  The Android Surface app shell is the step after that:
+   SurfaceView + JNI + a worker running the loader, attaching the
+   `ANativeWindow*` to the host native window.
 6. Port the remaining memory SVCs (`MapMemory` is currently a copy, not a
    shared alias; `MapPhysicalMemory` details) and the rest of the HLE service
    registry.

@@ -7,6 +7,7 @@
  * the same description is also used for the first on-screen presentation.
  */
 #include "runtime.h"
+#include "gfx_backend_android.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +26,9 @@ typedef struct HostNativeWindow {
     uint32_t offscreen;
     uint64_t layer_id;
     void *android;          /* ANativeWindow*, set by the app shell */
+    int surface_ok;         /* VkSwapchainKHR created for `android` */
+    void *gfx_target;       /* GfxOffscreenTarget* or NULL for the software path */
+    float clear[4];
     uint8_t *buffer;
     size_t buffer_size;
 } HostNativeWindow;
@@ -45,14 +49,41 @@ void *runtime_native_window_create(uint32_t width, uint32_t height, uint32_t for
     w->buffer_size = (size_t)w->stride * height;
     w->buffer = calloc(1, w->buffer_size ? w->buffer_size : 1);
     if (!w->buffer) { free(w); return NULL; }
-    fprintf(stderr, "[totk-vi] host native window %ux%u format=%#x layer=%llu offscreen buffer=%p/%zu\n",
-            width, height, w->format, (unsigned long long)layer_id, (void *)w->buffer, w->buffer_size);
+    w->clear[0] = 0.0f; w->clear[1] = 0.0f; w->clear[2] = 0.0f; w->clear[3] = 1.0f;
+
+    const char *want = getenv("TOTK_ANDROID_GFX_BACKEND");
+    int force_vulkan = want && !strcmp(want, "vulkan");
+    int force_software = want && !strcmp(want, "software");
+    if (!force_software) {
+        if (gfx_backend_vulkan_init()) {
+            w->gfx_target = gfx_backend_offscreen_create(width, height, w->format);
+            if (!w->gfx_target) {
+                if (force_vulkan) {
+                    free(w->buffer); free(w);
+                    fprintf(stderr, "[totk-vi] ERROR Vulkan offscreen target creation failed\n");
+                    return NULL;
+                }
+                fprintf(stderr, "[totk-vi] Vulkan target unsupported; using software framebuffer\n");
+            }
+        } else if (force_vulkan) {
+            free(w->buffer); free(w);
+            fprintf(stderr, "[totk-vi] ERROR Vulkan requested but unavailable\n");
+            return NULL;
+        } else {
+            fprintf(stderr, "[totk-vi] Vulkan unavailable; using software framebuffer\n");
+        }
+    }
+    fprintf(stderr, "[totk-vi] host native window %ux%u format=%#x layer=%llu backend=%s buffer=%p/%zu\n",
+            width, height, w->format, (unsigned long long)layer_id,
+            w->gfx_target ? "vulkan" : "software", (void *)w->buffer, w->buffer_size);
     return w;
 }
 
 void runtime_native_window_destroy(void *p) {
     HostNativeWindow *w = p;
     if (!w || w->magic != HOST_NW_MAGIC) return;
+    if (w->gfx_target) gfx_backend_offscreen_destroy(w->gfx_target);
+    if (w->surface_ok) gfx_backend_detach_android_surface();
     free(w->buffer);
     w->magic = 0;
     free(w);
@@ -75,6 +106,15 @@ void runtime_native_window_attach_android(void *p, void *android) {
     if (!w || w->magic != HOST_NW_MAGIC) return;
     w->android = android;
     w->offscreen = android == NULL;
+    w->surface_ok = 0;
+    if (android) {
+        if (gfx_backend_attach_android_surface(android, w->width, w->height, w->format))
+            w->surface_ok = 1;
+        else
+            fprintf(stderr, "[totk-vi] ERROR Android surface attach failed; keeping offscreen target\n");
+    } else {
+        gfx_backend_detach_android_surface();
+    }
 }
 
 void *runtime_native_window_android(const void *p) {
@@ -88,8 +128,37 @@ void *runtime_native_window_android(const void *p) {
 int runtime_native_window_clear(void *p, uint32_t rgba) {
     HostNativeWindow *w = p;
     if (!w || w->magic != HOST_NW_MAGIC) return 0;
+    w->clear[0] = ((rgba >> 0) & 0xff) / 255.0f;
+    w->clear[1] = ((rgba >> 8) & 0xff) / 255.0f;
+    w->clear[2] = ((rgba >> 16) & 0xff) / 255.0f;
+    w->clear[3] = ((rgba >> 24) & 0xff) / 255.0f;
+    if (w->gfx_target) {
+        if (!gfx_backend_offscreen_clear(w->gfx_target, w->clear[0], w->clear[1],
+                                         w->clear[2], w->clear[3]))
+            return 0;
+        size_t size = 0;
+        const uint8_t *src = gfx_backend_offscreen_pixels(w->gfx_target, &size);
+        if (src) memcpy(w->buffer, src, size < w->buffer_size ? size : w->buffer_size);
+        return 1;
+    }
     uint32_t *px = (uint32_t *)w->buffer;
     size_t n = w->buffer_size / 4;
     for (size_t i = 0; i < n; i++) px[i] = rgba;
     return 1;
+}
+
+int runtime_native_window_present(void *p) {
+    HostNativeWindow *w = p;
+    if (!w || w->magic != HOST_NW_MAGIC) return 0;
+    if (w->surface_ok && gfx_backend_surface_ready())
+        return gfx_backend_surface_present(w->clear[0], w->clear[1], w->clear[2], w->clear[3]);
+    if (w->gfx_target) return gfx_backend_offscreen_present(w->gfx_target);
+    fprintf(stderr, "[totk-vi] present software %ux%u\n", w->width, w->height);
+    return 1;
+}
+
+const char *runtime_native_window_backend(const void *p) {
+    const HostNativeWindow *w = p;
+    if (!w || w->magic != HOST_NW_MAGIC) return "none";
+    return w->gfx_target ? gfx_backend_name() : "software";
 }

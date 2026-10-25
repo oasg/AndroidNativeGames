@@ -22,6 +22,7 @@
 
 typedef uint32_t NvnBool;
 typedef void *NvnNativeWindow;
+extern int runtime_native_window_present(void *p);
 
 #define NVN_MAGIC(a, b, c, d) \
     ((uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24)
@@ -595,8 +596,10 @@ static void nvnQueuePresentTexture(queue_t *q, win_t *w, int index) { nvn_api("n
     w->presents++;
     unsigned total = __atomic_add_fetch(&nvn_gpu_presents, 1, __ATOMIC_RELAXED);
     if (total <= 4)
-        fprintf(stderr, "[totk-nvn] present #%u window=%p index=%d (CPU-only host)\n",
+        fprintf(stderr, "[totk-nvn] present #%u window=%p index=%d (host backend)\n",
                 total, (void *)w, index);
+    if (w->native && !runtime_native_window_present(w->native))
+        nvn_fail("nvnQueuePresentTexture", "native window present failed");
 }
 static int nvnQueueGetError(queue_t *q, void *info) {
     (void)q; if (info) memset(info, 0, 0x40); return 0;

@@ -1061,6 +1061,12 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[totk-android] sealed all\n");
     if (!strcmp(argv[2], "probe")) return probe();
     if (!strcmp(argv[2], "probe-hle")) return probe_hle();
+    if (!strcmp(argv[2], "probe-vulkan")) {
+        int gfx_backend_selftest(void);
+        if (!gfx_backend_selftest()) { fprintf(stderr, "[totk-vk] selftest FAIL\n"); return 1; }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"vulkan-offscreen\"}\n");
+        return 0;
+    }
     if (!strcmp(argv[2], "probe-nvn-submit")) {
         int runtime_nvn_submit_selftest(void);
         if (!runtime_nvn_submit_selftest()) { fprintf(stderr, "[totk-nvn] submit selftest FAIL\n"); return 1; }
