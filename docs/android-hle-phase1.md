@@ -308,9 +308,12 @@ protocol objects) is:
 [ipc] unknown command service=nvdrv command=0 type=6 data=00000000
 ```
 
-nvdrv commands 0, 12, 2 (plus the earlier 3, 8, 13) are still the generic
-Android stub. This is the first clear C2 gap, and it is left explicit instead
-of pretending the GPU is initialized.
+nvdrv now has a real host service (`nvdrv_android.c`) rather than the generic
+Android stub: Initialize/SetAruid/SetGraphicsFirmwareMemoryMarginEnabled,
+Open/Close/Ioctl3, QueryEvent/MapSharedMem, nvmap allocation and nvhost-ctrl
+syncpoints.  Its nvmap memory lives in a guest-visible window at
+`0x500000000`; unknown commands and ioctls return explicit errors.  See
+`docs/android-hle-phase2a.md`.
 
 `acc:u0` is a minimal one-local-user service. Commands 160 (8-byte input) and
 150 (1-byte output) are answered with the sizes the client proxy expects.

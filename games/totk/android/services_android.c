@@ -45,7 +45,26 @@ static uint8_t user_exception_context[0x1000] __attribute__((aligned(0x1000)));
 #define MAX_COMMITS 1024
 static struct { uintptr_t base, end; } commits[MAX_COMMITS];
 static unsigned ncommits;
+/* Host-backed guest ranges outside the low reservation (for example the nvdrv
+ * nvmap window).  QueryMemory must report these as mapped, otherwise the
+ * SDK's address allocator could hand the same address to the game. */
+#define MAX_EXTRA 8
+static struct { uintptr_t base, end; } extra_ranges[MAX_EXTRA];
+static unsigned nextra;
 static pthread_mutex_t commit_lock = PTHREAD_MUTEX_INITIALIZER;
+void runtime_guest_map_extra(uintptr_t base, uintptr_t size) {
+    if (!base || !size) return;
+    pthread_mutex_lock(&commit_lock);
+    if (nextra < MAX_EXTRA) {
+        extra_ranges[nextra].base = base;
+        extra_ranges[nextra].end = base + size;
+        nextra++;
+    } else {
+        static int warned;
+        if (!warned++) fprintf(stderr, "[totk-android] extra guest range table full\n");
+    }
+    pthread_mutex_unlock(&commit_lock);
+}
 
 void runtime_guest_commit(uintptr_t base, uintptr_t size) {
     if (!size) return;
@@ -209,6 +228,13 @@ static void query_memory(uint64_t out, uint64_t addr) {
         uint64_t b = (uintptr_t)m->base;
         if (addr >= b && addr < b + m->key_off) {
             base = b; size = m->key_off; state = 5; perm = 3;
+        }
+    }
+    for (unsigned i = 0; i < nextra; i++) {
+        if (addr >= extra_ranges[i].base && addr < extra_ranges[i].end) {
+            base = extra_ranges[i].base; size = extra_ranges[i].end - base;
+            state = 5; perm = 3;
+            break;
         }
     }
     if (low_space && addr >= (uintptr_t)low_space && addr < (uintptr_t)low_space + LOW_SIZE) {

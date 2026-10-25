@@ -220,3 +220,157 @@ The next checks are:
   the last NVN call recorded.
 - `nvnQueueSubmitCommands` and `nvnQueuePresentTexture` log the first explicit
   GPU submission/present points; no GPU work is executed.
+
+## 6. Phase 2A.3: nvdrv is a real service
+
+`games/totk/android/nvdrv_android.c` replaces the generic Android stub for
+`nvdrv`, `nvdrv:a`, `nvdrv:s` and `nvdrv:t`.  It implements the public
+`INvDrvServices` command shape:
+
+| Cmd | Name | Host behaviour |
+| --- | --- | --- |
+| 0 | Open | Opens a real per-session fd for `/dev/nvmap`, `/dev/nvhost-*`, `/dev/nvdisp-*`, `/dev/nvsched-ctrl`; unknown paths return an error |
+| 2 | Close | Closes the fd |
+| 3 | Initialize | Accepts the process/transfer-memory handles and returns a real u32 status |
+| 4 | QueryEvent | Returns a real event handle through the move table |
+| 5 | MapSharedMem | Aliases the nvmap guest object to the transfer memory range, or fails explicitly |
+| 8 | SetAruid | Stores the ARUID and returns success |
+| 12 | Ioctl3 | Dispatches nvmap/nvhost-ctrl ioctls with the real in/out buffers |
+| 13 | SetGraphicsFirmwareMemoryMarginEnabled | Stores the flag, no output |
+
+The nvmap backing memory is **guest-visible**: a dedicated 1 GiB window at
+`0x500000000` (below the 39-bit Horizon limit) is reserved; each block is
+`memset` on free, `runtime_guest_commit` records the range and
+`runtime_guest_map_extra` makes `QueryMemory` report the window as committed,
+so the SDK's address allocator cannot hand the same address to the game.  This
+is the "memory mapping and guest address match" requirement; it is not a host
+`malloc` pointer.  The window is a bump allocator: freed blocks are zeroed but
+not reused yet, so a long session with many texture/buffer allocations will
+eventually exhaust it (the next step is a free list inside the window).
+
+Implemented nvmap ioctls: `CREATE`, `FROM_ID`, `ALLOC`, `FREE`, `MMAP`,
+`PARAM`, `GET_ID`, and the tag/cache/export calls.  Implemented nvhost-ctrl
+ioctls: syncpoint read/incr/wait/wait-event, event alloc/free, module mutex,
+and `GET_CONFIG`.  Unknown ioctls and unknown devices return an explicit
+`0x1a8` instead of a fake success.  `GetStatus`/`InitializeDevtools` are also
+explicit errors until their versioned structures are known.
+
+A host self-test exercises the real CMIF handler end to end:
+
+```
+totk-android <dir> probe-nvdrv
+```
+
+It opens `/dev/nvmap`, creates a 0x20000-byte object, allocates it, checks
+`NVMAP_IOC_PARAM` size and that the window is below 2^39, then frees/closes.
+Passing on the arm64 device means Open/Ioctl3/Close no longer go through the
+generic stub.
+
+## 7. Phase 2A.4: host NativeWindow
+
+`games/totk/android/native_window_android.c` defines the host
+`HostNativeWindow`:
+
+- width, height, NVN format (0x25 = RGBA8), bytes per pixel, stride, buffer
+  count and a host framebuffer;
+- an opaque `ANativeWindow*` slot that the app shell can attach later;
+- `runtime_native_window_info` and `runtime_native_window_clear`.
+
+`nn::vi::CreateLayer` / `nn::vi::GetNativeWindow` are host overrides built on
+the same object.  They create a `HostViLayer` (magic, layer id, window) and
+return the window pointer.  `nvnWindowBuilderSetNativeWindow` stores that
+pointer, and `nvnWindowGetNativeWindow` returns it unchanged.  The default is
+offscreen 1920x1080 (1280x720 in handheld mode).
+
+```
+totk-android <dir> probe-vi
+```
+
+checks layer -> native window -> 1920x1080/RGBA8/8,294,400-byte framebuffer,
+a software clear, and the NVN builder/getter round trip.
+
+The real Horizon `vi` `OpenLayer` (command 2020) carries an Android Parcel with
+a `dispdrv` binder object.  The host cannot fabricate that binder without a
+compositor; the host layer/native-window object is the explicit replacement in
+this phase, not a silently accepted Parcel.  The VI IPC commands that the
+real SDK path uses are logged; the host path is what the game currently
+exercises.
+
+## 8. Phase 2A.5: offscreen first, app shell next
+
+The offscreen path is complete and testable without an APK:
+
+```
+totk-android <dir> probe-nvn-submit
+```
+
+builds a real NVN device/queue/window in the CPU-only layer, records a command
+buffer, calls `nvnQueueSubmitCommands` once, clears the host framebuffer and
+calls `nvnQueuePresentTexture`.  The log contains the first explicit points:
+
+```
+[totk-nvn] GPU submit #1 queue=0x... commands=1 (CPU-only host)
+[totk-nvn] present #1 window=0x... index=0 (CPU-only host)
+```
+
+This proves the object graph and submit/present instrumentation, but it is a
+host self-test, not the game's first frame.
+
+The Android app shell is deliberately still a follow-up.  To put the
+framebuffer on a Surface, the app needs:
+
+1. a `SurfaceView` / `NativeActivity` that owns a real `ANativeWindow*`;
+2. a JNI entry that runs the existing loader on a worker thread;
+3. `runtime_native_window_attach_android(window, surface)` so
+   `vi_create_layer_host` attaches the Surface to the same host object;
+4. a renderer that writes the offscreen framebuffer (or binds a Vulkan/GL
+   target) before `nvnQueuePresentTexture`.
+
+The current executable remains the adb-driven CLI; the offscreen mode is the
+supported Phase 2A target.
+
+## 9. Current game stop (updated)
+
+With the host VI layer restored, the game gets through:
+- the original 0x230 null allocation,
+- NVN device, queue, memory pools, sampler/texture pools, command buffers,
+- VI layer + 1920x1080 host native window,
+- `nn::gfx` window/queue setup.
+
+It still stops at `main+0x794dd0`.  The crash dump now shows the registry:
+
+```
+gfx-registry mgr=0x...
+gfx-registry mgr+0x18..0x50: <head> ...
+gfx-registry head=<sentinel>: 0 0 <vtable> 0
+```
+
+The head's first word is 0: no `nn::gfx` context is registered yet.  The
+subsequent allocation of the 0x5f0-byte error/context object uses a guest
+small-object heap whose fallback is only 0x10000 bytes, so the guest's own
+abort path dereferences a null after the failed lookup.  The last NVN call is
+`nvnBufferMap` and it returned a valid guest mapping; this is not an NVN null
+and no null check was skipped.
+
+Next: find why the `nn::gfx` context is not registered on the main thread
+before the buffer/window setup (the `nn::gfx::Device`/`Context` create calls
+around `main+0xe9d404` and `main+0xea500`), then the game's own
+`nvnQueueSubmitCommands` should hit the existing log line.
+
+## 10. Verification
+
+All of these pass on the arm64 device:
+
+```sh
+totk-android <dir> probe
+totk-android <dir> probe-hle
+totk-android <dir> probe-tls
+totk-android <dir> probe-nvdrv
+totk-android <dir> probe-vi
+totk-android <dir> probe-nvn-submit
+TOTK_ANDROID_INITS=1 TOTK_ANDROID_STOP_AFTER_INITS=1 \
+  TOTK_ANDROID_ROMFS=/data/local/tmp/totk-android/romfs-min \
+  totk-android /data/local/tmp/totk-android boot-sdk
+```
+
+`probe-tls` still uses the boot-sdk path; it is not a separate binary.

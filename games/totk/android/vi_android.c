@@ -18,9 +18,34 @@ typedef struct {
 } ViState;
 
 static unsigned vi_logged;
+static int vi_trace(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_ANDROID_TRACE_VI"); v = e && *e && strcmp(e, "0"); }
+    return v;
+}
 static void vi_log(const char *what, uint32_t cmd, const IpcRequest *rq) {
     if (vi_logged++ < 120)
         fprintf(stderr, "[totk-vi] %s command %u data=%u bytes\n", what, cmd, rq->data_size);
+    if (!vi_trace()) return;
+    fprintf(stderr, "[totk-vi]   type=%u nx=%u na=%u nb=%u nw=%u nc=%u copy=%u move=%u\n",
+            rq->type, rq->nx, rq->na, rq->nb, rq->nw, rq->nc, rq->ncopy, rq->nmove);
+    for (unsigned i = 0; i * 4 + 4 <= rq->data_size && i < 24; i++)
+        fprintf(stderr, "[totk-vi]   data[%u]=%08x\n", i, IPC_ARG(rq, uint32_t, i * 4));
+    for (unsigned i = 0; i < rq->nx; i++)
+        fprintf(stderr, "[totk-vi]   x%u type=%#x addr=%#llx size=%#llx\n", i, rq->x[i].index,
+                (unsigned long long)rq->x[i].addr, (unsigned long long)rq->x[i].size);
+    for (unsigned i = 0; i < rq->na; i++)
+        fprintf(stderr, "[totk-vi]   a%u addr=%#llx size=%#llx\n", i,
+                (unsigned long long)rq->a[i].addr, (unsigned long long)rq->a[i].size);
+    for (unsigned i = 0; i < rq->nb; i++)
+        fprintf(stderr, "[totk-vi]   b%u addr=%#llx size=%#llx\n", i,
+                (unsigned long long)rq->b[i].addr, (unsigned long long)rq->b[i].size);
+    for (unsigned i = 0; i < rq->nw; i++)
+        fprintf(stderr, "[totk-vi]   w%u addr=%#llx size=%#llx\n", i,
+                (unsigned long long)rq->w[i].addr, (unsigned long long)rq->w[i].size);
+    for (unsigned i = 0; i < rq->nc; i++)
+        fprintf(stderr, "[totk-vi]   c%u addr=%#llx size=%#llx\n", i,
+                (unsigned long long)rq->c[i].addr, (unsigned long long)rq->c[i].size);
 }
 
 static void vi_side_service_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {

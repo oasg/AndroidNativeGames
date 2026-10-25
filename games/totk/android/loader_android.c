@@ -120,6 +120,8 @@ void runtime_thread_init(void) {
     memcpy(hc->dummy + 0x58, &ts, 8);           /* ThreadType::stack_size */
     uint32_t guest_handle = runtime_thread_current_handle();
     if (guest_handle) memcpy(hc->dummy + 0x1b0, &guest_handle, 4);   /* ThreadType::thread_id */
+    if (getenv("TOTK_ANDROID_TLS_TRACE"))
+        fprintf(stderr, "[totk-android] thread init handle=%#x dummy=%p\n", guest_handle, hc->dummy);
     memcpy(hc->guest_tlr + 0x1f8, &hc->dummy, 8);
     hc->guest_stack_top = area_base + area - 16;
     if (getenv("TOTK_ANDROID_TLS_TRACE") || getenv("TOTK_ANDROID_CTOR_PROBE") || tls_probe_mode)
@@ -454,6 +456,34 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
                 (unsigned long long)rr[28]);
         for (unsigned i = 0; i < 4; i++) {
             uint64_t obj = rr[i];
+            if (i == 1 && obj && !(obj & 7)) {
+                uint64_t q[16] = {0};
+                if (crash_read(obj, q, sizeof q)) {
+                    fprintf(stderr, "[crash] x1 object %#llx: %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx\n",
+                            (unsigned long long)obj,
+                            (unsigned long long)q[0], (unsigned long long)q[1],
+                            (unsigned long long)q[2], (unsigned long long)q[3],
+                            (unsigned long long)q[4], (unsigned long long)q[5],
+                            (unsigned long long)q[6], (unsigned long long)q[7]);
+                    uint64_t fallback = q[6];
+                    if (fallback && !(fallback & 7)) {
+                        uint64_t fq[16] = {0};
+                        if (crash_read(fallback, fq, sizeof fq))
+                            fprintf(stderr, "[crash] x1 fallback %#llx: %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx\n",
+                                    (unsigned long long)fallback,
+                                    (unsigned long long)fq[0], (unsigned long long)fq[1],
+                                    (unsigned long long)fq[2], (unsigned long long)fq[3],
+                                    (unsigned long long)fq[4], (unsigned long long)fq[5],
+                                    (unsigned long long)fq[6], (unsigned long long)fq[7]);
+                    }
+                    uint64_t vtable = q[0], fn = 0;
+                    if (vtable && !(vtable & 7) && crash_read(vtable + 0x10, &fn, 8)) {
+                        char d[128]; describe_address(fn, d, sizeof d);
+                        fprintf(stderr, "[crash] x1 vtable=%#llx +0x10 -> %s\n",
+                                (unsigned long long)vtable, d);
+                    }
+                }
+            }
             uint64_t q[9] = {0};
             if (!obj || (obj & 7) || !crash_read(obj, q, sizeof q)) continue;
             fprintf(stderr, "[crash] [x%u]: +0=%#llx +8=%#llx +0x20=%#llx +0x38=%#llx +0x40=%#llx\n",
@@ -520,6 +550,47 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
                             fprintf(stderr, "[crash]   resource-table+%#x: %#llx %#llx\n",
                                     j * 8, (unsigned long long)t[j],
                                     (unsigned long long)t[j + 1]);
+                }
+            }
+            /* nn::gfx device/context registry: [main+0x4542f08] -> manager,
+             * manager+0x18 -> list head; nodes link at +0x598 and carry the
+             * thread id at +0x5e8.  This is the lookup that fails at
+             * main+0x794d30. */
+            {
+                uint64_t mgr = 0, head = 0;
+                if (crash_read((uintptr_t)(mb + 0x4542f08), &mgr, 8) && mgr && !(mgr & 7)) {
+                    fprintf(stderr, "[crash] gfx-registry mgr=%#llx\n", (unsigned long long)mgr);
+                    if (crash_read(mgr, &head, 8))
+                        fprintf(stderr, "[crash] gfx-registry mgr[0]=%#llx\n", (unsigned long long)head);
+                    {
+                        uint64_t q[8] = {0};
+                        if (crash_read(mgr + 0x18, q, sizeof q))
+                            fprintf(stderr, "[crash] gfx-registry mgr+0x18..0x50: %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx\n",
+                                    (unsigned long long)q[0], (unsigned long long)q[1],
+                                    (unsigned long long)q[2], (unsigned long long)q[3],
+                                    (unsigned long long)q[4], (unsigned long long)q[5],
+                                    (unsigned long long)q[6], (unsigned long long)q[7]);
+                    }
+                    if (crash_read(mgr + 0x18, &head, 8) && head && !(head & 7)) {
+                        uint64_t hv[4] = {0};
+                        if (crash_read(head, hv, sizeof hv))
+                            fprintf(stderr, "[crash] gfx-registry head=%#llx: %#llx %#llx %#llx %#llx\n",
+                                    (unsigned long long)head, (unsigned long long)hv[0],
+                                    (unsigned long long)hv[1], (unsigned long long)hv[2],
+                                    (unsigned long long)hv[3]);
+                        uint64_t node = hv[0];
+                        if (crash_read(head, &node, 8)) {
+                            for (unsigned n = 0; n < 8 && node && !(node & 7); n++) {
+                                uint64_t key = 0, next = 0;
+                                crash_read(node + 0x5e8, &key, 8);
+                                crash_read(node + 0x598, &next, 8);
+                                fprintf(stderr, "[crash] gfx-registry node[%u]=%#llx key+0x5e8=%#llx next=%#llx\n",
+                                        n, (unsigned long long)node, (unsigned long long)key,
+                                        (unsigned long long)next);
+                                node = next;
+                            }
+                        }
+                    }
                 }
             }
             uint8_t *sb = runtime_module_base("sdk");
@@ -990,6 +1061,24 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[totk-android] sealed all\n");
     if (!strcmp(argv[2], "probe")) return probe();
     if (!strcmp(argv[2], "probe-hle")) return probe_hle();
+    if (!strcmp(argv[2], "probe-nvn-submit")) {
+        int runtime_nvn_submit_selftest(void);
+        if (!runtime_nvn_submit_selftest()) { fprintf(stderr, "[totk-nvn] submit selftest FAIL\n"); return 1; }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-submit-present\"}\n");
+        return 0;
+    }
+    if (!strcmp(argv[2], "probe-vi")) {
+        int runtime_vi_selftest(void);
+        if (!runtime_vi_selftest()) { fprintf(stderr, "[totk-vi] selftest FAIL\n"); return 1; }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"vi-native-window\"}\n");
+        return 0;
+    }
+    if (!strcmp(argv[2], "probe-nvdrv")) {
+        int runtime_nvdrv_selftest(void);
+        if (!runtime_nvdrv_selftest()) { fprintf(stderr, "[totk-nvdrv] selftest FAIL\n"); return 1; }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvdrv\"}\n");
+        return 0;
+    }
     if (!strcmp(argv[2], "probe-tls")) { tls_probe_mode = 1; return boot_sdk(); }
     if (!strcmp(argv[2], "boot-sdk")) return boot_sdk();
     runtime_fail("unknown mode");

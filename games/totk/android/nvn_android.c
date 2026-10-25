@@ -80,7 +80,12 @@ enum {
 
 static const char *g_last_api = "none";
 static char g_last_proc[80] = "none";
-static void nvn_api(const char *what) { g_last_api = what; }
+static int nvn_trace(void);
+static void nvn_api(const char *what) {
+    g_last_api = what;
+    if (nvn_trace())
+        fprintf(stderr, "[totk-nvn] api %s thread=%#x\n", what, runtime_thread_current_handle());
+}
 const char *runtime_nvn_last_api(void) { return g_last_api; }
 const char *runtime_nvn_last_proc(void) { return g_last_proc; }
 
@@ -382,6 +387,18 @@ static void nvn_tex_layout(const tex_desc *d, tex_layout *o) {
         tileD = nvn_pick_tile(z + z / 2);
     }
     uint64_t ls = nvn_layer_bytes(d, dpl, layered, w, h, z, tileH, tileD, t);
+    /* NVN v55's MINIMAL_LAYOUT path: when the resource asks for it and the
+     * one-GOB footprint differs from the default, the driver uses tile H=D=0.
+     * Omitting this over-allocates the game's texture heaps. */
+    static int minimal = -1;
+    if (minimal < 0) {
+        const char *e = getenv("TOTK_MINIMAL_LAYOUT");
+        minimal = !(e && !strcmp(e, "0"));
+    }
+    if ((d->flags & 0x200) && !d->pkg_block_h && minimal) {
+        uint64_t one_gob = nvn_layer_bytes(d, dpl, layered, w, h, z, 0, 0, t);
+        if (one_gob != ls) { tileH = tileD = 0; ls = one_gob; }
+    }
     o->tileH = tileH; o->tileD = tileD;
     o->layer_size = ls;
     o->size = layered ? ls * z : ls;
@@ -691,6 +708,59 @@ static void nvnWindowSetNumActiveTextures(win_t *w, int n) {
 static int nvnWindowGetNumActiveTextures(const win_t *w) { return w ? w->active : 0; }
 static int nvnWindowGetNumTextures(const win_t *w) { return w ? w->ntex : 0; }
 
+/* Host-side round-trip check used by probe-vi: the native-window pointer the
+ * VI layer hands out must survive builder -> window -> getter unchanged. */
+extern void *runtime_native_window_create(uint32_t width, uint32_t height, uint32_t format, uint64_t layer_id);
+extern int runtime_native_window_clear(void *p, uint32_t rgba);
+int runtime_nvn_submit_selftest(void) {
+    void *nw = runtime_native_window_create(1280, 720, 0x25, 0x77);
+    if (!nw) return 0;
+    dev_builder_t db;
+    nvn_dev_t d;
+    queue_builder_t qb;
+    queue_t q;
+    win_builder_t wb;
+    win_t w;
+    memset(&db, 0, sizeof db);
+    memset(&d, 0, sizeof d);
+    if (!nvnDeviceInitialize(&d, &db)) return 0;
+    memset(&qb, 0, sizeof qb);
+    qb.dev = &d;
+    qb.flags = 1;
+    qb.cmd_sz = 0x10000;
+    qb.ctl_sz = 0x1000;
+    qb.mem_sz = 0x2000;
+    memset(&q, 0, sizeof q);
+    if (!nvnQueueInitialize(&q, &qb)) return 0;
+    memset(&wb, 0, sizeof wb);
+    wb.dev = &d;
+    wb.native = nw;
+    wb.ntex = 1;
+    wb.tex[0] = (void *)(uintptr_t)1;
+    memset(&w, 0, sizeof w);
+    if (!nvnWindowInitialize(&w, &wb)) return 0;
+    uint64_t handle = 0x100000001ull;
+    nvnQueueSubmitCommands(&q, 1, &handle);
+    if (!runtime_native_window_clear(nw, 0xff102030u)) return 0;
+    nvnQueuePresentTexture(&q, &w, 0);
+    if (q.submits != 1 || w.presents != 1) return 0;
+    return 1;
+}
+
+int runtime_nvn_window_selftest(void *nw) {
+    win_builder_t b;
+    win_t w;
+    memset(&b, 0, sizeof b);
+    memset(&w, 0, sizeof w);
+    b.native = nw;
+    b.ntex = 1;
+    b.tex[0] = (void *)(uintptr_t)1;
+    if (!nvnWindowInitialize(&w, &b)) return 0;
+    if (nvnWindowGetNativeWindow(&w) != nw) return 0;
+    if (nvnWindowGetNumTextures(&w) != 1) return 0;
+    return 1;
+}
+
 /* ------------------------------------------------------------------ */
 /* Memory pool                                                         */
 
@@ -827,6 +897,11 @@ static void *nvnBufferMap(const buf_t *b) { nvn_api("nvnBufferMap");
                     (long long)(b ? b->off : 0), (unsigned long long)(b ? b->size : 0));
         return NULL;
     }
+    if (getenv("TOTK_ANDROID_TRACE_NVN"))
+        fprintf(stderr, "[totk-nvn] BufferMap %p pool=%p mem=%p off=%lld size=%llu -> %p thread=%#x\n",
+                (const void *)b, (void *)b->pool, (void *)b->pool->mem,
+                (long long)b->off, (unsigned long long)b->size,
+                (void *)(b->pool->mem + b->off), runtime_thread_current_handle());
     return b->pool->mem + b->off;
 }
 static uint64_t nvnBufferGetAddress(const buf_t *b) {
@@ -1264,6 +1339,76 @@ static int64_t nvnSamplerPoolGetMemoryOffset(const samp_pool_t *p) { return p ? 
 static int nvnSamplerPoolGetSize(const samp_pool_t *p) { return p ? (int)p->n : 0; }
 
 /* ------------------------------------------------------------------ */
+/* Command buffer                                                      */
+
+typedef struct {
+    uint32_t magic;
+    uint32_t recording;
+    void *dev;
+    void *ctl;
+    size_t ctl_size, ctl_used;
+    void *cmd;
+    size_t cmd_size, cmd_used;
+    void *mem_cb, *mem_cb_data;
+    uint64_t serial;
+} cb_t;
+
+_Static_assert(sizeof(cb_t) <= NVN_COMMAND_BUFFER_SIZE, "command buffer object too large");
+static uint64_t nvn_cb_serial;
+
+static uint32_t nvnCommandBufferInitialize(cb_t *c, void *d) { nvn_api("nvnCommandBufferInitialize");
+    if (!c) { nvn_fail("nvnCommandBufferInitialize", "null command buffer"); return 0; }
+    memset(c, 0, sizeof *c);
+    c->magic = NVN_MAGIC('C', 'M', 'D', 'B');
+    c->dev = d;
+    c->serial = ++nvn_cb_serial;
+    if (nvn_trace()) fprintf(stderr, "[totk-nvn] CommandBufferInitialize %p\n", (void *)c);
+    return 1;
+}
+static void nvnCommandBufferFinalize(cb_t *c) { if (c) c->magic = 0; }
+static void nvnCommandBufferSetDebugLabel(cb_t *c, const char *l) { (void)c; (void)l; }
+static void nvnCommandBufferSetMemoryCallback(cb_t *c, void *cb) { if (c) c->mem_cb = cb; }
+static void nvnCommandBufferSetMemoryCallbackData(cb_t *c, void *d) { if (c) c->mem_cb_data = d; }
+static void nvnCommandBufferSetControlMemoryCallbackEnabled(cb_t *c, int e) { (void)c; (void)e; }
+static void nvnCommandBufferSetCommandMemoryCallbackEnabled(cb_t *c, int e) { (void)c; (void)e; }
+static void nvnCommandBufferAddCommandMemory(cb_t *c, const pool_t *p, ptrdiff_t off, size_t n) {
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferAddCommandMemory", "invalid command buffer"); return; }
+    if (!nvn_obj(p, NVN_MAGIC('P', 'O', 'O', 'L'), "nvnCommandBufferAddCommandMemory(pool)")) return;
+    if (!p->mem) { nvn_fail("nvnCommandBufferAddCommandMemory", "pool has no memory"); return; }
+    c->cmd = p->mem + off;
+    c->cmd_size = n;
+    c->cmd_used = 0;
+}
+static void nvnCommandBufferAddControlMemory(cb_t *c, void *m, size_t n) {
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferAddControlMemory", "invalid command buffer"); return; }
+    c->ctl = m;
+    c->ctl_size = n;
+    c->ctl_used = 0;
+}
+static size_t nvnCommandBufferGetControlMemorySize(const cb_t *c) { return c ? c->ctl_size : 0; }
+static size_t nvnCommandBufferGetControlMemoryUsed(const cb_t *c) { return c ? c->ctl_used : 0; }
+static size_t nvnCommandBufferGetCommandMemorySize(const cb_t *c) { return c ? c->cmd_size : 0; }
+static size_t nvnCommandBufferGetCommandMemoryUsed(const cb_t *c) { return c ? c->cmd_used : 0; }
+static void nvnCommandBufferBeginRecording(cb_t *c) {
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferBeginRecording", "invalid command buffer"); return; }
+    c->recording = 1;
+    c->cmd_used = 0;
+    c->ctl_used = 0;
+}
+static uint64_t nvnCommandBufferEndRecording(cb_t *c) {
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferEndRecording", "invalid command buffer"); return 0; }
+    c->recording = 0;
+    uint64_t h = 0x100000000ull | (c->serial & 0xffffffffull);
+    if (nvn_trace()) fprintf(stderr, "[totk-nvn] CommandBufferEndRecording %p -> handle %#llx\n", (void *)c, (unsigned long long)h);
+    return h;
+}
+static void nvnCommandBufferSetRenderEnable(cb_t *c, int e) { (void)c; (void)e; }
+static void nvnCommandBufferSetRenderTargets(cb_t *c, int n, const void *const *t) { (void)c; (void)n; (void)t; }
+static void nvnCommandBufferClearColor(cb_t *c, int i, const float *v, int mask) { (void)c; (void)i; (void)v; (void)mask; }
+static void nvnCommandBufferClearDepthStencil(cb_t *c, float d, int dm, int sm, int stencil) { (void)c; (void)d; (void)dm; (void)sm; (void)stencil; }
+static void nvnCommandBufferSetViewport(cb_t *c, int x, int y, int w, int h) { (void)c; (void)x; (void)y; (void)w; (void)h; }
+static void nvnCommandBufferSetScissor(cb_t *c, int x, int y, int w, int h) { (void)c; (void)x; (void)y; (void)w; (void)h; }
+
 /* Program, sync, event                                                */
 
 static uint32_t nvnProgramInitialize(prog_t *p, const nvn_dev_t *d) { nvn_api("nvnProgramInitialize");
@@ -1521,6 +1666,17 @@ static const nvn_entry nvn_entries[] = {
     NVN_E(nvnSamplerPoolRegisterSamplerBuilder), NVN_E(nvnSamplerPoolGetMemoryPool),
     NVN_E(nvnSamplerPoolGetMemoryOffset), NVN_E(nvnSamplerPoolGetSize),
 
+    NVN_E(nvnCommandBufferInitialize), NVN_E(nvnCommandBufferFinalize),
+    NVN_E(nvnCommandBufferSetDebugLabel), NVN_E(nvnCommandBufferSetMemoryCallback),
+    NVN_E(nvnCommandBufferSetMemoryCallbackData), NVN_E(nvnCommandBufferSetControlMemoryCallbackEnabled),
+    NVN_E(nvnCommandBufferSetCommandMemoryCallbackEnabled), NVN_E(nvnCommandBufferAddCommandMemory),
+    NVN_E(nvnCommandBufferAddControlMemory), NVN_E(nvnCommandBufferGetControlMemorySize),
+    NVN_E(nvnCommandBufferGetControlMemoryUsed), NVN_E(nvnCommandBufferGetCommandMemorySize),
+    NVN_E(nvnCommandBufferGetCommandMemoryUsed), NVN_E(nvnCommandBufferBeginRecording),
+    NVN_E(nvnCommandBufferEndRecording), NVN_E(nvnCommandBufferSetRenderEnable),
+    NVN_E(nvnCommandBufferSetRenderTargets), NVN_E(nvnCommandBufferClearColor),
+    NVN_E(nvnCommandBufferClearDepthStencil), NVN_E(nvnCommandBufferSetViewport),
+    NVN_E(nvnCommandBufferSetScissor),
     NVN_E(nvnProgramInitialize), NVN_E(nvnProgramFinalize), NVN_E(nvnProgramSetDebugLabel),
     NVN_E(nvnProgramSetShaders), NVN_E(nvnProgramSetShadersExt),
     NVN_E(nvnProgramSetSampleShading), NVN_E(nvnProgramGetSubtileSize),

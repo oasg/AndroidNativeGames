@@ -41,23 +41,39 @@ static uint64_t applet_resource_user_id(void) { return 1; }
 void *runtime_nvn_bootstrap(const char *name);
 void *runtime_hid_override(const char *name);
 
-/* Host-side vi layer/window lifecycle.  The SDK's CreateLayer validates an
- * indirect-layer table that only a real compositor populates; there is no
- * compositor in Phase 1.  Keep the SDK's display/initialize/vsync path (it
- * talks to vi:m), but hand the game a real host layer object and a real host
- * native-window object.  NVN stores the latter in its window builder; no
- * rendering backend is connected yet. */
-static uint64_t vi_layer_object;
-static uint64_t vi_native_window_object;
+/* Host-side vi layer/window lifecycle.  The SDK's real CreateLayer needs an
+ * Android dispdrv Parcel from a compositor; Phase 2A uses an explicit host
+ * layer + offscreen NativeWindow description instead.  NVN stores the window
+ * pointer in its builder, and nvnWindowGetNativeWindow returns the same host
+ * object.  The app shell can attach a real ANativeWindow later. */
+typedef struct {
+    uint32_t magic;
+    uint32_t pad;
+    uint64_t id;
+    void *window;
+} HostViLayer;
+#define HOST_VI_LAYER_MAGIC 0x594c5648u /* "HVLY" */
+extern void *runtime_native_window_create(uint32_t width, uint32_t height, uint32_t format, uint64_t layer_id);
+extern int runtime_native_window_info(const void *p, uint32_t *width, uint32_t *height,
+                                      uint32_t *format, void **buffer, size_t *size);
 static uint32_t vi_create_layer_host(void **out, void *display) {
     (void)display;
     if (!out) return 0xf601;
-    *out = &vi_layer_object;
+    HostViLayer *l = calloc(1, sizeof *l);
+    if (!l) return 0xc01;
+    static uint64_t next_layer = 1;
+    l->magic = HOST_VI_LAYER_MAGIC;
+    l->id = next_layer++;
+    l->window = runtime_native_window_create(handheld() ? 1280 : 1920,
+                                             handheld() ? 720 : 1080, 0x25, l->id);
+    if (!l->window) { free(l); return 0xc01; }
+    *out = l;
     return 0;
 }
 static uint32_t vi_get_native_window_host(void **out, void *layer) {
-    if (!out || layer != &vi_layer_object) return 0xf601;
-    *out = &vi_native_window_object;
+    HostViLayer *l = layer;
+    if (!out || !l || l->magic != HOST_VI_LAYER_MAGIC) return 0xf601;
+    *out = l->window;
     return 0;
 }
 
@@ -89,6 +105,24 @@ static void *am_get_self_controller(void) {
     }
     return am_self_object;
 }
+int runtime_nvn_window_selftest(void *nw);
+extern int runtime_native_window_clear(void *p, uint32_t rgba);
+int runtime_vi_selftest(void) {
+    void *layer = NULL, *nw = NULL;
+    uint32_t w = 0, h = 0, fmt = 0;
+    void *buf = NULL;
+    size_t size = 0;
+    if (vi_create_layer_host(&layer, NULL) != 0) return 0;
+    if (vi_get_native_window_host(&nw, layer) != 0) return 0;
+    if (!runtime_native_window_info(nw, &w, &h, &fmt, &buf, &size)) return 0;
+    if (w != 1920 || h != 1080 || fmt != 0x25 || !buf || size != (size_t)1920 * 1080 * 4) return 0;
+    if (!runtime_native_window_clear(nw, 0xff203040u)) return 0;
+    if (!runtime_nvn_window_selftest(nw)) return 0;
+    fprintf(stderr, "[totk-vi] selftest layer=%p native-window=%p %ux%u format=%#x\n",
+            layer, nw, w, h, fmt);
+    return 1;
+}
+
 static void apm_init(void) { fprintf(stderr, "[totk-android] nn::apm initialized on the host\n"); }
 static void apm_finalize(void) { }
 static int apm_performance_mode(void) { return handheld() ? 0 : 1; }
@@ -145,9 +179,9 @@ void *runtime_override(const char *name) {
         {"_ZN2nn3err26InitializeContextWriterApiEv", err_init},
         {"_ZN2nn4diag34InitializeApplicationAbortObserverEv", diag_abort_init},
         {"_ZN2nn6applet37TryPopFromApplicationParameterChannelEPNS0_13StorageHandleENS0_19LaunchParameterKindE", applet_try_pop_parameter},
-        {"nvnBootstrapLoader", runtime_nvn_bootstrap},
         {"_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE", vi_create_layer_host},
         {"_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE", vi_get_native_window_host},
+        {"nvnBootstrapLoader", runtime_nvn_bootstrap},
     };
     for (size_t i = 0; i < sizeof map / sizeof *map; i++)
         if (!strcmp(name, map[i].name)) return map[i].fn;

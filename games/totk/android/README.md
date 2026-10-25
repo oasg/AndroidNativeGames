@@ -40,6 +40,16 @@ gate + HLE-stack thunks + a minimal SVC layer.
   `docs/android-hle-phase2a.md`.
 - `nn::vi` uses the SDK display/initialize/vsync path, with host layer/native
   window objects for `CreateLayer`/`GetNativeWindow` until a renderer exists.
+- `nvdrv` is a real host service (`nvdrv_android.c`): Open/Close/Initialize/
+  SetAruid/Ioctl3/MapSharedMem, nvmap create/alloc/free/id/param, nvhost-ctrl
+  syncpoints, and a guest-visible 1 GiB nvmap window at `0x500000000` that
+  `QueryMemory` reports as committed.  Unknown devices/ioctls return explicit
+  errors.  `probe-nvdrv` covers the
+  protocol.
+- `nn::vi` has a host layer + offscreen `NativeWindow` (1920x1080 RGBA8,
+  1280x720 in handheld); `probe-vi` checks the object and the NVN builder
+  round trip.  `probe-nvn-submit` records and submits one command buffer and
+  presents it to the host framebuffer.
 - `nn::hid::InitializeNpad` is a host no-pad backend for now (zero Npad/6-axis
   state, vibration stub). Keyboard/mouse/touch/debug-pad/gesture initialization
   are host no-device initializers too, because the HID shared-memory service is
@@ -79,6 +89,9 @@ adb shell chmod 755 /data/local/tmp/totk-android/totk-android
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-hle
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-tls
+adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-nvdrv
+adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-vi
+adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-nvn-submit
 TOTK_ANDROID_TRACE_SVC=1 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android boot-sdk
 ```
 
@@ -127,6 +140,15 @@ Expected results on an arm64 Android device:
 - `probe-tls`: allocates a TLS slot, checks `SetTlsValue`/`GetTlsValue` on the
   main thread and on a second thread, verifies the values do not leak between
   threads, and checks `GetCurrentStackInfo` covers the TLR.
+- `probe-nvdrv`: opens `/dev/nvmap`, creates/allocates/params/frees an nvmap
+  object and verifies its address is below 2^39.
+- `probe-vi`: creates a host layer/native window, checks 1920x1080 RGBA8 and
+  the 8,294,400-byte framebuffer, clears it and round-trips it through the NVN
+  window builder.
+- `probe-nvn-submit`: builds a CPU-only NVN device/queue/window, records one
+  command buffer, submits it and presents it.  This is the first explicit
+  `nvnQueueSubmitCommands`/`nvnQueuePresentTexture` point; it is a self-test,
+  not the game's own frame.
 - `boot-sdk`: reaches `{"stage":"loader-ready"}`.
 - `TOTK_ANDROID_INITS=1 boot-sdk`: runs the three module `DT_INIT`s and
   reaches `{"stage":"nnMain-entry"}`.
@@ -171,9 +193,20 @@ Expected results on an arm64 Android device:
    production file path now uses the `nn::fs` host overrides instead.
 2. Continue past `nnMain` with the graphics/input/audio services. The original
    `main+0x1123f7c` null allocator is explained and fixed by the RomFS heap
-   definitions; the current stop is the `nn::gfx` device/context registry at
-   `main+0x794dd0` during window/queue setup, after the NVN object graph. See
-   `docs/android-hle-phase2a.md`.
-3. Port the remaining memory SVCs (`MapMemory` is currently a copy, not a
+   definitions; the current stop is the `nn::gfx` context registry at
+   `main+0x794dd0` during window/queue setup, after the NVN object graph and the
+   host native window. See `docs/android-hle-phase2a.md`.
+3. `nvdrv` is now a real service (`nvdrv_android.c`): Open/Close/Initialize/
+   SetAruid/Ioctl3/MapSharedMem plus a guest-visible nvmap window at
+   `0x500000000`.  `probe-nvdrv` exercises it.  The next nvdrv work is the
+   versioned GetStatus/display/scheduler ioctls used after the first frame.
+4. `vi` has a host layer/native-window object (`native_window_android.c`), and
+   `probe-vi`/`probe-nvn-submit` prove the builder round trip and the first
+   submit/present points in the CPU-only NVN layer.  The game's own first
+   frame still depends on the `nn::gfx` context registration above.
+5. Add the Android Surface app shell: SurfaceView + JNI + a worker running the
+   existing loader, attaching the `ANativeWindow*` to the host native window.
+   The offscreen mode is the supported Phase 2A target.
+6. Port the remaining memory SVCs (`MapMemory` is currently a copy, not a
    shared alias; `MapPhysicalMemory` details) and the rest of the HLE service
    registry.
