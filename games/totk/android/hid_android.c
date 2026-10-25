@@ -39,6 +39,14 @@ static int hid_send_vibration(const void *handle, const void *value) {
 void *runtime_hid_override(const char *name) {
     static const struct { const char *name; void *fn; } map[] = {
         {"_ZN2nn3hid14InitializeNpadEv", hid_ok},
+        /* Keyboard/mouse/touch also activate the SDK's HID shared-memory
+         * accessor.  There is no hid service on this host yet, so they are
+         * host no-device initializers just like InitializeNpad. */
+        {"_ZN2nn3hid15InitializeMouseEv", hid_ok},
+        {"_ZN2nn3hid18InitializeKeyboardEv", hid_ok},
+        {"_ZN2nn3hid21InitializeTouchScreenEv", hid_ok},
+        {"_ZN2nn3hid18InitializeDebugPadEv", hid_ok},
+        {"_ZN2nn3hid17InitializeGestureEv", hid_ok},
         {"_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm", hid_ok},
         {"_ZN2nn3hid24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", hid_ok},
         {"_ZN2nn3hid15GetNpadStyleSetERKj", hid_style},

@@ -1,0 +1,222 @@
+# Android Phase 2A: the null `nn::gfx` object and the NVN object graph
+
+This note records the Phase 2A investigation on the Android/arm64 host. It
+answers the question in the task directly:
+
+> `main+0x1123f34` allocates a 0x230-byte `nn::gfx` object; the constructor at
+> `main+0x1123f7c` receives `x0 = 0`. Is the allocator returning null, is an
+> NVN object uninitialised, or is the guest heap range wrong?
+
+The answer is **the allocator really returned null**, and the reason was not an
+NVN object and not the heap range. The caller's per-resource size lookup
+returned 0 for every entry, so the heap that should back the 0x230 object was
+never created. The missing input was a RomFS resource
+(`System/HeapSize/*.HeapDef.byml.zs`, plus the resource size table), not a
+null-pointer check to skip.
+
+## 1. The 0x230 allocation path
+
+The crash site is a virtual method call from `main+0x811784`:
+
+```
+main+0x8117dc  ldr  x0, [x21, x24, lsl #3]   ; resource object
+...
+main+0x8117f4  blr  x8                       ; object->vtable[0xc0] = name
+main+0x811838  bl   0x86686c                 ; create a sead heap from parent heap
+main+0x811840  str  x0, [x19]                ; x19[0] = new heap (or 0)
+...
+main+0x81187c  blr  x9                       ; virtual Initialize, x1 = x19
+```
+
+The callee is `main+0x1123388`. It does:
+
+```
+main+0x11234ec  mov  w0, #0x230
+main+0x11234f4  bl   0x7ff170                ; sead::operator new(size, align, heap)
+main+0x11234f8  mov  x22, x0
+main+0x11234fc  bl   main+0x1123ee0          ; constructor(this = x0)
+```
+
+At the crash, `[x20]` (the argument struct passed to `main+0x1123388`) was 0.
+That field is the heap returned by `0x86686c`, so the callee took the
+"no heap" fallback in `0x7ff170` and returned 0. The fallback also found no
+current-thread heap, so the 0x230 allocation was null and the constructor
+stored to address 0.
+
+`0x86686c` creates the heap only if the **required-size vector** entry for the
+resource is at least 0x101 bytes. The vector is built in `main+0x810c68` from
+the resource name:
+
+```
+main+0x8119b0  ; ResourceSizeTable lookup("Heaps/<name>/Size")
+main+0x810df8  ; vector[index] = size << 10
+```
+
+The crash dump showed:
+
+```
+0x810c68 size-vector count=77 data=...
+0x810c68 resource[0..]: size=0
+0x811784 requested heap size=0x... (a string pointer)
+```
+
+Every size was 0. The lookup failed because the game had not loaded the heap
+definition resources. On this image the boot path opens:
+
+```
+content:/System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs
+content:/System/HeapSize/Default.Nin_NX_NVN.HeapDef.byml.zs
+content:/System/HeapSize/Product.HeapDef.byml.zs
+content:/System/Resource/ResourceSizeTable.Product.100.rsizetable.zs
+```
+
+With no `TOTK_ANDROID_ROMFS`, `nn::fs::MountRom("content")` fails and all of
+those reads return not-found. The SDK keeps an empty size table, the size
+vector stays 0, and the first heap allocation for the gfx resource fails. This
+is not an NVN builder/window null and not a committed-page/heap-range error;
+those were checked separately:
+
+- `SetHeapSize(0x84200000)` succeeded at `0x330000000`.
+- `MapMemory`/`UnmapMemory`/`QueryMemory` traces showed the committed stack
+  area and the heap base correctly.
+- The kernel never returned an error for the 0x230 allocation; the guest
+  allocator itself returned 0 after the size lookup.
+
+### Reproduction
+
+The minimum RomFS subset that removes this crash is:
+
+```
+System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs
+System/Resource/ResourceSizeTable.Product.100.rsizetable.zs
+System/RegionLangMask.txt
+System/GameRomConfig/NormalProduct.game__RomConfig.bgyml
+System/AddressTable/Product.100.Nin_NX_NVN.atbl.byml.zs
+Pack/                               (Bootup/ResidentCommon/ZsDic and the rest)
+RSDB/  Model/  TexToGo/  System/  Shader/  Grass/  Effect/  UI/ ...
+```
+
+For the first graphics module initialization the important files are the
+HeapDef, the resource size table and `Pack/Bootup.Nin_NX_NVN.pack.zs` (which
+registers the per-module `ModuleInitializeParam` resources). The full base
+RomFS is the real input; a partial tree only moves the crash to the next
+missing resource.
+
+## 2. The helper facts learned on the way
+
+### `ThreadType+0x1b0` is the guest thread handle
+
+`nn::os::UnlockMutex` (the `sdk` implementation) does a futex only when the
+owner tag has the waiters bit. The current-thread id comes from:
+
+```
+TLR+0x1f8 -> ThreadType
+ThreadType+0x1b0 -> thread id
+```
+
+The loader's `ThreadType` was zero in that field, so the mutex owner never
+matched and the SDK took the contention path. `runtime_thread_set_guest_handle`
+now writes the guest handle (`0x1001` for the main thread) into
+`ThreadType+0x1b0` after `svc_thread_main_init()`. This is a host TLS field, not
+an NVN object.
+
+### Builder zeroing must use the host struct size
+
+The NVN 55 objects the guest places on its stack are not always as large as the
+reserved sizes in the D2R `nvn.h` (which is NVN 53). Zeroing the nominal
+`NVNsamplerBuilder` size (0x60) overran the caller's saved `x30`; that produced
+a `pc=0, lr=0` crash after a successful sampler registration. All builder
+defaults now zero `sizeof(*builder)` and only write fields the host owns. The
+same applies to object initializers.
+
+### HID
+
+`nn::hid::InitializeMouse`/`InitializeKeyboard` activate the SDK's HID shared
+memory accessor, which the host does not have. They are now host no-device
+initializers next to `InitializeNpad`; without them the SDK dereferenced a null
+HID singleton (`sdk+0x497fec`).
+
+## 3. NVN object graph (`nvn_android.c`)
+
+The previous file returned `nvn_ok`/`nvn_nop` for almost everything. It now owns
+the object graph and the pointer semantics the guest expects, while still not
+submitting to a GPU:
+
+- **Device**: real device builder flags, `nvnDeviceInitialize` magic, window
+  origin/depth mode, the X1 device-info table, monotonic timestamps, and
+  non-zero texture/texel/image/separate handles.
+- **Memory pool**: builder storage/flags, initialization, CPU map, buffer
+  address, size/flags, explicit failure for a CPU-invisible map.
+- **Buffer**: builder storage, range-checked initialization, map and address,
+  size/offset/pool getters.
+- **Texture**: full builder fields, Tegra X1 block-linear storage size and
+  alignment (so the guest sizes its pools consistently), storage/view offsets,
+  CPU texel write/read, packaged-data copy, address, memory pool/offset/size.
+- **Texture view**: the 16-byte TOTK view layout (levels/layers/format/swizzle/
+  target) with getters and compare.
+- **Sampler and sampler pool**: builder parameters, sampler object, descriptor
+  pool registration (writes a defined 32-byte descriptor), getters.
+- **Texture pool**: initialize/register/getters.
+- **Program, sync, event**: object magic, shader copies, fence/wait results,
+  event storage and signal.
+- **Queue**: builder sizes/priority/memory, queue initialization, submit and
+  present counters. `nvnQueueSubmitCommands` logs the first explicit GPU
+  submission points (`GPU submit #N ...`) even though the host is CPU-only.
+- **Window**: builder native window/textures/interval/active count, window
+  initialization, native-window return, acquire/present/crop.
+- **Unknown object APIs** are logged as `unimplemented NVN object API` and
+  return an explicit zero-returning stub. They are never silently reported as
+  success.
+
+The NVN layer does not need the Metal backend; it is a CPU-only object graph.
+The guest's own `nn::gfx` objects and the SEAD heaps remain real guest objects.
+
+## 4. Current stop
+
+With the required RomFS subset, the guest now passes the original 0x230 null
+allocation, creates memory/sampler pools, initializes the NVN device, gets past
+HID keyboard/mouse, and reaches `nn::gfx` window/queue setup. The current
+crash is:
+
+```
+[crash] sig=11 pc=main+0x794dd0 lr=main+0x794db8 fault=0x10
+[crash] frame 0: lr=main+0xea5f4
+[crash] frame 1: lr=main+0x11db37c
+[crash] frame 2: lr=main+0x11dad64
+[crash] frame 3: lr=main+0x1139318
+...
+[crash] frame 8: lr=main+0x811880          ; the gfx window virtual call
+[crash] last NVN api: nvnBufferMap
+```
+
+`main+0x794d30` walks a `nn::gfx` device/context registry at
+`[main+0x4542f08+0x18]` looking for the object returned by `main+0xa59ac`; the
+list is empty, so it takes the error path and the guest's own exception
+unwinder dereferences a null. The last NVN call is `nvnBufferMap`, which
+returned a valid mapping (no invalid-buffer log). This is now an
+`nn::gfx` device-registry/initialization gap, not the original null 0x230
+allocation and not a skipped NVN object. It is left explicit.
+
+The next checks are:
+
+1. Why the `nn::gfx` device/context object created at `main+0xe9d404` is not in
+   the registry walked by `main+0x794d30` (the object is handed to the SDK;
+   check the `nn::gfx::Device` create/register calls and the NVN device
+   capability values that gate them).
+2. Continue with the full RomFS so the resource-driven module initialization
+   cannot mask the next missing input.
+3. The first `nvnQueueSubmitCommands` call is already instrumented; it should
+   appear in the log as soon as the registry path is fixed.
+
+## 5. Acceptance status
+
+- The original `main+0x1123f7c` crash is explained: allocator null because the
+  required-size lookup returned 0 for every resource; the missing input is the
+  RomFS heap definition/resource size table. No null check was skipped.
+- The NVN object graph is implemented with real builder fields, object magic,
+  mappings, handles and explicit unknown-API errors.
+- The guest now reaches `nn::gfx` window/queue construction and stops at
+  `main+0x794dd0` in the `nn::gfx` device registry, with the frame chain and
+  the last NVN call recorded.
+- `nvnQueueSubmitCommands` and `nvnQueuePresentTexture` log the first explicit
+  GPU submission/present points; no GPU work is executed.

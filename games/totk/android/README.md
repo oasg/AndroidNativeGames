@@ -27,18 +27,34 @@ gate + HLE-stack thunks + a minimal SVC layer.
   `docs/android-hle-phase1.md`.
 - Guest entry points run on a real guest stack; each thread has its own 8 KiB
   TLS, ThreadLocalRegion and ThreadType, so `GetCurrentStackInfo` and
-  `GetTlsValue`/`SetTlsValue` see the layout the SDK expects.
-- `nvnBootstrapLoader`/`nvnDeviceGetProcAddress` and the NVN device
-  initialization path run on the host (`nvn_android.c`); the NVN device object
-  is created and the former SEAD task crash at `main+0x214a5e0` is gone.
+  `GetTlsValue`/`SetTlsValue` see the layout the SDK expects. The guest
+  `ThreadType+0x1b0` is filled with the guest thread handle, which
+  `nn::os::UnlockMutex` uses for its owner check.
+- `nvnBootstrapLoader`/`nvnDeviceGetProcAddress` and the full NVN object graph
+  run on the host (`nvn_android.c`): device, memory pool, buffer, texture and
+  texture view, sampler and sampler pool, texture pool, program, queue, window,
+  sync and event. Builders write real fields, mappings return the backing
+  storage, handles are non-zero, and unknown object APIs are reported instead
+  of silently succeeding. The host is CPU-only; `nvnQueueSubmitCommands` logs
+  the first explicit GPU submission points but submits no GPU work. See
+  `docs/android-hle-phase2a.md`.
 - `nn::vi` uses the SDK display/initialize/vsync path, with host layer/native
   window objects for `CreateLayer`/`GetNativeWindow` until a renderer exists.
 - `nn::hid::InitializeNpad` is a host no-pad backend for now (zero Npad/6-axis
-  state, vibration stub).
+  state, vibration stub). Keyboard/mouse/touch/debug-pad/gesture initialization
+  are host no-device initializers too, because the HID shared-memory service is
+  not implemented yet.
 - The guest thread stack guard uses accurate `QueryMemory` committed ranges and
   SVC `MapMemory`/`UnmapMemory`; guest TLS/TLR live at the bottom of each
   committed stack area.
 - HLE thunks switch to the per-thread HostContext stack.
+- The original `main+0x1123f7c` null 0x230 `nn::gfx` object was an allocator
+  null caused by missing RomFS heap definitions. The boot path needs
+  `System/HeapSize/*.HeapDef.byml.zs` and
+  `System/Resource/ResourceSizeTable.*.rsizetable.zs` (plus `Pack/` and the
+  boot `RSDB/`, `Model/`, `TexToGo/`, `System/` assets). Without them the
+  resource-size vector is all zero and no heap is created; this is not masked
+  by a null-pointer skip.
 
 ## Build
 
@@ -153,9 +169,11 @@ Expected results on an arm64 Android device:
 1. Finish the optional `fsp-srv` file-system protocol (`IFileSystem`/`IFile`
    objects) and point `IStorage` at the extracted RomFS/save data. The
    production file path now uses the `nn::fs` host overrides instead.
-2. Continue past `nnMain` with the graphics/input/audio services. The current
-   stop is the `nn::gfx` window/queue object at `main+0x1123f7c`, after NVN/VI
-   initialization; see `docs/android-hle-phase1.md`.
+2. Continue past `nnMain` with the graphics/input/audio services. The original
+   `main+0x1123f7c` null allocator is explained and fixed by the RomFS heap
+   definitions; the current stop is the `nn::gfx` device/context registry at
+   `main+0x794dd0` during window/queue setup, after the NVN object graph. See
+   `docs/android-hle-phase2a.md`.
 3. Port the remaining memory SVCs (`MapMemory` is currently a copy, not a
    shared alias; `MapPhysicalMemory` details) and the rest of the HLE service
    registry.

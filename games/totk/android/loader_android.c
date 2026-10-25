@@ -79,6 +79,14 @@ static uintptr_t read_tpidr_el0(void) {
 
 void runtime_guest_stack_info(uint64_t *base, uint64_t *size);
 void runtime_guest_commit(uintptr_t base, uintptr_t size);
+uint32_t runtime_thread_current_handle(void);
+void runtime_thread_set_guest_handle(uint32_t handle) {
+    if (g_host && g_host->dummy && handle) {
+        memcpy(g_host->dummy + 0x1b0, &handle, sizeof handle);
+        if (getenv("TOTK_ANDROID_TLS_TRACE"))
+            fprintf(stderr, "[totk-android] ThreadType %p thread_id=%#x\n", g_host->dummy, handle);
+    }
+}
 
 void runtime_thread_init(void) {
     if (g_host) return;
@@ -110,6 +118,8 @@ void runtime_thread_init(void) {
     uint64_t tb = area_base, ts = area;
     memcpy(hc->dummy + 0x50, &tb, 8);           /* ThreadType::stack_base */
     memcpy(hc->dummy + 0x58, &ts, 8);           /* ThreadType::stack_size */
+    uint32_t guest_handle = runtime_thread_current_handle();
+    if (guest_handle) memcpy(hc->dummy + 0x1b0, &guest_handle, 4);   /* ThreadType::thread_id */
     memcpy(hc->guest_tlr + 0x1f8, &hc->dummy, 8);
     hc->guest_stack_top = area_base + area - 16;
     if (getenv("TOTK_ANDROID_TLS_TRACE") || getenv("TOTK_ANDROID_CTOR_PROBE") || tls_probe_mode)
@@ -376,6 +386,9 @@ void runtime_guest_frame_report(uint64_t fp, uint64_t lr) {
     }
 }
 
+const char *runtime_nvn_last_api(void);
+const char *runtime_nvn_last_proc(void);
+
 static void crash_handler(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *u = ctx;
     uint64_t pc = u->uc_mcontext.pc;
@@ -392,6 +405,44 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
 
     if (getenv("TOTK_ANDROID_CRASH_DUMP")) {
         const unsigned long long *rr = (const unsigned long long *)u->uc_mcontext.regs;
+        for (unsigned i = 0; i <= 28; i++) {
+            char d[128];
+            if (!rr[i]) continue;
+            describe_address(rr[i], d, sizeof d);
+            if (d[0] == 'm' || d[0] == 's')   /* module-relative address */
+                fprintf(stderr, "[crash] x%u=%s\n", i, d);
+        }
+        /* With a zero frame pointer (tail call / indirect branch) walk the
+         * raw stack instead: any word that points into a module is a
+         * likely return address. */
+        if (!fp) {
+            uint64_t sv[96] = {0};
+            if (crash_read(sp, sv, sizeof sv)) {
+                for (unsigned i = 0; i < 96; i += 4)
+                    fprintf(stderr, "[crash] rawstack+%#x: %#llx %#llx %#llx %#llx\n",
+                            i * 8, (unsigned long long)sv[i], (unsigned long long)sv[i+1],
+                            (unsigned long long)sv[i+2], (unsigned long long)sv[i+3]);
+                for (unsigned i = 0; i < 96; i++) {
+                    char d[128];
+                    if (!sv[i]) continue;
+                    describe_address(sv[i], d, sizeof d);
+                    if (d[0] == 'm' || d[0] == 's')
+                        fprintf(stderr, "[crash] stack+%#x: %s\n", i * 8, d);
+                }
+                /* Recover a frame chain when the faulting x29 is zero: scan
+                 * for {candidate_fp, return_address} records. */
+                for (uintptr_t a = sp; a < sp + 0x400; a += 8) {
+                    uint64_t pair[2] = {0};
+                    if (!crash_read(a, pair, sizeof pair)) break;
+                    char d[128]; describe_address(pair[1], d, sizeof d);
+                    if ((d[0] == 'm' || d[0] == 's') &&
+                        pair[0] >= sp && pair[0] < sp + 0x100000)
+                        fprintf(stderr, "[crash] frame-scan %#llx: fp=%#llx lr=%s\n",
+                                (unsigned long long)a,
+                                (unsigned long long)pair[0], d);
+                }
+            }
+        }
         fprintf(stderr, "[crash] regs x0=%#llx x1=%#llx x2=%#llx x3=%#llx x4=%#llx x5=%#llx x6=%#llx x7=%#llx\n",
                 (unsigned long long)rr[0], (unsigned long long)rr[1], (unsigned long long)rr[2],
                 (unsigned long long)rr[3], (unsigned long long)rr[4], (unsigned long long)rr[5],
@@ -442,8 +493,14 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
         if (mb) {
             static const struct { uint32_t off; const char *name; } globals[] = {
                 {0x4557768, "alloc-global"}, {0x4557798, "current-thread"},
+                {0x4557728, "resource-table"}, {0x4557730, "resource-2"},
                 {0x4563010, "gfx-mgr"}, {0x4563018, "gfx-mgr-2"},
                 {0x45586f0, "gfx-device-slot"},
+                {0x4540aa8, "nvn-proc-aa8"}, {0x4540ab0, "nvn-proc-ab0"},
+                {0x453efa0, "got-unlock-mutex"}, {0x453ef98, "got-lock-mutex"},
+                {0x453ef88, "got-memset"}, {0x453efb8, "got-sqrtf"},
+                {0x45409a0, "nvn-proc-9a0"}, {0x45409a8, "nvn-proc-9a8"},
+                {0x45407a0, "nvn-proc-7a0"}, {0x45409f8, "nvn-proc-9f8"},
             };
             for (unsigned i = 0; i < sizeof globals / sizeof *globals; i++) {
                 uint64_t p = 0, v = 0;
@@ -456,6 +513,25 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
                     fprintf(stderr, "[crash] %s @%#x: %#llx (null)\n",
                             globals[i].name, globals[i].off, (unsigned long long)p);
                 }
+                if (!strcmp(globals[i].name, "resource-table") && p && !(p & 7)) {
+                    uint64_t t[16] = {0};
+                    if (crash_read(p, t, sizeof t))
+                        for (unsigned j = 0; j < 16; j += 2)
+                            fprintf(stderr, "[crash]   resource-table+%#x: %#llx %#llx\n",
+                                    j * 8, (unsigned long long)t[j],
+                                    (unsigned long long)t[j + 1]);
+                }
+            }
+            uint8_t *sb = runtime_module_base("sdk");
+            if (sb) {
+                static const uint32_t sdk_slots[] = {0xd0308, 0xd0310, 0xd0318, 0xd0320, 0xd0328, 0xd0330,
+                                                     0xddc000, 0xddc008, 0xddc010, 0xddc018, 0xddc020, 0xddc028};
+                for (unsigned i = 0; i < sizeof sdk_slots / sizeof *sdk_slots; i++) {
+                    uint64_t v = 0;
+                    if (crash_read((uintptr_t)(sb + sdk_slots[i]), &v, 8))
+                        fprintf(stderr, "[crash] sdk-got+%#x: %#llx\n",
+                                sdk_slots[i], (unsigned long long)v);
+                }
             }
             uint64_t g[16] = {0};
             if (crash_read((uintptr_t)(mb + 0x463c000), g, sizeof g))
@@ -467,6 +543,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
 
     /* Guest frame-pointer chain: at x29 the pair is {caller fp, return address}. */
     uint64_t chain_fp = fp;
+    uint64_t caller_heap = 0;
     if (chain_fp && !(chain_fp & 7)) {
         for (unsigned n = 0; n < 16 && chain_fp; n++) {
             uint64_t pair[2];
@@ -475,18 +552,42 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
             describe_address(pair[1], fd, sizeof fd);
             fprintf(stderr, "[crash] frame %u: fp=%#llx lr=%s\n",
                     n, (unsigned long long)chain_fp, fd);
-            if (getenv("TOTK_ANDROID_CRASH_DUMP") && n == 1) {
-                /* 0x811784 saves x23 (the sead heap the allocation uses) at
-                 * fp+0x30; the 0x810c68 caller keeps it at fp-0xa9898. */
-                uint64_t v[16] = {0};
-                if (crash_read(chain_fp + 0x20, v, sizeof v))
-                    fprintf(stderr, "[crash] frame 1 saved x24..x27=%#llx %#llx %#llx %#llx\n",
-                            (unsigned long long)v[0], (unsigned long long)v[1],
-                            (unsigned long long)v[2], (unsigned long long)v[3]);
-                if (crash_read(chain_fp + 0x30, v, 8))
-                    fprintf(stderr, "[crash] frame 1 heap x23=%#llx\n", (unsigned long long)v[0]);
-                if (crash_read(chain_fp - 0xa9898, v, 8))
-                    fprintf(stderr, "[crash] frame 2 saved resource=%#llx\n", (unsigned long long)v[0]);
+            if (getenv("TOTK_ANDROID_CRASH_DUMP") && n == 2) {
+                /* 0x811784: x29 = sp+0x10, saves x23 (the sead heap the
+                 * allocation uses) at fp+0x38; the size requested from that
+                 * heap is kept at fp-8. */
+                uint64_t v[8] = {0};
+                if (crash_read(chain_fp - 8, v, 8))
+                    fprintf(stderr, "[crash] 0x811784 requested heap size=%#llx\n",
+                            (unsigned long long)v[0]);
+                if (crash_read(chain_fp + 0x38, v, 8)) {
+                    fprintf(stderr, "[crash] 0x811784 x23=%#llx\n", (unsigned long long)v[0]);
+                    caller_heap = v[0];
+                }
+            }
+            if (getenv("TOTK_ANDROID_CRASH_DUMP") && n == 3) {
+                /* 0x810c68: x29 = sp+0x10.  sp+0x108/0x110 is the per-resource
+                 * required-size vector; sp+0x118/0x120 is the object vector. */
+                uint64_t base = chain_fp - 0xa9930, v[4] = {0};
+                uint32_t count = 0, ocount = 0;
+                uint64_t data = 0, odata = 0;
+                if (crash_read(base + 0x108, &count, 4)) { }
+                if (crash_read(base + 0x110, &data, 8)) { }
+                if (crash_read(base + 0x118, &ocount, 4)) { }
+                if (crash_read(base + 0x120, &odata, 8)) { }
+                fprintf(stderr, "[crash] 0x810c68 size-vector count=%u data=%#llx"
+                        " object-vector count=%u data=%#llx\n",
+                        count, (unsigned long long)data, ocount, (unsigned long long)odata);
+                for (uint32_t i = 0; i < count && i < 8 && data; i++) {
+                    uint64_t s = 0, o = 0;
+                    if (!crash_read(data + i * 8, &s, 8)) break;
+                    if (odata) crash_read(odata + i * 8, &o, 8);
+                    fprintf(stderr, "[crash] 0x810c68 resource[%u]: size=%#llx object=%#llx\n",
+                            i, (unsigned long long)s, (unsigned long long)o);
+                }
+                if (crash_read(base + 0x98, v, 8))
+                    fprintf(stderr, "[crash] 0x810c68 x21/resource=%#llx\n",
+                            (unsigned long long)v[0]);
             }
             uint64_t next = pair[0];
             if (!next || (next & 7) || next <= chain_fp || next - chain_fp > (64u << 20)) break;
@@ -498,9 +599,20 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
         fprintf(stderr, "[crash] frame 0: fp=%#llx lr=%s\n", (unsigned long long)fp, fd);
     }
 
+    if (getenv("TOTK_ANDROID_CRASH_DUMP") && caller_heap && !(caller_heap & 7)) {
+        uint64_t v[32] = {0};
+        if (crash_read(caller_heap, v, sizeof v))
+            for (unsigned i = 0; i < 32; i += 2)
+                fprintf(stderr, "[crash] heap %#llx+%#x: %#llx %#llx\n",
+                        (unsigned long long)caller_heap, i * 8,
+                        (unsigned long long)v[i], (unsigned long long)v[i + 1]);
+    }
+
     char hle[256];
     if (runtime_hle_last_call(hle, sizeof hle)) fprintf(stderr, "[crash] last HLE: %s\n", hle);
     else fprintf(stderr, "[crash] last HLE: none\n");
+    fprintf(stderr, "[crash] last NVN api: %s (last proc lookup: %s)\n",
+            runtime_nvn_last_api(), runtime_nvn_last_proc());
 
     RuntimeIpcRecord ipc;
     if (runtime_ipc_last(&ipc) && ipc.valid)
@@ -811,6 +923,7 @@ static void module_finis(void) { }
 
 static int boot_sdk(void) {
     uint32_t main_handle = svc_thread_main_init();
+    runtime_thread_set_guest_handle(main_handle);
     void *start = runtime_symbol("_ZN2nn4init5StartEmmPFvvES2_S2_");
     need(start != NULL, "nn::init::Start symbol");
     fprintf(stderr, "[totk-android] ENTER nn::init::Start\n");

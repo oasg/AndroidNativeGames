@@ -67,13 +67,21 @@ unsigned runtime_romfs_open(uint64_t *out, const char *path, int mode) {
     unsigned r = resolve(path, p, sizeof p);
     if (r) return r;
     int fd = open(p, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) return errno == ENOENT || errno == ENOTDIR ? NOT_FOUND : INVALID;
+    if (fd < 0) {
+        if (getenv("TOTK_ANDROID_FS_TRACE"))
+            fprintf(stderr, "[totk-romfs] open %s: %s\n", path,
+                    errno == ENOENT || errno == ENOTDIR ? "not found" : "denied");
+        return errno == ENOENT || errno == ENOTDIR ? NOT_FOUND : INVALID;
+    }
     struct stat st;
     if (fstat(fd, &st) || !S_ISREG(st.st_mode)) { close(fd); return NOT_FOUND; }
     for (unsigned i = 0; i < NH; i++) if (entries[i].fd <= 0) {
         entries[i].fd = fd;
         entries[i].size = (uint64_t)st.st_size;
         *out = HANDLE_BASE + i;
+        if (getenv("TOTK_ANDROID_FS_TRACE"))
+            fprintf(stderr, "[totk-romfs] open %s handle=%#llx size=%llu\n",
+                    path, (unsigned long long)*out, (unsigned long long)st.st_size);
         return 0;
     }
     close(fd);

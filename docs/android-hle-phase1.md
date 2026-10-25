@@ -371,30 +371,30 @@ With this, `main+0x463c048` is non-null, and the crash at
 
 ## 5. Current next gap
 
-After NVN, VI and HID initialization, the guest reaches its `nn::gfx`
-window/queue setup and crashes here:
+The `main+0x1123f7c` crash is resolved and explained in
+`docs/android-hle-phase2a.md`. In short: `main+0x1123388` really did allocate
+0x230 bytes at `main+0x11234ec`, but the parent heap was never created because
+the per-resource required-size vector built in `main+0x810c68` was all zero.
+The lookup in `main+0x8119b0` (`ResourceSizeTable`, key
+`Heaps/<name>/Size`) had no data because the RomFS heap definition
+(`content:/System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs`) and the resource
+size table were not mounted. This was an allocator-null caused by a missing
+RomFS input, not an NVN builder/window pointer and not a committed-page error.
 
-```
-[crash] sig=11 pc=main+0x1123f7c lr=main+0x1123ef4 fault=0x8
-[crash] frame 0: lr=main+0x1123500
-[crash] frame 1: lr=main+0x811880
-[crash] frame 2: lr=main+0x811014
-[crash] last IPC: service=acc:u0 command=150 object=1 type=6 data=0 result=0
-```
-
-`main+0x1123f34` allocates a 0x230-byte `nn::gfx` object and calls its
-constructor; the constructor receives a null `this` at `main+0x1123f7c`
-(`strb wzr,[x0,#8]`, `x0=0`). This is inside NVN window/queue object setup, after
-`nvnWindowBuilderSetDefaults`/`nvnWindowBuilderSetDevice` and the NVN proc
-lookups. The next step is the real NVN window/queue object graph (or the exact
-allocator that returned null), not more service stubs.
+With the HeapDef, the resource size table, `Pack/` and the boot `RSDB/`,
+`Model/`, `TexToGo/` and `System/` assets, the guest passes the 0x230
+allocation, creates memory/sampler pools, gets past HID keyboard/mouse, and
+reaches `nn::gfx` window/queue setup. The current stop is
+`main+0x794dd0` in the `nn::gfx` device registry, after a valid
+`nvnBufferMap`; the frame chain and the full object-graph work are recorded in
+`docs/android-hle-phase2a.md`.
 
 The service-side gaps still open, in trace order:
 
 1. `nvdrv` initialization commands 0/12/2 (device, memory, swapchain); it is
    still the generic Android stub.
-2. NVN window/queue/present object graph and native-window object semantics
-   behind `main+0x1123f7c` (Phase 2 renderer boundary).
+2. The `nn::gfx` device/context registry lookup at `main+0x794d30` (the
+   `nn::gfx` window/queue setup after the NVN object graph).
 3. `audio`, `am`/`applet` lifecycle, `settings`: not reached yet.
 
 ## 6. Acceptance status
@@ -407,16 +407,17 @@ Verified on the arm64 device:
 - `TOTK_ANDROID_INITS=1 boot-sdk`: pass (`module-inits`), constructors run.
 - `TOTK_ANDROID_STOP_AFTER_INITS=1`: pass.
 - `probe-tls`: pass (single-thread, cross-thread, stack info).
-- `TOTK_ANDROID_RUN_NNMAIN=1`: no longer crashes at `main+0xeba4f4` or at the
-  SEAD task object `main+0x214a5e0`; SEAD initialization completes,
-  `nn::oe initialized on the host` is logged, and the NVN device object is
-  created.
-- The next crash is `main+0x1123f7c`, a null `nn::gfx` window/queue object
-  after NVN/VI/HID initialization.
+- `TOTK_ANDROID_RUN_NNMAIN=1`: no longer crashes at `main+0xeba4f4`, at the
+  SEAD task object `main+0x214a5e0`, or at `main+0x1123f7c`; SEAD
+  initialization completes, `nn::oe initialized on the host` is logged, the
+  NVN device object is created, and the NVN object graph is live.
+- The next crash is `main+0x794dd0`, in the `nn::gfx` device/context registry
+  during window/queue setup. It is explicit and is the Phase 2A next item.
 
-Not in Phase 1:
+Not in Phase 1/2A:
 
-- Vulkan/Metal renderer and first frame.
+- Vulkan/Metal renderer and first frame (`nvnQueueSubmitCommands` is logged but
+  no GPU work is submitted).
 - Complete input/audio.
 - A real `OpenLayer` native window.
 - Performance work.
