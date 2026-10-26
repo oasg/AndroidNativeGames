@@ -447,6 +447,15 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
                 }
             }
         }
+        {
+            uint64_t q[8] = {0};
+            if (crash_read(sp, q, sizeof q))
+                fprintf(stderr, "[crash] sp object: %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx\n",
+                        (unsigned long long)q[0], (unsigned long long)q[1],
+                        (unsigned long long)q[2], (unsigned long long)q[3],
+                        (unsigned long long)q[4], (unsigned long long)q[5],
+                        (unsigned long long)q[6], (unsigned long long)q[7]);
+        }
         fprintf(stderr, "[crash] regs x0=%#llx x1=%#llx x2=%#llx x3=%#llx x4=%#llx x5=%#llx x6=%#llx x7=%#llx\n",
                 (unsigned long long)rr[0], (unsigned long long)rr[1], (unsigned long long)rr[2],
                 (unsigned long long)rr[3], (unsigned long long)rr[4], (unsigned long long)rr[5],
@@ -483,6 +492,33 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
                         char d[128]; describe_address(fn, d, sizeof d);
                         fprintf(stderr, "[crash] x1 vtable=%#llx +0x10 -> %s\n",
                                 (unsigned long long)vtable, d);
+                    }
+                    if (fallback && !(fallback & 7)) {
+                        uint64_t sub = 0;
+                        if (crash_read(fallback + 0x48, &sub, 8) && sub && !(sub & 7)) {
+                            uint64_t sq[16] = {0};
+                            if (crash_read(sub, sq, sizeof sq))
+                                fprintf(stderr, "[crash] x1 fallback+0x48 %#llx: %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx\n",
+                                        (unsigned long long)sub,
+                                        (unsigned long long)sq[0], (unsigned long long)sq[1],
+                                        (unsigned long long)sq[2], (unsigned long long)sq[3],
+                                        (unsigned long long)sq[4], (unsigned long long)sq[5],
+                                        (unsigned long long)sq[6], (unsigned long long)sq[7]);
+                        }
+                        uint64_t subv = 0, subfn = 0;
+                        if (crash_read(sub, &subv, 8) && subv && !(subv & 7) &&
+                            crash_read(subv + 0x38, &subfn, 8)) {
+                            char d[128]; describe_address(subfn, d, sizeof d);
+                            fprintf(stderr, "[crash] sub vtable=%#llx +0x38 -> %s\n",
+                                    (unsigned long long)subv, d);
+                        }
+                        uint64_t fv = 0, ffn = 0;
+                        if (crash_read(fallback, &fv, 8) && fv && !(fv & 7) &&
+                            crash_read(fv + 0x10, &ffn, 8)) {
+                            char d[128]; describe_address(ffn, d, sizeof d);
+                            fprintf(stderr, "[crash] x1 fallback vtable=%#llx +0x10 -> %s\n",
+                                    (unsigned long long)fv, d);
+                        }
                     }
                 }
             }
@@ -994,6 +1030,166 @@ static void module_inits(void) {
 
 static void module_finis(void) { }
 
+static char *read_text_file(const char *path, size_t *size) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0 || st.st_size > (off_t)(16 << 20)) { close(fd); return NULL; }
+    char *b = malloc((size_t)st.st_size + 1);
+    ssize_t n = b ? read(fd, b, (size_t)st.st_size) : -1;
+    close(fd);
+    if (!b || n != st.st_size) { free(b); return NULL; }
+    b[n] = 0;
+    if (size) *size = (size_t)n;
+    return b;
+}
+
+/* The generated .res.json files are simple, trusted arrays.  Read the
+ * "cbufs" binding numbers without pulling a JSON dependency into the CLI. */
+static unsigned reflect_cbufs(const char *path, uint32_t *out, unsigned max) {
+    if (!path || !*path || !out || !max) return 0;
+    char *text = read_text_file(path, NULL);
+    if (!text) { fprintf(stderr, "[totk-vk] ERROR read reflection %s\n", path); return 0; }
+    const char *p = strstr(text, "\"cbufs\"");
+    if (!p) { free(text); return 0; }
+    p = strchr(p, '[');
+    unsigned n = 0;
+    while (p && n < max) {
+        const char *obj = strchr(p, '{');
+        const char *end = strchr(p, ']');
+        if (!obj || (end && obj > end)) break;
+        const char *close = strchr(obj, '}');
+        if (!close) break;
+        const char *b = strstr(obj, "\"binding\"");
+        if (b && b < close) {
+            b += strlen("\"binding\"");
+            while (*b && (*b == ' ' || *b == ':' || *b == '\t')) b++;
+            uint32_t v = (uint32_t)strtoul(b, NULL, 10);
+            int dup = 0;
+            for (unsigned i = 0; i < n; i++) if (out[i] == v) dup = 1;
+            if (!dup) out[n++] = v;
+        }
+        p = close + 1;
+    }
+    for (const char *key = "\"sbufs\""; *key; ) {
+        const char *q = strstr(text, key);
+        if (!q) break;
+        const char *a = strchr(q, '[');
+        const char *b = a ? strchr(a, ']') : NULL;
+        if (a && b && b > a + 1)
+            fprintf(stderr, "[totk-vk] reflection %s has sbufs; descriptor mapping for them is next\n", path);
+        break;
+    }
+    free(text);
+    return n;
+}
+
+
+static unsigned reflect_section(const char *path, const char *section, GfxBindingKind kind,
+                                GfxBindingSpec *out, unsigned max) {
+    if (!path || !*path || !out || !max) return 0;
+    char *text = read_text_file(path, NULL);
+    if (!text) { fprintf(stderr, "[totk-vk] ERROR read reflection %s\n", path); return 0; }
+    char key[64]; snprintf(key, sizeof key, "\"%s\"", section);
+    const char *p = strstr(text, key);
+    if (!p) { free(text); return 0; }
+    p = strchr(p, '[');
+    unsigned n = 0;
+    while (p && n < max) {
+        const char *obj = strchr(p, '{');
+        const char *end = strchr(p, ']');
+        if (!obj || (end && obj > end)) break;
+        const char *close = strchr(obj, '}');
+        if (!close) break;
+        const char *b = strstr(obj, "\"binding\"");
+        if (b && b < close) {
+            b += strlen("\"binding\"");
+            while (*b && (*b == ' ' || *b == ':' || *b == '\t')) b++;
+            uint32_t binding = (uint32_t)strtoul(b, NULL, 10);
+            uint32_t count = 1;
+            const char *a = strstr(obj, "\"array\"");
+            if (a && a < close) {
+                a += strlen("\"array\"");
+                while (*a && (*a == ' ' || *a == ':' || *a == '\t')) a++;
+                uint32_t v = (uint32_t)strtoul(a, NULL, 10);
+                if (v) count = v;
+            }
+            int dup = 0;
+            for (unsigned i = 0; i < n; i++)
+                if (out[i].binding == binding) { dup = 1; break; }
+            if (!dup) out[n++] = (GfxBindingSpec){ binding, kind, count };
+        }
+        p = close + 1;
+    }
+    free(text);
+    return n;
+}
+
+static unsigned reflect_file(const char *path, GfxBindingSpec *out, unsigned max) {
+    unsigned n = 0;
+    n += reflect_section(path, "cbufs", GFX_BIND_UBO, out + n, max - n);
+    n += reflect_section(path, "sbufs", GFX_BIND_SSBO, out + n, max - n);
+    n += reflect_section(path, "textures", GFX_BIND_TEXTURE, out + n, max - n);
+    n += reflect_section(path, "images", GFX_BIND_IMAGE, out + n, max - n);
+    return n;
+}
+
+static int spirv_move_set(uint8_t *code, size_t size, uint32_t from, uint32_t to) {
+    if (!code || size < 20 || (size & 3)) return 0;
+    uint32_t *w = (uint32_t *)code;
+    for (size_t i = 5; i < size / 4; ) {
+        uint32_t op = w[i] & 0xffffu, wc = w[i] >> 16;
+        if (!wc || i + wc > size / 4) break;
+        /* OpDecorate target DescriptorSet value */
+        if (op == 71 && wc >= 4 && w[i + 2] == 34 && w[i + 3] == from) w[i + 3] = to;
+        i += wc;
+    }
+    return 1;
+}
+
+static int probe_vulkan_triangle(const char *dir) {
+    const char *fs = getenv("TOTK_ANDROID_TRIANGLE_FRAMES");
+    int frames = fs && *fs ? atoi(fs) : 60;
+    if (frames < 1) frames = 1;
+    if (frames > 600) frames = 600;
+    GfxOffscreenTarget *t = gfx_backend_offscreen_create(1280, 720, 0x25);
+    if (!t) { fprintf(stderr, "[totk-vk] ERROR triangle target\n"); return 1; }
+    GfxTrianglePipeline *p = gfx_backend_builtin_triangle_pipeline();
+    if (!p) { gfx_backend_offscreen_destroy(t); return 1; }
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    for (int i = 0; i < frames; i++) {
+        if (!gfx_backend_triangle_draw(p, t, 0.05f, 0.08f, 0.12f, 1.0f)) {
+            fprintf(stderr, "[totk-vk] ERROR triangle draw frame %d\n", i);
+            gfx_backend_offscreen_destroy(t);
+            return 1;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    double sec = (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) / 1e9;
+    uint8_t center[4] = {0}, corner[4] = {0};
+    gfx_backend_offscreen_read_pixel(t, 640, 360, center);
+    gfx_backend_offscreen_read_pixel(t, 0, 0, corner);
+    uint64_t hash = gfx_backend_offscreen_hash(t);
+    char shot[PATH_MAX];
+    const char *env = getenv("TOTK_ANDROID_SCREENSHOT");
+    if (env && *env) snprintf(shot, sizeof shot, "%s", env);
+    else snprintf(shot, sizeof shot, "%s/triangle.ppm", dir);
+    int shot_ok = gfx_backend_offscreen_write_ppm(t, shot);
+    int ok = center[0] > 200 && center[1] > 60 && center[1] < 100 &&
+             center[2] < 40 && corner[0] < 40 && corner[1] < 40;
+    printf("{\"status\":\"%s\",\"host\":\"android\",\"probe\":\"vulkan-triangle\","
+           "\"frames\":%d,\"fps\":%.2f,\"center\":\"%02x%02x%02x%02x\","
+           "\"corner\":\"%02x%02x%02x%02x\",\"hash\":\"%016llx\",\"screenshot\":\"%s\","
+           "\"screenshot_ok\":%s}\n",
+           ok ? "pass" : "fail", frames, sec > 0 ? frames / sec : 0.0,
+           center[0], center[1], center[2], center[3],
+           corner[0], corner[1], corner[2], corner[3],
+           (unsigned long long)hash, shot, shot_ok ? "true" : "false");
+    gfx_backend_offscreen_destroy(t);
+    return ok ? 0 : 1;
+}
+
 static int boot_sdk(void) {
     uint32_t main_handle = svc_thread_main_init();
     runtime_thread_set_guest_handle(main_handle);
@@ -1063,6 +1259,191 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[totk-android] sealed all\n");
     if (!strcmp(argv[2], "probe")) return probe();
     if (!strcmp(argv[2], "probe-hle")) return probe_hle();
+    if (!strcmp(argv[2], "probe-vulkan-triangle")) return probe_vulkan_triangle(argv[1]);
+    if (!strcmp(argv[2], "probe-totk-reflect")) {
+        const char *vsp = getenv("TOTK_ANDROID_SPV_VS");
+        const char *psp = getenv("TOTK_ANDROID_SPV_PS");
+        const char *rvp = getenv("TOTK_ANDROID_REFL_VS");
+        const char *rpp = getenv("TOTK_ANDROID_REFL_PS");
+        if (!vsp || !psp || !rvp || !rpp) {
+            fprintf(stderr, "[totk-vk] ERROR probe-totk-reflect needs SPV_VS/SPV_PS/REFL_VS/REFL_PS\n");
+            return 1;
+        }
+        size_t vsn = 0, psn = 0;
+        uint8_t *vs = (uint8_t *)read_text_file(vsp, &vsn);
+        uint8_t *ps = (uint8_t *)read_text_file(psp, &psn);
+        if (!vs || !ps) { free(vs); free(ps); return 1; }
+        spirv_move_set(ps, psn, 0, 1);
+        GfxBindingSpec vss[16], pss[16];
+        unsigned nvs = reflect_file(rvp, vss, 16);
+        unsigned nps = reflect_file(rpp, pss, 16);
+        fprintf(stderr, "[totk-vk] reflected bindings vs=%u ps=%u\n", nvs, nps);
+        GfxOffscreenTarget *t = gfx_backend_offscreen_create(1280, 720, 0x25);
+        GfxReflectedPipeline *p = t ? gfx_backend_reflected_pipeline_create(
+            vs, vsn, ps, psn, gfx_backend_vk_format_for_nvn(0x25), vss, nvs, pss, nps) : NULL;
+        free(vs); free(ps);
+        if (!t || !p) {
+            if (t) gfx_backend_offscreen_destroy(t);
+            fprintf(stderr, "[totk-vk] ERROR reflected pipeline\n");
+            return 1;
+        }
+        for (int i = 0; i < 10; i++)
+            if (!gfx_backend_reflected_draw(p, t, 0.05f, 0.08f, 0.12f, 1.0f)) {
+                fprintf(stderr, "[totk-vk] ERROR reflected draw %d\n", i);
+                gfx_backend_reflected_pipeline_destroy(p);
+                gfx_backend_offscreen_destroy(t);
+                return 1;
+            }
+        uint8_t center[4] = {0}, corner[4] = {0};
+        gfx_backend_offscreen_read_pixel(t, 640, 360, center);
+        gfx_backend_offscreen_read_pixel(t, 0, 0, corner);
+        int visible = center[0] != corner[0] || center[1] != corner[1] || center[2] != corner[2];
+        char shot[PATH_MAX];
+        const char *env = getenv("TOTK_ANDROID_SCREENSHOT");
+        if (env && *env) snprintf(shot, sizeof shot, "%s", env);
+        else snprintf(shot, sizeof shot, "%s/reflect.ppm", argv[1]);
+        int shot_ok = gfx_backend_offscreen_write_ppm(t, shot);
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"totk-reflect\","
+               "\"vs_bindings\":%u,\"ps_bindings\":%u,\"center\":\"%02x%02x%02x%02x\","
+               "\"corner\":\"%02x%02x%02x%02x\",\"visible\":%s,\"screenshot\":\"%s\","
+               "\"screenshot_ok\":%s}\n", nvs, nps, center[0], center[1], center[2], center[3],
+               corner[0], corner[1], corner[2], corner[3], visible ? "true" : "false",
+               shot, shot_ok ? "true" : "false");
+        gfx_backend_reflected_pipeline_destroy(p);
+        gfx_backend_offscreen_destroy(t);
+        return 0;
+    }
+    if (!strcmp(argv[2], "probe-totk-vs")) {
+        const char *path = getenv("TOTK_ANDROID_SPV_VS");
+        if (!path || !*path) path = "/data/local/tmp/totk-android/spv/system-vs-8511c97f.spv";
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) { fprintf(stderr, "[totk-vk] ERROR open %s\n", path); return 1; }
+        struct stat st;
+        if (fstat(fd, &st) != 0 || st.st_size <= 0 || st.st_size > (off_t)(16 << 20)) { close(fd); return 1; }
+        uint8_t *vs = malloc((size_t)st.st_size);
+        ssize_t got = vs ? read(fd, vs, (size_t)st.st_size) : -1;
+        close(fd);
+        if (!vs || got != st.st_size) { free(vs); return 1; }
+        const char *ps_path = getenv("TOTK_ANDROID_SPV_PS");
+        uint8_t *ps = NULL;
+        size_t ps_size = 0;
+        if (ps_path && *ps_path) {
+            int pfd = open(ps_path, O_RDONLY);
+            if (pfd < 0 || fstat(pfd, &st) != 0 || st.st_size <= 0 || st.st_size > (off_t)(16 << 20)) {
+                if (pfd >= 0) close(pfd);
+                free(vs);
+                fprintf(stderr, "[totk-vk] ERROR open %s\n", ps_path);
+                return 1;
+            }
+            ps_size = (size_t)st.st_size;
+            ps = malloc(ps_size);
+            ssize_t pgot = ps ? read(pfd, ps, ps_size) : -1;
+            close(pfd);
+            if (!ps || pgot != st.st_size) { free(vs); free(ps); return 1; }
+        }
+        GfxUboBinding ubos[8];
+        uint32_t nubo = 0;
+        const char *rv = getenv("TOTK_ANDROID_REFL_VS");
+        const char *rp = getenv("TOTK_ANDROID_REFL_PS");
+        if (rv || rp) {
+            uint32_t b[8];
+            unsigned n = reflect_cbufs(rv, b, 8);
+            for (unsigned i = 0; i < n; i++) ubos[nubo++] = (GfxUboBinding){ b[i], 0x10000 };
+            n = reflect_cbufs(rp, b, 8);
+            for (unsigned i = 0; i < n; i++) {
+                int dup = 0;
+                for (uint32_t j = 0; j < nubo; j++) if (ubos[j].binding == b[i]) dup = 1;
+                if (!dup && nubo < 8) ubos[nubo++] = (GfxUboBinding){ b[i], 0x10000 };
+            }
+            fprintf(stderr, "[totk-vk] reflection cbufs: %u binding(s)\n", nubo);
+        }
+        if (!nubo) { ubos[nubo++] = (GfxUboBinding){1, 0x10000}; ubos[nubo++] = (GfxUboBinding){2, 0x10000}; }
+        GfxOffscreenTarget *t = gfx_backend_offscreen_create(1280, 720, 0x25);
+        GfxTrianglePipeline *p = NULL;
+        if (t) {
+            if (ps) {
+                p = gfx_backend_triangle_pipeline_create_ubo(vs, (size_t)got, ps, ps_size,
+                                                             gfx_backend_vk_format_for_nvn(0x25), ubos, nubo);
+            } else {
+                p = gfx_backend_totk_vs_pipeline_create(vs, (size_t)got, gfx_backend_vk_format_for_nvn(0x25));
+            }
+        }
+        free(vs); free(ps);
+        if (!t || !p) { if (t) gfx_backend_offscreen_destroy(t); fprintf(stderr, "[totk-vk] ERROR TOTK VS pipeline\n"); return 1; }
+        float c4[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+        float c11[4] = {255.0f, 0.0f, 0.0f, 0.0f};
+        if (nubo) {
+            if (!gfx_backend_triangle_write_ubo(p, 1, 147 * 16, c4, sizeof c4) ||
+                !gfx_backend_triangle_write_ubo(p, 2, 25 * 16, c11, sizeof c11)) {
+                fprintf(stderr, "[totk-vk] ERROR TOTK VS UBO write\n");
+                gfx_backend_offscreen_destroy(t);
+                return 1;
+            }
+        }
+        for (int i = 0; i < 10; i++)
+            if (!gfx_backend_triangle_draw(p, t, 0.05f, 0.08f, 0.12f, 1.0f)) {
+                fprintf(stderr, "[totk-vk] ERROR TOTK VS draw %d\n", i);
+                gfx_backend_offscreen_destroy(t);
+                return 1;
+            }
+        uint8_t center[4] = {0}, corner[4] = {0};
+        gfx_backend_offscreen_read_pixel(t, 640, 360, center);
+        gfx_backend_offscreen_read_pixel(t, 0, 0, corner);
+        char shot[PATH_MAX];
+        const char *env = getenv("TOTK_ANDROID_SCREENSHOT");
+        if (env && *env) snprintf(shot, sizeof shot, "%s", env);
+        else snprintf(shot, sizeof shot, "%s/totk-vs.ppm", argv[1]);
+        int ok = ps_path && *ps_path
+                 ? (center[0] > 200 && center[1] > 200 && center[2] > 200)
+                 : (center[0] > 200 && center[1] > 60 && center[1] < 100 && center[2] < 40);
+        int shot_ok = gfx_backend_offscreen_write_ppm(t, shot);
+        printf("{\"status\":\"%s\",\"host\":\"android\",\"probe\":\"totk-vs\","
+               "\"ps\":\"%s\",\"center\":\"%02x%02x%02x%02x\",\"corner\":\"%02x%02x%02x%02x\","
+               "\"screenshot\":\"%s\",\"screenshot_ok\":%s}\n",
+               ok ? "pass" : "fail", (ps_path && *ps_path) ? ps_path : "builtin",
+               center[0], center[1], center[2], center[3],
+               corner[0], corner[1], corner[2], corner[3], shot, shot_ok ? "true" : "false");
+        gfx_backend_offscreen_destroy(t);
+        return ok ? 0 : 1;
+    }
+    if (!strcmp(argv[2], "probe-vulkan-texture")) {
+        GfxOffscreenTarget *t = gfx_backend_offscreen_create(1280, 720, 0x25);
+        GfxTexturedPipeline *p = gfx_backend_builtin_textured_pipeline();
+        static const uint8_t checker[16] = {
+            255, 0, 0, 255,   0, 255, 0, 255,
+            0, 0, 255, 255,   255, 255, 255, 255,
+        };
+        GfxTexture *tex = gfx_backend_texture_create_rgba8(2, 2, checker);
+        if (!t || !p || !tex) {
+            fprintf(stderr, "[totk-vk] ERROR texture probe setup\n");
+            if (tex) gfx_backend_texture_destroy(tex);
+            if (t) gfx_backend_offscreen_destroy(t);
+            return 1;
+        }
+        for (int i = 0; i < 10; i++)
+            if (!gfx_backend_textured_draw(p, tex, t, 0.05f, 0.08f, 0.12f, 1.0f)) {
+                fprintf(stderr, "[totk-vk] ERROR textured draw %d\n", i);
+                return 1;
+            }
+        uint8_t center[4] = {0}, corner[4] = {0};
+        gfx_backend_offscreen_read_pixel(t, 640, 360, center);
+        gfx_backend_offscreen_read_pixel(t, 0, 0, corner);
+        char shot[PATH_MAX];
+        const char *env = getenv("TOTK_ANDROID_SCREENSHOT");
+        if (env && *env) snprintf(shot, sizeof shot, "%s", env);
+        else snprintf(shot, sizeof shot, "%s/texture.ppm", argv[1]);
+        int shot_ok = gfx_backend_offscreen_write_ppm(t, shot);
+        int ok = center[0] > 80 && center[0] < 180 && center[1] > 80 && center[1] < 180 &&
+                 center[2] > 80 && center[2] < 180 && corner[0] < 40;
+        printf("{\"status\":\"%s\",\"host\":\"android\",\"probe\":\"vulkan-texture\","
+               "\"center\":\"%02x%02x%02x%02x\",\"corner\":\"%02x%02x%02x%02x\","
+               "\"screenshot\":\"%s\",\"screenshot_ok\":%s}\n",
+               ok ? "pass" : "fail", center[0], center[1], center[2], center[3],
+               corner[0], corner[1], corner[2], corner[3], shot, shot_ok ? "true" : "false");
+        gfx_backend_texture_destroy(tex);
+        gfx_backend_offscreen_destroy(t);
+        return ok ? 0 : 1;
+    }
     if (!strcmp(argv[2], "probe-spirv")) {
         const char *dir = getenv("TOTK_ANDROID_SPV_DIR");
         if (!dir) dir = "/data/local/tmp/totk-android/spv";
@@ -1098,6 +1479,43 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[2], "probe-vulkan")) {
         if (!gfx_backend_selftest()) { fprintf(stderr, "[totk-vk] selftest FAIL\n"); return 1; }
         printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"vulkan-offscreen\"}\n");
+        return 0;
+    }
+    if (!strcmp(argv[2], "probe-nvn-texture")) {
+        int runtime_nvn_textured_draw_selftest(const char *screenshot, int frames);
+        char shot[PATH_MAX];
+        const char *env = getenv("TOTK_ANDROID_SCREENSHOT");
+        if (env && *env) snprintf(shot, sizeof shot, "%s", env);
+        else snprintf(shot, sizeof shot, "%s/nvn-texture.ppm", argv[1]);
+        const char *fs = getenv("TOTK_ANDROID_NVN_DRAW_FRAMES");
+        int frames = fs && *fs ? atoi(fs) : 60;
+        if (!runtime_nvn_textured_draw_selftest(shot, frames)) {
+            fprintf(stderr, "[totk-nvn] NVN texture draw selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-texture\","
+               "\"frames\":%d,\"screenshot\":\"%s\"}\n", frames, shot);
+        return 0;
+    }
+    if (!strcmp(argv[2], "probe-nvn-draw")) {
+        int runtime_nvn_draw_selftest(const char *screenshot, int frames,
+                                      const char *vs_path, const char *ps_path, int expect_visible);
+        char shot[PATH_MAX];
+        const char *env = getenv("TOTK_ANDROID_SCREENSHOT");
+        if (env && *env) snprintf(shot, sizeof shot, "%s", env);
+        else snprintf(shot, sizeof shot, "%s/nvn-draw.ppm", argv[1]);
+        const char *fs = getenv("TOTK_ANDROID_NVN_DRAW_FRAMES");
+        int frames = fs && *fs ? atoi(fs) : 60;
+        const char *vs = getenv("TOTK_ANDROID_SPV_VS");
+        const char *ps = getenv("TOTK_ANDROID_SPV_PS");
+        int visible = !(vs && *vs && ps && *ps);
+        if (!runtime_nvn_draw_selftest(shot, frames, vs, ps, visible)) {
+            fprintf(stderr, "[totk-nvn] NVN draw selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-draw\","
+               "\"frames\":%d,\"visible\":%s,\"screenshot\":\"%s\"}\n",
+               frames, visible ? "true" : "false", shot);
         return 0;
     }
     if (!strcmp(argv[2], "probe-nvn-submit")) {

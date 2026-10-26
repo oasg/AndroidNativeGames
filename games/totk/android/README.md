@@ -62,6 +62,15 @@ gate + HLE-stack thunks + a minimal SVC layer.
   GPU.  `tools/shader_spike.py` reproduces the sample and `probe-spirv`
   validates a cache on-device.  See
   `docs/android-hle-phase2b2-shader-spike.md`.
+- 2B.3 rendering: a real Vulkan triangle pipeline (built-in GLSL -> SPIR-V at
+  build time), offscreen `probe-vulkan-triangle` with 60 frames and PPM
+  screenshot, an NVN command-buffer draw path (`probe-nvn-draw`, 60
+  draws/presents), a sampled-texture path (`probe-vulkan-texture` and
+  `probe-nvn-texture`, including guest block-linear deswizzle), a visible
+  translated TOTK VS/PS draw with UBO/`.res.json` cbuf mapping
+  (`probe-totk-vs`), and a separate Android Surface clear APK under
+  `surface_test/` (1,620+ frames on the arm64 emulator).  See
+  `docs/android-hle-phase2b3-rendering.md`.
 - `nn::hid::InitializeNpad` is a host no-pad backend for now (zero Npad/6-axis
   state, vibration stub). Keyboard/mouse/touch/debug-pad/gesture initialization
   are host no-device initializers too, because the HID shared-memory service is
@@ -108,6 +117,12 @@ adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-vi
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-nvn-submit
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-vulkan
+adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-vulkan-triangle
+adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-vulkan-texture
+adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-nvn-draw
+adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-nvn-texture
+adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-totk-vs
+adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-totk-reflect
 TOTK_ANDROID_TRACE_SVC=1 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android boot-sdk
 ```
 
@@ -124,6 +139,24 @@ adb shell 'TOTK_ANDROID_SPV_DIR=/data/local/tmp/totk-android/spv \
 `--all` translates every unique shader in the selected packages; the default
 is two per package.  The spike uses the macOS `totk_xlate` prebuilt and keeps
 game-derived output under `/tmp`.
+
+### Surface clear test
+
+The on-screen path is tested by a separate minimal APK with no game data:
+
+```sh
+ANDROID_NDK_HOME=/opt/homebrew/share/android-ndk \
+ANDROID_SDK_ROOT=/opt/homebrew/share/android-commandlinetools \
+games/totk/android/surface_test/build.sh
+adb install -r games/totk/android/surface_test/build/surface-test.apk
+adb shell am start -n com.totk.surfacetest/.MainActivity
+```
+
+It creates a real `VkSwapchainKHR` from an `ANativeWindow` and presents an
+animated clear.  The arm64 emulator reached 1,620+ frames (~60 Hz).  The physical
+Xiaomi device now accepts `adb install` (the streamed install succeeds), but the
+last run was on a locked/dozing screen, so Android destroyed the Surface after
+one frame; unlock and keep the screen on to measure it on-device.
 
 ### Host-call and IPC tracing
 
@@ -178,6 +211,25 @@ Expected results on an arm64 Android device:
 - `probe-vulkan`: creates a real Vulkan instance/device, a 1280x720 RGBA8
   offscreen `VkImage`, clears it on the GPU, copies it back and verifies
   `px=4080bfff`.  Device on the test target: Adreno 830, Vulkan 1.3.284.
+- `probe-vulkan-triangle`: renders 60 frames of the built-in triangle,
+  verifies orange center / dark corner pixels, writes `triangle.ppm` and reports
+  FPS.
+- `probe-nvn-draw`: records 60 NVN command-buffer draws, submits and presents
+  them through the Vulkan backend; verifies the same pixels and writes
+  `nvn-draw.ppm`.
+- `probe-vulkan-texture`: uploads a 2x2 RGBA8 checker to a `VkImage`/sampler,
+  draws a textured triangle and verifies the interpolated center pixel.
+- `probe-nvn-texture`: creates a real NVN memory pool/texture through
+  `nvnTextureInitialize`, writes a checker through block-linear `nvn_swizzle`,
+  deswizzles it and runs 60 NVN textured draws/presents.
+- `probe-totk-vs`: draws a visible full-screen triangle with the translated
+  TOTK `system-vs` and `material-ps`, using `.res.json` cbuf bindings and UBOs.
+- `probe-totk-reflect`: creates a two-set descriptor pipeline from full
+  `.res.json` cbufs; sampled-textured PS compilation is still under debug.
+- `probe-nvn-draw` with `TOTK_ANDROID_SPV_VS`/`TOTK_ANDROID_SPV_PS` loads a
+  translated TOTK SPIR-V pair into the NVN program and executes the draw.  The
+  sampled system/material pair is not a visible triangle (`visible:false`);
+  full game shader/UBO/vertex binding is the next step.
 - `probe-nvn-submit`: builds a CPU-only NVN device/queue/window, records one
   command buffer, submits it and presents it through Vulkan.  This is the
   first explicit `nvnQueueSubmitCommands`/`nvnQueuePresentTexture` point; it is
@@ -243,11 +295,15 @@ Expected results on an arm64 Android device:
    translator.  The 112-shader spike translated 112/112 and the Adreno driver
    accepted 112/112 `VkShaderModule`s.  Next: translate the startup/title
    subset, map NVN reflection to Vulkan descriptor sets, and create real
-   pipelines.  Missing variants fall back to clear/simple triangle; full game
-   visuals are not promised yet.  See `docs/android-hle-phase2b2-shader-spike.md`.
+   pipelines.  cbuf UBOs and a visible translated TOTK VS/PS draw are now
+   working; sbufs/textures/images and full mip/format coverage remain.
+   Missing variants fall back to clear/simple triangle; full game visuals are
+   not promised yet.  See `docs/android-hle-phase2b2-shader-spike.md`.
 6. 2B.3: texture storage -> `VkImage` upload/format-modifier validation and
    the Android Surface app shell (SurfaceView + JNI + a worker running the
-   loader, attaching the `ANativeWindow*` to the host native window).
+   loader, attaching the `ANativeWindow*` to the host native window).  The
+   minimal Vulkan and NVN texture draw paths and the Surface clear APK are now
+   in place; full game texture/descriptor mapping is next.
 7. Port the remaining memory SVCs (`MapMemory` is currently a copy, not a
    shared alias; `MapPhysicalMemory` details) and the rest of the HLE service
    registry.

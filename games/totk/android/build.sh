@@ -19,16 +19,21 @@ if [ ! -x "$cc" ]; then
 fi
 "$python" "$here/../scripts/prepare_android_runtime.py" --work "$work"
 out="$work/build/android-v0"
+"$python" "$here/tools/prepare_triangle_spv.py" --ndk "$ndk" --out "$out/triangle_spv.h"
 "$cc" -std=c11 -O2 -Wall -Wextra \
   -fno-stack-protector -ffixed-x18 -fno-sanitize=shadow-call-stack -fno-emulated-tls \
   -I"$here/../runtime" -I"$out" \
+  -I"$here/../third_party/d2r_gfx/gfx/nvn" -I"$here/../third_party/d2r_gfx/gfx/tex" \
   "$here/loader_android.c" "$here/hle_android.c" "$here/hle_stack_android.c" \
   "$here/services_android.c" "$here/fs_service_android.c" "$here/vi_android.c" \
   "$here/account_android.c" "$here/nvn_android.c" "$here/nvdrv_android.c" \
   "$here/native_window_android.c" "$here/gfx_vulkan_android.c" "$here/hid_android.c" \
   "$here/fs_host_android.c" "$here/romfs_android.c" \
   "$here/../runtime/threads.c" "$here/../runtime/ipc.c" \
+  "$here/../third_party/d2r_gfx/gfx/nvn/nvn_tex.c" \
+  "$here/../third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c" \
+  "$here/nvn_texture_guest_android.c" \
   "$here/sha256.c" "$here/gate_android.S" "$here/hle_stack_android.S" \
   "$here/thread_enter_android.S" -D__ANDROID__ \
-  -pthread -lc++abi -lunwind -lvulkan -ldl -o "$out/totk-android"
+  -pthread -lc++abi -lunwind -lvulkan -ldl -llog -o "$out/totk-android"
 echo "built $out/totk-android"

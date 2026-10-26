@@ -162,3 +162,52 @@ const char *runtime_native_window_backend(const void *p) {
     if (!w || w->magic != HOST_NW_MAGIC) return "none";
     return w->gfx_target ? gfx_backend_name() : "software";
 }
+
+int runtime_native_window_draw_triangle_pipeline(void *p, void *pipeline) {
+    HostNativeWindow *w = p;
+    if (!w || w->magic != HOST_NW_MAGIC || !w->gfx_target || !pipeline) return 0;
+    if (!gfx_backend_triangle_draw((GfxTrianglePipeline *)pipeline, w->gfx_target,
+                                   0.05f, 0.08f, 0.12f, 1.0f))
+        return 0;
+    const uint8_t *src = gfx_backend_offscreen_pixels(w->gfx_target, NULL);
+    if (src) memcpy(w->buffer, src, w->buffer_size);
+    return 1;
+}
+
+int runtime_native_window_draw_triangle(void *p) {
+    return runtime_native_window_draw_triangle_pipeline(p, gfx_backend_builtin_triangle_pipeline());
+}
+
+int runtime_native_window_draw_textured_triangle(void *p, void *pipeline, void *texture) {
+    HostNativeWindow *w = p;
+    if (!w || w->magic != HOST_NW_MAGIC || !w->gfx_target || !pipeline || !texture) return 0;
+    if (!gfx_backend_textured_draw((GfxTexturedPipeline *)pipeline, (GfxTexture *)texture,
+                                   w->gfx_target, 0.05f, 0.08f, 0.12f, 1.0f))
+        return 0;
+    const uint8_t *src = gfx_backend_offscreen_pixels(w->gfx_target, NULL);
+    if (src) memcpy(w->buffer, src, w->buffer_size);
+    return 1;
+}
+
+int runtime_native_window_read_pixel(void *p, uint32_t x, uint32_t y, uint8_t out[4]) {
+    HostNativeWindow *w = p;
+    if (!w || w->magic != HOST_NW_MAGIC) return 0;
+    if (w->gfx_target) return gfx_backend_offscreen_read_pixel(w->gfx_target, x, y, out);
+    if (x >= w->width || y >= w->height || !out) return 0;
+    memcpy(out, w->buffer + ((size_t)y * w->width + x) * 4, 4);
+    return 1;
+}
+
+int runtime_native_window_screenshot(void *p, const char *path) {
+    HostNativeWindow *w = p;
+    if (!w || w->magic != HOST_NW_MAGIC || !path) return 0;
+    if (w->gfx_target) return gfx_backend_offscreen_write_ppm(w->gfx_target, path);
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    fprintf(f, "P6\n%u %u\n255\n", w->width, w->height);
+    for (uint32_t y = 0; y < w->height; y++)
+        for (uint32_t x = 0; x < w->width; x++)
+            fwrite(w->buffer + ((size_t)y * w->width + x) * 4, 1, 3, f);
+    fclose(f);
+    return 1;
+}

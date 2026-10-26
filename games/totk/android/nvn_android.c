@@ -19,10 +19,17 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <time.h>
+#include "gfx_backend_android.h"
 
 typedef uint32_t NvnBool;
 typedef void *NvnNativeWindow;
 extern int runtime_native_window_present(void *p);
+extern int runtime_native_window_draw_triangle(void *p);
+extern int runtime_native_window_draw_triangle_pipeline(void *p, void *pipeline);
+extern int runtime_native_window_draw_textured_triangle(void *p, void *pipeline, void *texture);
+extern int runtime_native_window_read_pixel(void *p, uint32_t x, uint32_t y, uint8_t out[4]);
+extern int runtime_native_window_screenshot(void *p, const char *path);
+static void nvn_process_submit_commands(const uint64_t *cmds, int n);
 
 #define NVN_MAGIC(a, b, c, d) \
     ((uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24)
@@ -223,6 +230,12 @@ typedef struct {
     int64_t off;
 } tex_pool_t;
 
+/* Host bridge for the 2B.3 texture path; kept out of tex_t so the guest's
+ * NVN_TEXTURE_SIZE contract is unchanged. */
+typedef struct { const tex_t *tex; void *gfx; } tex_bridge_t;
+static tex_bridge_t g_tex_bridges[64];
+static unsigned g_tex_bridge_count;
+
 typedef struct {
     uint8_t minf, magf, ws, wt, wr, cmp_mode, cmp_func, reduction;
     float lod_min, lod_max, lod_bias, aniso, border[4], lod_snap;
@@ -236,6 +249,10 @@ typedef struct {
     uint32_t magic, nstage;
     uint64_t data[6];
     const void *control[6];
+    void *gfx_pipeline;       /* host Vulkan pipeline for the 2B.3 draw path */
+    void *gfx_textured_pipeline;
+    void *gfx_texture;
+    uint32_t textured;
     uint64_t serial;
 } prog_t;
 
@@ -586,6 +603,7 @@ static void nvnQueueSubmitCommands(queue_t *q, int n, const uint64_t *cmds) { nv
     if (total <= 8 || getenv("TOTK_ANDROID_TRACE_NVN"))
         fprintf(stderr, "[totk-nvn] GPU submit #%u queue=%p commands=%d (CPU-only host)\n",
                 total, (void *)q, n);
+    nvn_process_submit_commands(cmds, n);
 }
 static void nvnQueueFlush(queue_t *q) { (void)q; }
 static void nvnQueueFinish(queue_t *q) { (void)q; }
@@ -1044,7 +1062,86 @@ static uint32_t nvnTextureInitialize(tex_t *t, const tex_builder_t *b) { nvn_api
     t->serial = (uint64_t)(uintptr_t)t;
     return 1;
 }
-static void nvnTextureFinalize(tex_t *t) { if (t) t->magic = 0; }
+static int nvn_texture_store_bridge(tex_t *t, GfxTexture *g) {
+    for (unsigned i = 0; i < g_tex_bridge_count; i++) {
+        if (g_tex_bridges[i].tex == t) {
+            if (g_tex_bridges[i].gfx) gfx_backend_texture_destroy(g_tex_bridges[i].gfx);
+            g_tex_bridges[i].gfx = g;
+            return 1;
+        }
+    }
+    if (g_tex_bridge_count < sizeof g_tex_bridges / sizeof g_tex_bridges[0]) {
+        g_tex_bridges[g_tex_bridge_count++] = (tex_bridge_t){ t, g };
+        return 1;
+    }
+    gfx_backend_texture_destroy(g);
+    return 0;
+}
+
+
+int runtime_nvn_texture_upload_rgba8(void *texture, const uint8_t *pixels,
+                                    uint32_t width, uint32_t height) {
+    tex_t *t = texture;
+    if (!t || t->magic != NVN_MAGIC('T', 'E', 'X', 0) || !pixels) return 0;
+    GfxTexture *g = gfx_backend_texture_create_rgba8(width, height, pixels);
+    if (!g) return 0;
+    return nvn_texture_store_bridge(t, g);
+}
+
+/* Guest storage -> linear -> Vulkan.  The level-0 layer-0 path is enough for the
+ * 2B.3 texture milestone; nvn_deswizzle.c is the same Tegra GOB decoder used by
+ * the macOS route.  Non-RGBA8 formats are explicit errors for now. */
+extern int runtime_guest_texture_deswizzle(const void *storage, void *linear, size_t pitch,
+    int target, int format, int flags, int samples, uint32_t width, uint32_t height,
+    uint32_t depth, uint32_t levels, uint32_t stride, int pkg_block_h);
+extern int runtime_guest_texture_swizzle(void *storage, const void *linear, size_t pitch,
+    int target, int format, int flags, int samples, uint32_t width, uint32_t height,
+    uint32_t depth, uint32_t levels, uint32_t stride, int pkg_block_h);
+
+int runtime_nvn_texture_upload_guest(void *texture) {
+    tex_t *t = texture;
+    if (!t || t->magic != NVN_MAGIC('T', 'E', 'X', 0) || !t->mem) return 0;
+    if (t->d.target != NVN_TARGET_2D || t->d.format != 0x25) {
+        fprintf(stderr, "[totk-nvn] ERROR guest texture upload supports 2D RGBA8 only (target=%d format=%#x)\n",
+                t->d.target, t->d.format);
+        return 0;
+    }
+    if (!t->d.width || !t->d.height) return 0;
+    size_t pitch = (size_t)t->d.width * 4;
+    size_t bytes = pitch * t->d.height;
+    uint8_t *linear = calloc(1, bytes);
+    if (!linear) return 0;
+    if (runtime_guest_texture_deswizzle(t->mem, linear, pitch, t->d.target, t->d.format,
+                                        t->d.flags, t->d.samples, t->d.width, t->d.height,
+                                        t->d.depth, t->d.levels, t->d.stride,
+                                        t->d.pkg_block_h)) {
+        fprintf(stderr, "[totk-nvn] ERROR block-linear deswizzle failed\n");
+        free(linear);
+        return 0;
+    }
+    GfxTexture *g = gfx_backend_texture_create_rgba8(t->d.width, t->d.height, linear);
+    free(linear);
+    if (!g) return 0;
+    return nvn_texture_store_bridge(t, g);
+}
+
+static void *nvn_texture_gfx(const tex_t *t) {
+    for (unsigned i = 0; i < g_tex_bridge_count; i++)
+        if (g_tex_bridges[i].tex == t) return g_tex_bridges[i].gfx;
+    return NULL;
+}
+
+static void nvnTextureFinalize(tex_t *t) {
+    if (!t) return;
+    for (unsigned i = 0; i < g_tex_bridge_count; i++) {
+        if (g_tex_bridges[i].tex == t) {
+            if (g_tex_bridges[i].gfx) gfx_backend_texture_destroy(g_tex_bridges[i].gfx);
+            g_tex_bridges[i] = g_tex_bridges[--g_tex_bridge_count];
+            break;
+        }
+    }
+    t->magic = 0;
+}
 static void nvnTextureSetDebugLabel(tex_t *t, const char *l) { (void)t; (void)l; }
 static int nvnTextureGetStorageClass(const tex_t *t) { return t && t->d.target == NVN_TARGET_BUFFER ? 0 : 1; }
 static int nvnTextureGetFlags(const tex_t *t) { return t ? t->d.flags : 0; }
@@ -1353,11 +1450,17 @@ typedef struct {
     void *cmd;
     size_t cmd_size, cmd_used;
     void *mem_cb, *mem_cb_data;
-    uint64_t serial;
+    void *prog;
+    void *win;
+    uint64_t serial, handle;
+    int draw_first, draw_count;
 } cb_t;
 
 _Static_assert(sizeof(cb_t) <= NVN_COMMAND_BUFFER_SIZE, "command buffer object too large");
 static uint64_t nvn_cb_serial;
+static cb_t *g_cbs[64];
+static unsigned g_ncbs;
+static unsigned nvn_nvn_draws;
 
 static uint32_t nvnCommandBufferInitialize(cb_t *c, void *d) { nvn_api("nvnCommandBufferInitialize");
     if (!c) { nvn_fail("nvnCommandBufferInitialize", "null command buffer"); return 0; }
@@ -1365,6 +1468,7 @@ static uint32_t nvnCommandBufferInitialize(cb_t *c, void *d) { nvn_api("nvnComma
     c->magic = NVN_MAGIC('C', 'M', 'D', 'B');
     c->dev = d;
     c->serial = ++nvn_cb_serial;
+    if (g_ncbs < sizeof g_cbs / sizeof g_cbs[0]) g_cbs[g_ncbs++] = c;
     if (nvn_trace()) fprintf(stderr, "[totk-nvn] CommandBufferInitialize %p\n", (void *)c);
     return 1;
 }
@@ -1397,13 +1501,31 @@ static void nvnCommandBufferBeginRecording(cb_t *c) {
     c->recording = 1;
     c->cmd_used = 0;
     c->ctl_used = 0;
+    c->draw_first = 0;
+    c->draw_count = 0;
 }
 static uint64_t nvnCommandBufferEndRecording(cb_t *c) {
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferEndRecording", "invalid command buffer"); return 0; }
     c->recording = 0;
     uint64_t h = 0x100000000ull | (c->serial & 0xffffffffull);
+    c->handle = h;
     if (nvn_trace()) fprintf(stderr, "[totk-nvn] CommandBufferEndRecording %p -> handle %#llx\n", (void *)c, (unsigned long long)h);
     return h;
+}
+static void nvnCommandBufferDrawArrays(cb_t *c, int mode, int first, int count) {
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) {
+        nvn_fail("nvnCommandBufferDrawArrays", "invalid command buffer");
+        return;
+    }
+    if (count < 0 || first < 0) {
+        nvn_fail("nvnCommandBufferDrawArrays", "negative first/count");
+        return;
+    }
+    c->draw_first = first;
+    c->draw_count += count;
+    if (nvn_trace())
+        fprintf(stderr, "[totk-nvn] CommandBufferDrawArrays mode=%d first=%d count=%d\n",
+                mode, first, count);
 }
 static void nvnCommandBufferSetRenderEnable(cb_t *c, int e) { (void)c; (void)e; }
 static void nvnCommandBufferSetRenderTargets(cb_t *c, int n, const void *const *t) { (void)c; (void)n; (void)t; }
@@ -1446,9 +1568,225 @@ static uint32_t nvnProgramSetShadersExt(prog_t *p, int n, const void *shaders) {
     }
     return 1;
 }
+static int nvn_read_file(const char *path, uint8_t **out, size_t *size) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
+    long n = ftell(f);
+    if (n <= 0 || n > (16 << 20)) { fclose(f); return 0; }
+    rewind(f);
+    uint8_t *b = malloc((size_t)n);
+    if (!b) { fclose(f); return 0; }
+    if (fread(b, 1, (size_t)n, f) != (size_t)n) { free(b); fclose(f); return 0; }
+    fclose(f);
+    *out = b; *size = (size_t)n;
+    return 1;
+}
+
+/* Host bridge for the 2B.2/2B.3 integration: load translated SPIR-V into an
+ * NVN program object.  This is not a guest NVN entry point; the guest still
+ * carries Maxwell data/control, and the offline cache supplies SPIR-V. */
+int runtime_nvn_program_load_spirv(void *prog, const char *vs_path, const char *ps_path) {
+    prog_t *p = prog;
+    if (!p || p->magic != NVN_MAGIC('P', 'R', 'O', 'G') || !vs_path || !ps_path) return 0;
+    uint8_t *vs = NULL, *ps = NULL;
+    size_t vs_size = 0, ps_size = 0;
+    if (!nvn_read_file(vs_path, &vs, &vs_size) || !nvn_read_file(ps_path, &ps, &ps_size)) {
+        free(vs); free(ps);
+        fprintf(stderr, "[totk-nvn] ERROR read SPIR-V %s / %s\n", vs_path, ps_path);
+        return 0;
+    }
+    int fmt = gfx_backend_vk_format_for_nvn(0x25);
+    GfxTrianglePipeline *pipeline = gfx_backend_triangle_pipeline_create(vs, vs_size, ps, ps_size, fmt);
+    free(vs); free(ps);
+    if (!pipeline) {
+        fprintf(stderr, "[totk-nvn] ERROR create pipeline from translated SPIR-V\n");
+        return 0;
+    }
+    p->gfx_pipeline = pipeline;
+    fprintf(stderr, "[totk-nvn] loaded translated SPIR-V vs=%s ps=%s\n", vs_path, ps_path);
+    return 1;
+}
+
 static void nvnProgramSetSampleShading(prog_t *p, int v) { (void)p; (void)v; }
 static int nvnProgramGetSubtileSize(const prog_t *p) { (void)p; return 0x1000; }
 static void nvnProgramSetSubroutineLinkage(prog_t *p, int n, const void *l) { (void)p; (void)n; (void)l; }
+
+static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
+    for (int i = 0; i < n; i++) {
+        cb_t *cb = NULL;
+        for (unsigned j = 0; j < g_ncbs; j++) {
+            if (g_cbs[j] && g_cbs[j]->handle == cmds[i]) { cb = g_cbs[j]; break; }
+        }
+        if (!cb || !cb->draw_count || !cb->prog || !cb->win) continue;
+        prog_t *p = cb->prog;
+        win_t *w = cb->win;
+        int has_pipeline = p->gfx_pipeline || (p->textured && p->gfx_textured_pipeline);
+        if (p->magic != NVN_MAGIC('P', 'R', 'O', 'G') || !has_pipeline ||
+            w->magic != NVN_MAGIC('W', 'I', 'N', 'D') || !w->native) {
+            nvn_fail("nvnQueueSubmitCommands", "draw has no program/pipeline/window");
+            continue;
+        }
+        int drew;
+        if (p->textured && p->gfx_textured_pipeline && p->gfx_texture)
+            drew = runtime_native_window_draw_textured_triangle(w->native, p->gfx_textured_pipeline,
+                                                                 p->gfx_texture);
+        else
+            drew = runtime_native_window_draw_triangle_pipeline(w->native, p->gfx_pipeline);
+        if (!drew) {
+            nvn_fail("nvnQueueSubmitCommands", "Vulkan draw failed");
+            continue;
+        }
+        unsigned total = __atomic_add_fetch(&nvn_nvn_draws, 1, __ATOMIC_RELAXED);
+        fprintf(stderr, "[totk-nvn] NVN draw #%u program=%p window=%p vertices=%d\n",
+                total, (void *)p, (void *)w, cb->draw_count);
+    }
+}
+
+int runtime_nvn_draw_selftest(const char *screenshot, int frames,
+                              const char *vs_path, const char *ps_path, int expect_visible) {
+    if (frames < 1) frames = 1;
+    if (frames > 60) frames = 60;
+    void *nw = runtime_native_window_create(1280, 720, 0x25, 0x88);
+    if (!nw) return 0;
+    nvn_dev_t d;
+    dev_builder_t db;
+    memset(&d, 0, sizeof d);
+    memset(&db, 0, sizeof db);
+    if (!nvnDeviceInitialize(&d, &db)) return 0;
+    queue_t q;
+    queue_builder_t qb;
+    memset(&q, 0, sizeof q);
+    memset(&qb, 0, sizeof qb);
+    qb.dev = &d;
+    qb.flags = 1;
+    qb.cmd_sz = 0x10000;
+    qb.ctl_sz = 0x1000;
+    qb.mem_sz = 0x2000;
+    if (!nvnQueueInitialize(&q, &qb)) return 0;
+    prog_t p;
+    memset(&p, 0, sizeof p);
+    if (!nvnProgramInitialize(&p, &d)) return 0;
+    if (vs_path && *vs_path && ps_path && *ps_path) {
+        if (!runtime_nvn_program_load_spirv(&p, vs_path, ps_path)) return 0;
+    } else {
+        p.gfx_pipeline = gfx_backend_builtin_triangle_pipeline();
+    }
+    if (!p.gfx_pipeline) return 0;
+    win_t w;
+    win_builder_t wb;
+    memset(&w, 0, sizeof w);
+    memset(&wb, 0, sizeof wb);
+    wb.dev = &d;
+    wb.native = nw;
+    wb.ntex = 1;
+    wb.tex[0] = (void *)(uintptr_t)1;
+    if (!nvnWindowInitialize(&w, &wb)) return 0;
+    cb_t cb;
+    for (int i = 0; i < frames; i++) {
+        if (!nvnCommandBufferInitialize(&cb, &d)) return 0;
+        cb.prog = &p;
+        cb.win = &w;
+        nvnCommandBufferBeginRecording(&cb);
+        nvnCommandBufferDrawArrays(&cb, 0, 0, 3);
+        uint64_t handle = nvnCommandBufferEndRecording(&cb);
+        nvnQueueSubmitCommands(&q, 1, &handle);
+        nvnQueuePresentTexture(&q, &w, 0);
+    }
+    uint8_t center[4] = {0}, corner[4] = {0};
+    runtime_native_window_read_pixel(nw, 640, 360, center);
+    runtime_native_window_read_pixel(nw, 0, 0, corner);
+    if (screenshot && *screenshot) runtime_native_window_screenshot(nw, screenshot);
+    int ok = expect_visible ? (center[0] > 200 && center[1] > 60 && center[1] < 100 &&
+                               center[2] < 40 && corner[0] < 40) : 1;
+    if (!expect_visible)
+        fprintf(stderr, "[totk-nvn] translated SPIR-V draw executed; pixel visibility not asserted\n");
+    if (nvn_trace())
+        fprintf(stderr, "[totk-nvn] NVN draw selftest center=%02x%02x%02x%02x corner=%02x%02x%02x%02x\n",
+                center[0], center[1], center[2], center[3], corner[0], corner[1], corner[2], corner[3]);
+    return ok;
+}
+
+int runtime_nvn_textured_draw_selftest(const char *screenshot, int frames) {
+    if (frames < 1) frames = 1;
+    if (frames > 60) frames = 60;
+    void *nw = runtime_native_window_create(1280, 720, 0x25, 0x99);
+    if (!nw) return 0;
+    nvn_dev_t d;
+    dev_builder_t db;
+    memset(&d, 0, sizeof d);
+    memset(&db, 0, sizeof db);
+    if (!nvnDeviceInitialize(&d, &db)) return 0;
+    queue_t q;
+    queue_builder_t qb;
+    memset(&q, 0, sizeof q);
+    memset(&qb, 0, sizeof qb);
+    qb.dev = &d; qb.flags = 1; qb.cmd_sz = 0x10000; qb.ctl_sz = 0x1000; qb.mem_sz = 0x2000;
+    if (!nvnQueueInitialize(&q, &qb)) return 0;
+
+    uint8_t *pool_mem = calloc(1, 0x10000);
+    if (!pool_mem) return 0;
+    pool_t pool;
+    pool_builder_t pb;
+    memset(&pool, 0, sizeof pool);
+    memset(&pb, 0, sizeof pb);
+    pb.dev = &d; pb.mem = pool_mem; pb.size = 0x10000; pb.flags = 1;
+    if (!nvnMemoryPoolInitialize(&pool, &pb)) { free(pool_mem); return 0; }
+    tex_builder_t tb;
+    tex_t tex;
+    memset(&tex, 0, sizeof tex);
+    nvnTextureBuilderSetDefaults(&tb);
+    tb.dev = &d;
+    nvnTextureBuilderSetSize2D(&tb, 2, 2);
+    nvnTextureBuilderSetFormat(&tb, 0x25);
+    nvnTextureBuilderSetLevels(&tb, 1);
+    nvnTextureBuilderSetStorage(&tb, &pool, 0);
+    if (!nvnTextureInitialize(&tex, &tb)) { free(pool_mem); return 0; }
+    static const uint8_t checker[16] = {
+        255, 0, 0, 255,   0, 255, 0, 255,
+        0, 0, 255, 255,   255, 255, 255, 255,
+    };
+    if (runtime_guest_texture_swizzle(tex.mem, checker, 8, tex.d.target, tex.d.format,
+                                       tex.d.flags, tex.d.samples, tex.d.width, tex.d.height,
+                                       tex.d.depth, tex.d.levels, tex.d.stride,
+                                       tex.d.pkg_block_h)) { free(pool_mem); return 0; }
+    if (!runtime_nvn_texture_upload_guest(&tex)) { free(pool_mem); return 0; }
+    void *tex_gfx = nvn_texture_gfx(&tex);
+    GfxTexturedPipeline *tp = gfx_backend_builtin_textured_pipeline();
+    if (!tex_gfx || !tp) { free(pool_mem); return 0; }
+
+    prog_t p;
+    memset(&p, 0, sizeof p);
+    if (!nvnProgramInitialize(&p, &d)) { free(pool_mem); return 0; }
+    p.gfx_textured_pipeline = tp;
+    p.gfx_texture = tex_gfx;
+    p.textured = 1;
+    win_t w;
+    win_builder_t wb;
+    memset(&w, 0, sizeof w);
+    memset(&wb, 0, sizeof wb);
+    wb.dev = &d; wb.native = nw; wb.ntex = 1; wb.tex[0] = (void *)(uintptr_t)1;
+    if (!nvnWindowInitialize(&w, &wb)) { free(pool_mem); return 0; }
+    cb_t cb;
+    for (int i = 0; i < frames; i++) {
+        if (!nvnCommandBufferInitialize(&cb, &d)) { free(pool_mem); return 0; }
+        cb.prog = &p;
+        cb.win = &w;
+        nvnCommandBufferBeginRecording(&cb);
+        nvnCommandBufferDrawArrays(&cb, 0, 0, 3);
+        uint64_t handle = nvnCommandBufferEndRecording(&cb);
+        nvnQueueSubmitCommands(&q, 1, &handle);
+        nvnQueuePresentTexture(&q, &w, 0);
+    }
+    uint8_t center[4] = {0}, corner[4] = {0};
+    runtime_native_window_read_pixel(nw, 640, 360, center);
+    runtime_native_window_read_pixel(nw, 0, 0, corner);
+    if (screenshot && *screenshot) runtime_native_window_screenshot(nw, screenshot);
+    int ok = center[0] > 80 && center[0] < 180 && center[1] > 80 && center[1] < 180 &&
+             center[2] > 80 && center[2] < 180 && corner[0] < 40;
+    free(pool_mem);
+    return ok;
+}
 
 static uint32_t nvnSyncInitialize(sync_t *s, const nvn_dev_t *d) { nvn_api("nvnSyncInitialize");
     if (!s || !nvn_obj(d, NVN_MAGIC('D', 'E', 'V', 0), "nvnSyncInitialize(device)")) return 0;
@@ -1678,7 +2016,7 @@ static const nvn_entry nvn_entries[] = {
     NVN_E(nvnCommandBufferGetCommandMemoryUsed), NVN_E(nvnCommandBufferBeginRecording),
     NVN_E(nvnCommandBufferEndRecording), NVN_E(nvnCommandBufferSetRenderEnable),
     NVN_E(nvnCommandBufferSetRenderTargets), NVN_E(nvnCommandBufferClearColor),
-    NVN_E(nvnCommandBufferClearDepthStencil), NVN_E(nvnCommandBufferSetViewport),
+    NVN_E(nvnCommandBufferDrawArrays), NVN_E(nvnCommandBufferClearDepthStencil), NVN_E(nvnCommandBufferSetViewport),
     NVN_E(nvnCommandBufferSetScissor),
     NVN_E(nvnProgramInitialize), NVN_E(nvnProgramFinalize), NVN_E(nvnProgramSetDebugLabel),
     NVN_E(nvnProgramSetShaders), NVN_E(nvnProgramSetShadersExt),

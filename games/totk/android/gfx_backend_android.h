@@ -42,6 +42,62 @@ uint32_t gfx_backend_offscreen_height(const GfxOffscreenTarget *target);
 const uint8_t *gfx_backend_offscreen_pixels(const GfxOffscreenTarget *target,
                                             size_t *size);
 const char *gfx_backend_offscreen_format_name(const GfxOffscreenTarget *target);
+int gfx_backend_offscreen_write_ppm(const GfxOffscreenTarget *target, const char *path);
+uint64_t gfx_backend_offscreen_hash(const GfxOffscreenTarget *target);
+
+/* Minimal graphics pipeline used by the 2B.3 triangle milestone and by the
+ * host NVN draw self-test.  The SPIR-V pair is compiled from the repository's
+ * own triangle.vert/frag; translated game shaders can use the same path. */
+typedef struct GfxTrianglePipeline GfxTrianglePipeline;
+GfxTrianglePipeline *gfx_backend_triangle_pipeline_create(const uint8_t *vs, size_t vs_size,
+                                                          const uint8_t *ps, size_t ps_size,
+                                                          int vk_format);
+void gfx_backend_triangle_pipeline_destroy(GfxTrianglePipeline *pipeline);
+int gfx_backend_triangle_draw(GfxTrianglePipeline *pipeline, GfxOffscreenTarget *target,
+                              float r, float g, float b, float a);
+GfxTrianglePipeline *gfx_backend_builtin_triangle_pipeline(void);
+
+typedef struct { uint32_t binding; uint32_t size; } GfxUboBinding;
+GfxTrianglePipeline *gfx_backend_triangle_pipeline_create_ubo(const uint8_t *vs, size_t vs_size,
+                                                              const uint8_t *ps, size_t ps_size,
+                                                              int vk_format,
+                                                              const GfxUboBinding *ubos, uint32_t nubo);
+int gfx_backend_triangle_write_ubo(GfxTrianglePipeline *pipeline, uint32_t binding,
+                                   uint32_t offset, const void *data, size_t size);
+/* TOTK VS + built-in fragment shader, with the two cbuf UBOs the system
+ * vertex shader reads (binding 1 = vp_c4, binding 2 = vp_c11). */
+GfxTrianglePipeline *gfx_backend_totk_vs_pipeline_create(const uint8_t *vs, size_t vs_size,
+                                                         int vk_format);
+
+/* Reflected multi-descriptor pipeline.  Set 0 belongs to the vertex stage and
+ * set 1 to the fragment stage (the translated PS SPIR-V is moved to set 1 so
+ * independent NVN binding numbers cannot collide). */
+typedef enum { GFX_BIND_UBO = 0, GFX_BIND_SSBO = 1, GFX_BIND_TEXTURE = 2, GFX_BIND_IMAGE = 3 } GfxBindingKind;
+typedef struct { uint32_t binding; GfxBindingKind kind; uint32_t count; } GfxBindingSpec;
+typedef struct GfxReflectedPipeline GfxReflectedPipeline;
+GfxReflectedPipeline *gfx_backend_reflected_pipeline_create(const uint8_t *vs, size_t vs_size,
+                                                            const uint8_t *ps, size_t ps_size,
+                                                            int vk_format,
+                                                            const GfxBindingSpec *vs_specs, uint32_t nvs,
+                                                            const GfxBindingSpec *ps_specs, uint32_t nps);
+void gfx_backend_reflected_pipeline_destroy(GfxReflectedPipeline *pipeline);
+int gfx_backend_reflected_draw(GfxReflectedPipeline *pipeline, GfxOffscreenTarget *target,
+                               float r, float g, float b, float a);
+
+/* Minimal sampled-texture path: RGBA8 texture -> VkImage/VkSampler and a
+ * textured triangle pipeline.  This is the 2B.3 NVN texture bridge's Vulkan
+ * half; the NVN object wraps it. */
+typedef struct GfxTexture GfxTexture;
+typedef struct GfxTexturedPipeline GfxTexturedPipeline;
+GfxTexture *gfx_backend_texture_create_rgba8(uint32_t width, uint32_t height,
+                                             const uint8_t *pixels);
+void gfx_backend_texture_destroy(GfxTexture *texture);
+GfxTexturedPipeline *gfx_backend_textured_pipeline_create(int vk_format);
+void gfx_backend_textured_pipeline_destroy(GfxTexturedPipeline *pipeline);
+int gfx_backend_textured_draw(GfxTexturedPipeline *pipeline, GfxTexture *texture,
+                              GfxOffscreenTarget *target,
+                              float r, float g, float b, float a);
+GfxTexturedPipeline *gfx_backend_builtin_textured_pipeline(void);
 
 /* Android Surface path.  `window` is an ANativeWindow*.  A surface is optional:
  * offscreen targets work without it.  If creation fails, the caller keeps the

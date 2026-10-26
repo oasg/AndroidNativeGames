@@ -175,14 +175,19 @@ loudly if Vulkan is unavailable or the target format is unsupported.
 - There is no Android app shell yet, so the real `ANativeWindow` / swapchain
   path compiles but is not exercised by an APK.  The offscreen path is the
   supported CLI target.
-- NVN block-linear textures are still guest-storage only; a Vulkan texture
-  upload/modifier bridge is the next renderer task.
+- NVN block-linear textures are still guest-storage only for arbitrary game
+  layouts; 2B.3 added a minimal RGBA8 texture upload/sampler/descriptor path
+  (`probe-vulkan-texture` / `probe-nvn-texture`).  A full block-linear/modifier
+  bridge remains the next renderer task.
 - NVN `prog_t` shader blobs are not yet compiled into Vulkan pipelines.  The
   2B.2 spike has already proven the existing translator emits Vulkan SPIR-V
   for a 112-shader TOTK sample; see `docs/android-hle-phase2b2-shader-spike.md`.
 - The game itself still stops at the `nn::gfx` context registry
   (`main+0x794dd0`) before its own first submit; the Vulkan self-test proves the
   device/target/clear/present path independently.
+- 2B.3 adds the real triangle, the NVN command-buffer draw path and an
+  on-screen Surface clear test; see
+  `docs/android-hle-phase2b3-rendering.md`.
 
 The next steps are, in order:
 
