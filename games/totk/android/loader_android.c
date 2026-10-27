@@ -9,6 +9,7 @@
 #include "ipc.h"
 #include "sha256.h"
 #include "gfx_backend_android.h"
+#include "shader_cache_android.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -43,6 +44,8 @@ typedef struct {
 typedef struct {
     uint64_t k18, ktls, ktlr, reserved[5];
 } GuestSlots;
+
+#define TLS_CANARY 0x544c53434f4eULL   /* "TLSOK" */
 
 static int tls_probe_mode;
 static __thread HostContext *g_host __attribute__((aligned(64)));
@@ -120,11 +123,17 @@ void runtime_thread_init(void) {
     uint64_t tb = area_base, ts = area;
     memcpy(hc->dummy + 0x50, &tb, 8);           /* ThreadType::stack_base */
     memcpy(hc->dummy + 0x58, &ts, 8);           /* ThreadType::stack_size */
+    /* Horizon's ThreadLocalRegion keeps the guest TPIDR_EL0 value at +0x1f0
+     * and the ThreadType pointer at +0x1f8.  The SDK's thread setup/teardown
+     * does `msr tpidr_el0, [tpidrro_el0+0x1f0]`; leaving +0x1f0 zero clears
+     * the guest TLS pointer and the next nn::gfx TLS store faults. */
+    uint64_t guest_tls_value = (uintptr_t)hc->guest_tls;
+    memcpy(hc->guest_tlr + 0x1f0, &guest_tls_value, 8);
+    memcpy(hc->guest_tlr + 0x1f8, &hc->dummy, 8);
     uint32_t guest_handle = runtime_thread_current_handle();
     if (guest_handle) memcpy(hc->dummy + 0x1b0, &guest_handle, 4);   /* ThreadType::thread_id */
     if (getenv("TOTK_ANDROID_TLS_TRACE"))
         fprintf(stderr, "[totk-android] thread init handle=%#x dummy=%p\n", guest_handle, hc->dummy);
-    memcpy(hc->guest_tlr + 0x1f8, &hc->dummy, 8);
     hc->guest_stack_top = area_base + area - 16;
     if (getenv("TOTK_ANDROID_TLS_TRACE") || getenv("TOTK_ANDROID_CTOR_PROBE") || tls_probe_mode)
         fprintf(stderr, "[totk-android] thread tls tlr=%p dummy=%p stack=%#llx+%#llx sp=%#llx\n",
@@ -132,6 +141,7 @@ void runtime_thread_init(void) {
                 (unsigned long long)area, (unsigned long long)hc->guest_stack_top);
     gs->ktls = (uintptr_t)hc->guest_tls;
     gs->ktlr = (uintptr_t)hc->guest_tlr;
+    gs->reserved[0] = TLS_CANARY;   /* crash-dump canary: "TLSOK" */
     pthread_once(&ipc_key_once, ipc_key_init);
     pthread_setspecific(runtime_keys[2], hc->guest_tlr);
     const size_t hs = 1u << 20;
@@ -368,6 +378,10 @@ static void describe_address(uint64_t addr, char *out, size_t cap) {
  * frame pointer into a short read instead of a nested SIGSEGV. */
 static int crash_read(uint64_t addr, void *out, size_t n) {
     static int mem = -2;
+    /* Bionic returns heap pointers with a top-byte tag.  The CPU ignores it,
+     * but /proc/self/mem's file offset is not a user pointer and is not
+     * untagged by the kernel, so mask it here. */
+    addr &= 0x00ffffffffffffffULL;
     if (mem == -2) mem = open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
     if (mem < 0) return 0;
     return pread(mem, out, n, (off_t)addr) == (ssize_t)n;
@@ -409,6 +423,43 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
 
     if (getenv("TOTK_ANDROID_CRASH_DUMP")) {
         const unsigned long long *rr = (const unsigned long long *)u->uc_mcontext.regs;
+        /* The relocated `mrs tpidr_el0` reads GuestSlots->ktls.  Keep the
+         * host TP and slot values in the dump so a lost guest TP is visible. */
+        uint64_t host_tp = read_tpidr_el0();
+        uint64_t slots_at = 0, ktls = 0, ktlr = 0, canary = 0;
+        int slots_ok = 0, slots_read = 0;
+        if (runtime_guest_slots_off) {
+            slots_ok = crash_read((uintptr_t)(host_tp + runtime_guest_slots_off), &slots_at, 8);
+            if (slots_at) {
+                slots_read = crash_read((uintptr_t)(slots_at + 8), &ktls, 8);
+                crash_read((uintptr_t)(slots_at + 16), &ktlr, 8);
+                crash_read((uintptr_t)(slots_at + 0x18), &canary, 8);
+            }
+        }
+        fprintf(stderr, "[crash] tls tp=%#llx slots=%#llx slots_ok=%d read=%d ktls=%#llx"
+                " ktlr=%#llx canary=%#llx\n", (unsigned long long)host_tp,
+                (unsigned long long)slots_at, slots_ok, slots_read,
+                (unsigned long long)ktls, (unsigned long long)ktlr,
+                (unsigned long long)canary);
+        if (rr[1] && !(rr[1] & 7)) {
+            uint64_t s[2] = {0};
+            if (crash_read(rr[1], s, sizeof s)) {
+                char text[129] = {0};
+                uint64_t len = s[1] & 0xffffffffu;
+                if (len >= sizeof text) len = sizeof text - 1;
+                if (s[0] && len && crash_read(s[0], text, (size_t)len))
+                    fprintf(stderr, "[crash] x1 string ptr=%#llx len=%llu '%.*s'\n",
+                            (unsigned long long)s[0],
+                            (unsigned long long)(s[1] & 0xffffffffu),
+                            (int)len, text);
+            }
+        }
+        for (unsigned i = 0; i < NMODULES; i++) {
+            uint64_t key0 = 0;
+            if (crash_read((uintptr_t)(modules[i].base + modules[i].key_off), &key0, 8))
+                fprintf(stderr, "[crash] key[0] %s=%#llx\n", modules[i].name,
+                        (unsigned long long)key0);
+        }
         for (unsigned i = 0; i <= 28; i++) {
             char d[128];
             if (!rr[i]) continue;
@@ -752,9 +803,11 @@ static void *tls_probe_thread(void *p) {
     if (!set || !get) { t->ok = 0; return NULL; }
     guest_call2(set, t->slot, t->value);
     uint64_t v = guest_call1(get, t->slot);
-    t->ok = v == t->value;
-    fprintf(stderr, "[totk-tls] thread slot=%u get=%#llx ok=%d\n",
-            t->slot, (unsigned long long)v, t->ok);
+    uint64_t tlr_tls = 0;
+    if (g_slots) memcpy(&tlr_tls, (void *)(uintptr_t)(g_slots->ktlr + 0x1f0), 8);
+    t->ok = v == t->value && g_slots && tlr_tls == g_slots->ktls;
+    fprintf(stderr, "[totk-tls] thread slot=%u get=%#llx tlr_tls=%#llx ok=%d\n",
+            t->slot, (unsigned long long)v, (unsigned long long)tlr_tls, t->ok);
     return NULL;
 }
 
@@ -789,6 +842,10 @@ static void tls_probe(void) {
     uint64_t tlr = 0;
     if (g_slots) tlr = g_slots->ktlr;
     need(base && size && tlr >= base && tlr < base + size, "GetCurrentStackInfo covers TLR");
+    uint64_t tlr_tls = 0;
+    if (tlr) memcpy(&tlr_tls, (void *)(uintptr_t)(tlr + 0x1f0), 8);
+    need(g_slots && tlr_tls == g_slots->ktls,
+         "ThreadLocalRegion +0x1f0 holds the guest TLS pointer");
 
     TlsThreadProbe tp = {.slot = slot, .value = 0xaabbccddeeff0011ull, .ok = 0};
     pthread_t th;
@@ -1881,6 +1938,57 @@ int main(int argc, char **argv) {
         gfx_backend_offscreen_destroy(t);
         return ok ? 0 : 1;
     }
+    if (!strcmp(argv[2], "probe-shader-cache")) {
+        const char *root = getenv("TOTK_ANDROID_SHADER_CACHE");
+        if (!root || !*root) root = runtime_shader_cache_root();
+        static const char *const stages[] = { "vs", "ps", "gs", "tcs", "tes", "cs" };
+        unsigned total = 0, failed = 0, pairs = 0;
+        for (unsigned s = 0; s < sizeof stages / sizeof stages[0]; s++) {
+            char dir[PATH_MAX];
+            snprintf(dir, sizeof dir, "%s/%s", root, stages[s]);
+            DIR *d = opendir(dir);
+            if (!d) continue;
+            struct dirent *ent;
+            while ((ent = readdir(d))) {
+                const char *name = ent->d_name;
+                size_t n = strlen(name);
+                if (n != 64 + 4 || strcmp(name + 64, ".spv")) continue;
+                int key_ok = 1;
+                for (size_t i = 0; i < 64; i++) {
+                    char c = name[i];
+                    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { key_ok = 0; break; }
+                }
+                if (!key_ok) { failed++; continue; }
+                char path[PATH_MAX];
+                snprintf(path, sizeof path, "%s/%s", dir, name);
+                int fd = open(path, O_RDONLY);
+                if (fd < 0) { failed++; continue; }
+                struct stat st;
+                if (fstat(fd, &st) != 0 || st.st_size <= 0 || st.st_size > (off_t)(16 << 20)) {
+                    close(fd); failed++; continue;
+                }
+                uint8_t *buf = malloc((size_t)st.st_size);
+                ssize_t got = buf ? read(fd, buf, (size_t)st.st_size) : -1;
+                close(fd);
+                if (!buf || got != st.st_size) { free(buf); failed++; continue; }
+                total++;
+                if (!gfx_backend_validate_spirv(buf, (size_t)got, name)) failed++;
+                free(buf);
+                char res[PATH_MAX];
+                snprintf(res, sizeof res, "%.*s.res.json", (int)(strlen(path) - 4), path);
+                if (access(res, R_OK) == 0) pairs++;
+            }
+            closedir(d);
+        }
+        if (!total) {
+            fprintf(stderr, "[totk-spv] ERROR no keyed .spv modules under %s\n", root);
+            return 1;
+        }
+        printf("{\"status\":\"%s\",\"host\":\"android\",\"probe\":\"shader-cache\","
+               "\"root\":\"%s\",\"modules\":%u,\"reflections\":%u,\"failed\":%u}\n",
+               failed ? "fail" : "pass", root, total, pairs, failed);
+        return failed ? 1 : 0;
+    }
     if (!strcmp(argv[2], "probe-spirv")) {
         const char *dir = getenv("TOTK_ANDROID_SPV_DIR");
         if (!dir) dir = "/data/local/tmp/totk-android/spv";
@@ -1999,6 +2107,28 @@ int main(int argc, char **argv) {
                "\"frames\":%d,\"screenshot\":\"%s\"}\n", frames, shot);
         return 0;
     }
+    if (!strcmp(argv[2], "probe-nvn-frame")) {
+        int runtime_nvn_frame_selftest(const char *screenshot, int frames);
+        char shot[PATH_MAX];
+        const char *env = getenv("TOTK_ANDROID_SCREENSHOT");
+        if (env && *env) snprintf(shot, sizeof shot, "%s", env);
+        else snprintf(shot, sizeof shot, "%s/nvn-frame.ppm", argv[1]);
+        const char *fs = getenv("TOTK_ANDROID_NVN_DRAW_FRAMES");
+        int frames = fs && *fs ? atoi(fs) : 2;
+        if (!getenv("TOTK_ANDROID_SHADER_CACHE")) {
+            static char cache[PATH_MAX];
+            snprintf(cache, sizeof cache, "%s/shader-cache", argv[1]);
+            setenv("TOTK_ANDROID_SHADER_CACHE", cache, 1);
+        }
+        if (!runtime_nvn_frame_selftest(shot, frames)) {
+            fprintf(stderr, "[totk-nvn] NVN frame (shader cache) selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-frame\","
+               "\"frames\":%d,\"shader_cache\":\"%s\",\"screenshot\":\"%s\"}\n",
+               frames, getenv("TOTK_ANDROID_SHADER_CACHE"), shot);
+        return 0;
+    }
     if (!strcmp(argv[2], "probe-nvn-bind")) {
         int runtime_nvn_bind_selftest(void);
         if (!runtime_nvn_bind_selftest()) {
@@ -2012,6 +2142,15 @@ int main(int argc, char **argv) {
         int runtime_nvn_submit_selftest(void);
         if (!runtime_nvn_submit_selftest()) { fprintf(stderr, "[totk-nvn] submit selftest FAIL\n"); return 1; }
         printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-submit-present\"}\n");
+        return 0;
+    }
+    if (!strcmp(argv[2], "probe-nvn-cb-lifetime")) {
+        int runtime_nvn_cb_lifetime_selftest(void);
+        if (!runtime_nvn_cb_lifetime_selftest()) {
+            fprintf(stderr, "[totk-nvn] command-buffer lifetime selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-cb-lifetime\"}\n");
         return 0;
     }
     if (!strcmp(argv[2], "probe-vi")) {

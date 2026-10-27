@@ -187,6 +187,8 @@ void *runtime_override(const char *name) {
         if (!strcmp(name, map[i].name)) return map[i].fn;
     void *hid = runtime_hid_override(name);
     if (hid) return hid;
+    void *clock = runtime_time_override(name);
+    if (clock) return clock;
     return runtime_fs_override(name);   /* nn::fs runs on the host, not through fsp-srv */
 }
 

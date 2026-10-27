@@ -9,12 +9,16 @@
 | 3 | on-screen clear | done (emulator) | Surface test APK, 1,620+ frames at ~60 Hz, screenshot |
 | 4 | triangle | done | `probe-vulkan-triangle`, 60 frames, screenshot |
 | 5 | NVN program/pipeline/texture/draw | done | `probe-nvn-texture` (guest block-linear upload), `probe-totk-vs` visible TOTK VS/PS |
-| 6 | game first frame | blocked | game still stops at `nn::gfx` context registry |
+| 6 | game first frame | blocked | registry/TLS/UI/audio/lm done; missing boot TexToGo resources stop texture worker |
 | 7 | continuous frames | done (host) | triangle 60 frames; surface 1,620+ frames; NVN 60 draws |
+| 8 | shader cache + `nvnProgramSetShaders*` -> pipeline | done (host) | `probe-nvn-frame`: key hit, reflected pipeline, visible draw |
+| 9 | command-buffer clear/viewport/draw translation | done (first slice) | `probe-nvn-frame` center `ff4d0dff`; miss fallback `0d141fff` |
 
 The game's own first frame is **not** claimed.  The renderer path is now
-independently exercisable, and the remaining blocker is the guest `nn::gfx`
-context registry, not Vulkan, shader translation or presentation.
+independently exercisable.  The former `nn::gfx` context-registry stop was a
+`ThreadLocalRegion+0x1f0` TLS bug and is fixed; the boot now passes the UI
+layout and audio renderer, and the remaining stop is the missing boot
+`TexToGo`/`Event` resources on a texture-worker thread.
 
 ## 2. Offscreen clear
 
@@ -311,21 +315,130 @@ The sampled PS is a real 5-texture material/system shader; the probe creates
 its full two-set layout, loads the descriptor map into the NVN program, submits
 two draws and presents a PPM.
 
-## 6. Game first frame
+### Shader cache and `nvnProgramSetShaders*` -> pipeline
 
-The game still stops at:
+The Android runtime now consumes the 2B.2 key directly instead of a
+probe-selected path.  `nvnProgramSetShaders` and
+`nvnProgramSetShadersExt` hash the NVN control section (`0x880`, or its
+declared short section size) and the code up to the length in the control
+section, then look up:
 
 ```text
-[crash] sig=11 pc=main+0x794dd0 lr=main+0x794db8 fault=0x10
-[crash] last NVN api: nvnBufferMap
+<cache>/<stage>/<key>.spv
+<cache>/<stage>/<key>.res.json
 ```
 
-The `nn::gfx` context registry is empty; the guest abort path then tries to
-allocate a 0x5f0-byte error/context object from a 64 KiB fallback heap and
-crashes in its unwinder.  This is the same pre-existing stop documented in
-`android-hle-phase2a.md`; the new Vulkan renderer, triangle, NVN draw and
-Surface clear do not change it.  Shader translation is not the blocker for
-this game stop.
+under `TOTK_ANDROID_SHADER_CACHE` (default `<profile>/shader-cache`).  The
+seed's `<key>-<variant>.spv` names and a flat `<key>.spv` are accepted as
+fallbacks.  A hit loads the module and marks the stage; when both VS and PS
+are present, the first submit creates the reflected `VkPipeline`, keyed by the
+target format.  A miss is logged with the key and the frame falls back to the
+recorded clear, never to a fabricated shader.
+
+Offline packing uses the 2B.2 spike output:
+
+```sh
+python3 games/totk/android/tools/prepare_shader_cache.py \
+  --spike /tmp/totk-shader-spike-all --out /tmp/totk-shader-cache
+adb push /tmp/totk-shader-cache /data/local/tmp/totk-android/shader-cache
+```
+
+The packer renames each spike job stem to the NVN key in
+`spike-report.json`; `tests/test_android_shader_cache.py` covers the layout,
+bad-module rejection and stale-entry cleanup.  The output is game-derived and
+stays in the work folder.  `probe-shader-cache` validates the packed
+`<stage>/<key>.spv` files (`vkCreateShaderModule` on the device) and counts the
+matching reflections:
+
+```text
+{"status":"pass","probe":"shader-cache","modules":92,"reflections":92,"failed":0}
+```
+
+`probe-nvn-frame` stores two synthetic NVN control/code pairs, loads them back
+and draws the translated triangle through a real NVN command buffer:
+
+```text
+[totk-nvn] shader cache hit #1 vs f2cb... code=256 +res.json
+[totk-nvn] shader cache hit #2 ps 3619... code=256 +res.json
+[totk-nvn] program=0x... create pipeline from cache vs=... ps=... format=0x25
+[totk-nvn] NVN draw #1 ... reflected
+[totk-nvn] frame selftest center=ff4d0dff corner=0d141fff ok=1
+{"status":"pass","probe":"nvn-frame",...}
+```
+
+With `TOTK_ANDROID_SHADER_CACHE_MISS=1` the same probe writes nothing, the
+program reports two misses, and the frame is `0d141fff` everywhere.  The
+synthetic key derivation was checked against the same SHA-256
+`prepare_shader_seed.py` uses.
+
+### Command-buffer translation order
+
+The command buffer records the guest order and translates it in that order:
+
+1. `nvnCommandBufferClearColor` / `ClearColori` / `ClearColorui` -> the
+   render-pass clear value (a later clear becomes `vkCmdClearAttachments`);
+2. `nvnCommandBufferSetViewport(s)` / `SetScissor(s)` -> dynamic
+   viewport/scissor;
+3. `nvnCommandBufferDrawArrays` -> `vkCmdDraw` with the reflected pipeline.
+
+`nvnCommandBufferBindProgram` selects the program.  `SetRenderTargets`
+resolves the window from its color texture, so draw and present share one host
+target.  When the guest's native-window pointer is not a host window yet (the
+VI/app-shell handoff is still incomplete), `nvnWindowInitialize` creates an
+offscreen 1920x1080 RGBA8 host window so the cached pipeline has a target.
+Descriptor/resource binds (`BindUniformBuffer`, `BindTexture`, `BindImage`,
+vertex buffers/states) are still recorded or traced and keep using the
+pipeline's descriptor sets.  Vertex/index resource reads, per-draw uploads and
+indexed draws are the next translation slice; `DrawElements` records the count
+but does not yet submit a `vkCmdDrawIndexed`.
+
+## 6. Game first frame
+
+The former `main+0x794dd0` stop was a TLS-layout bug, not an empty
+`nn::gfx` registry.  Horizon's ThreadLocalRegion stores the guest
+`TPIDR_EL0` at `TPIDRRO_EL0+0x1f0`; the SDK restores it with
+`msr tpidr_el0, [tpidrro_el0+0x1f0]`.  `runtime_thread_init` now fills that
+field (it already filled the `+0x1f8` ThreadType pointer), so the registry
+lookup succeeds and the game continues past it:
+
+```text
+gfx-registry head=...: <context> <context> <vtable> 0
+gfx-registry node[0]=... key+0x5e8=0x51 next=0
+```
+
+The game now reaches Boot UI and audio initialization.  The debug RomFS needs
+the three `UI/LayoutArchive/` archives (extracted from the XCI for the device
+test) and `Sound/Product.100.alto__AltoConfig.bgyml`.  The Android build also
+includes the real `audren:u` renderer protocol with a silent mixer backend,
+the host `nn::time` clock, and SVC 0x13/0x14 shared-memory mapping.  It opens
+the audio renderer, processes the REV11 request, mounts save/cache storage and
+stops at:
+
+```text
+[crash] sig=11 pc=sdk+0x356128 lr=sdk+0x35562c fault=0x0
+[crash] last NVN api: nvnTextureGetViewOffset
+[crash] last IPC: service=IAudioDevice command=7 ...
+```
+
+That was `nn::lm::detail::ShimLibraryGlobal::GetInstance`, the SDK log-manager
+singleton (`sdk+0x3560f0`; guard `sdk+0xd18118`, holder `sdk+0xd18120`, storage
+`sdk+0xd80d70`).  The SDK's `lm` command 0 is `OpenLogger`; the host service now
+returns an `ILogger` (moved session for a direct request, domain object for a
+domain request), so the singleton initializes and logging/asserts no longer
+crash.
+
+The next stop is the null texture builder it had been masking:
+
+```text
+[crash] sig=11 pc=main+0x84cb1c lr=main+0x128225c fault=0x1c
+[crash] last NVN api: nvnTextureBuilderGetStorageSize
+```
+
+Adding the `TexToGo/Water*` assets moves it further to `main+0xc49974` on a
+texture-worker thread, after more missing `TexToGo`/`Event` resources
+(`CmnTex_DriftSand_Alb`, event setting lists).  TLS remains valid and the
+Vulkan/NVN probes still pass.  The earlier non-fatal
+`nvnMemoryPoolMap: pool is CPU_NO_ACCESS` remains a separate pool-flag item.
 
 ## 7. Verification commands
 
@@ -342,6 +455,8 @@ totk-android <dir> probe-vulkan-reflect-texture
 totk-android <dir> probe-vulkan-reflect-ubo
 totk-android <dir> probe-nvn-texture-reflect
 totk-android <dir> probe-nvn-bind
+totk-android <dir> probe-nvn-frame
+totk-android <dir> probe-shader-cache
 totk-android <dir> probe-spirv
 totk-android <dir> probe-nvn-submit
 ```
@@ -370,6 +485,11 @@ Expected:
   program and reflected pipeline; visible draw and PPM.
 - `probe-nvn-bind`: NVN texture/sampler pool registration, combined-handle
   packing and the descriptor bind entry points pass.
+- `probe-nvn-frame`: writes two synthetic NVN shader keys, hits the offline
+  cache, creates the reflected pipeline and translates
+  clear/viewport/scissor/draw; center `ff4d0dff`, corner `0d141fff`.
+- `probe-shader-cache`: every packed `<stage>/<key>.spv` is accepted by
+  `vkCreateShaderModule` and its `.res.json` is present.
 - `probe-spirv`: all cached SPIR-V modules accepted by the driver.
 - `probe-nvn-submit`: the older submit/present self-test still passes.
 
@@ -380,9 +500,15 @@ Expected:
    texture objects and uniform buffers are now bound after pipeline creation.
    The remaining work is the upload/copy path for images and full mip/format
    coverage.
-2. Use the 2B.2 cache key when loading `nvnProgramSetShaders*` instead of a
-   probe-selected path, and persist the translated `.spv + .res.json` pair.
-3. Return to the `nn::gfx` context registry stop; until it is fixed, the game
-   cannot reach its own first frame regardless of renderer readiness.
-4. Unlock the physical device and keep the screen on, then re-run the Surface
+2. Pack the startup/title shader subset into the offline cache and run the
+   game's own `nvnProgramSetShaders*` against it.  The key/lookup/pipeline path
+   is in place (`probe-nvn-frame`); a cache miss still presents a clear frame.
+3. Translate vertex streams/attributes and indexed draws so translated
+   geometry reads the guest vertex data, then bind the real cbufs/textures
+   recorded by the command buffer.
+4. Fill the remaining boot `TexToGo`/UI/Event resources.  The real `lm` logger
+   and the Water textures fixed the logged `main+0x84cb1c` stop; the next crash
+   is `main+0xc49974` on a texture worker after missing
+   `CmnTex_DriftSand_Alb`/event setting resources.
+5. Unlock the physical device and keep the screen on, then re-run the Surface
    test; `adb install` now succeeds on the Xiaomi device.

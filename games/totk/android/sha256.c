@@ -36,24 +36,51 @@ static void block(uint32_t h[8], const uint8_t *p) {
     h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
 }
 
-void sha256(const void *data, size_t len, uint8_t out[32]) {
-    uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
-                     0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+void sha256_init(sha256_ctx *c) {
+    static const uint32_t iv[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+                                   0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    memcpy(c->h, iv, sizeof iv);
+    c->length = 0;
+    c->used = 0;
+}
+
+void sha256_update(sha256_ctx *c, const void *data, size_t len) {
     const uint8_t *p = data;
-    size_t n = len;
-    while (n >= 64) { block(h, p); p += 64; n -= 64; }
-    uint8_t tail[128]; memset(tail, 0, sizeof tail);
-    memcpy(tail, p, n);
-    tail[n] = 0x80;
-    size_t total = n < 56 ? 64 : 128;
-    uint64_t bits = (uint64_t)len * 8;
-    for (int i = 0; i < 8; i++) tail[total-1-i] = (uint8_t)(bits >> (8*i));
-    block(h, tail);
-    if (total == 128) block(h, tail + 64);
-    for (int i = 0; i < 8; i++) {
-        out[4*i] = (uint8_t)(h[i] >> 24); out[4*i+1] = (uint8_t)(h[i] >> 16);
-        out[4*i+2] = (uint8_t)(h[i] >> 8); out[4*i+3] = (uint8_t)h[i];
+    c->length += len;
+    if (c->used) {
+        size_t n = 64 - c->used;
+        if (n > len) n = len;
+        memcpy(c->block + c->used, p, n);
+        c->used += n;
+        p += n;
+        len -= n;
+        if (c->used == 64) { block(c->h, c->block); c->used = 0; }
     }
+    while (len >= 64) { block(c->h, p); p += 64; len -= 64; }
+    if (len) { memcpy(c->block, p, len); c->used = len; }
+}
+
+void sha256_final(sha256_ctx *c, uint8_t out[32]) {
+    uint64_t bits = c->length * 8;
+    uint8_t tail[128];
+    memset(tail, 0, sizeof tail);
+    memcpy(tail, c->block, c->used);
+    tail[c->used] = 0x80;
+    size_t total = c->used < 56 ? 64 : 128;
+    for (int i = 0; i < 8; i++) tail[total-1-i] = (uint8_t)(bits >> (8*i));
+    block(c->h, tail);
+    if (total == 128) block(c->h, tail + 64);
+    for (int i = 0; i < 8; i++) {
+        out[4*i] = (uint8_t)(c->h[i] >> 24); out[4*i+1] = (uint8_t)(c->h[i] >> 16);
+        out[4*i+2] = (uint8_t)(c->h[i] >> 8); out[4*i+3] = (uint8_t)c->h[i];
+    }
+}
+
+void sha256(const void *data, size_t len, uint8_t out[32]) {
+    sha256_ctx c;
+    sha256_init(&c);
+    sha256_update(&c, data, len);
+    sha256_final(&c, out);
 }
 
 void sha256_hex(const void *data, size_t len, char out[65]) {

@@ -208,6 +208,10 @@ The next checks are:
 3. The first `nvnQueueSubmitCommands` call is already instrumented; it should
    appear in the log as soon as the registry path is fixed.
 
+This stop was resolved by the `ThreadLocalRegion+0x1f0` fix in section 9; the
+registry is now populated and the game stops later, in window heap
+construction.
+
 ## 5. Acceptance status
 
 - The original `main+0x1123f7c` crash is explained: allocator null because the
@@ -337,27 +341,67 @@ With the host VI layer restored, the game gets through:
 - the original 0x230 null allocation,
 - NVN device, queue, memory pools, sampler/texture pools, command buffers,
 - VI layer + 1920x1080 host native window,
-- `nn::gfx` window/queue setup.
+- `nn::gfx` context registration and window/queue construction.
 
-It still stops at `main+0x794dd0`.  The crash dump now shows the registry:
+The former `main+0x794dd0` stop was **not** a missing `nn::gfx` registration
+call.  The SDK stores the guest `TPIDR_EL0` value in the ThreadLocalRegion at
+`TPIDRRO_EL0+0x1f0` and restores it with
+`msr tpidr_el0, [tpidrro_el0+0x1f0]` (`sdk+0x12fe58`, `sdk+0x1302d4`).  The
+Android thread init only filled `+0x1f8` (ThreadType), so the first restore
+cleared the guest TP.  The next `nn::gfx` context cache store at
+`TPIDR_EL0+0x10` then faulted.
+
+`runtime_thread_init` now also writes the guest TLS pointer to `TLR+0x1f0`.
+The registry is consequently populated:
 
 ```
-gfx-registry mgr=0x...
-gfx-registry mgr+0x18..0x50: <head> ...
-gfx-registry head=<sentinel>: 0 0 <vtable> 0
+gfx-registry mgr=...
+gfx-registry head=...: <context> <context> <vtable> 0
+gfx-registry node[0]=... key+0x5e8=0x51 next=0
 ```
 
-The head's first word is 0: no `nn::gfx` context is registered yet.  The
-subsequent allocation of the 0x5f0-byte error/context object uses a guest
-small-object heap whose fallback is only 0x10000 bytes, so the guest's own
-abort path dereferences a null after the failed lookup.  The last NVN call is
-`nvnBufferMap` and it returned a valid guest mapping; this is not an NVN null
-and no null check was skipped.
+The game proceeds past the registry, creates the NVN device and graphics
+threads, and reaches the Boot UI and audio initialization.  The debug RomFS
+initially lacked the Boot layout archives; extracting `UI/LayoutArchive/`
+(`Boot`, `Common`, `Title`) from the XCI moves the stop past the null tree
+insert.  `Sound/Product.100.alto__AltoConfig.bgyml` is also needed.
 
-Next: find why the `nn::gfx` context is not registered on the main thread
-before the buffer/window setup (the `nn::gfx::Device`/`Context` create calls
-around `main+0xe9d404` and `main+0xea500`), then the game's own
-`nvnQueueSubmitCommands` should hit the existing log line.
+The Android build now includes the real `audren:u` renderer protocol with a
+null (silent) mixer backend, the host `nn::time` clock, and SVC 0x13/0x14
+`MapSharedMemory`/`UnmapSharedMemory` (copy semantics for now).  With those,
+the game opens the audio renderer, processes the REV11 request, mounts
+save/cache storage, and reaches the next stop:
+
+```text
+[crash] sig=11 pc=sdk+0x356128 lr=sdk+0x35562c fault=0x0
+[crash] last NVN api: nvnTextureGetViewOffset
+[crash] last IPC: service=IAudioDevice command=7 ...
+```
+
+The next stop was in the SDK **log manager**, not a thread/name manager.
+`sdk+0x3560f0` is `nn::lm::detail::ShimLibraryGlobal::GetInstance`; its guard
+is the pointer at `sdk+0xd18118`, the instance holder is at `sdk+0xd18120`, and
+the zeroed storage is `sdk+0xd80d70`.  The constructor at `sdk+0x356060` calls
+`nn::lm::CreateLogServiceByHipc` (`sdk+0x356b50`) and the resulting
+`ILogService::OpenLogger`.  The SDK's `lm` command 0 is `OpenLogger`: the host
+service now returns an `ILogger` (a moved session for a direct request, a
+domain object for a domain request), so `ShimLibraryGlobal` initializes.
+
+The first log/assert no longer crashes.  The next stop is the null texture
+builder that the log manager had been masking:
+
+```text
+[crash] sig=11 pc=main+0x84cb1c lr=main+0x128225c fault=0x1c
+[crash] last NVN api: nvnTextureBuilderGetStorageSize
+```
+
+This is a missing texture resource, not a builder API bug.  Adding the
+`TexToGo/Water*` assets (test data from the XCI) moves the crash further to
+`main+0xc49974` on texture-worker thread `0x101f`, after more missing
+`TexToGo`/`Event` resources (`CmnTex_DriftSand_Alb`, event setting lists).
+
+`nvnMemoryPoolMap` still reports `pool is CPU_NO_ACCESS`; it remains a separate
+pool-flag item.
 
 ## 10. Verification
 

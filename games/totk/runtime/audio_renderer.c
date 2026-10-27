@@ -13,8 +13,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(__ANDROID__)
+#include "../android/thread_compat_android.h"
+typedef mach_vm_address_t vm_address_t;
+typedef mach_vm_size_t vm_size_t;
+#define vm_read_overwrite mach_vm_read_overwrite
+#else
 #include <mach/mach.h>
 #include <pthread/qos.h>
+#endif
 
 #define REV(n) (0x30564552u + ((uint32_t)(n) << 24))   /* "REVn" */
 #define WORK_BUFFER_BYTES 0x10000u                      /* host keeps its state in host memory */

@@ -1436,6 +1436,14 @@ GfxTrianglePipeline *gfx_backend_builtin_triangle_pipeline(void) {
     return g_builtin_triangle;
 }
 
+void gfx_backend_builtin_triangle_modules(const uint8_t **vs, size_t *vs_size,
+                                          const uint8_t **ps, size_t *ps_size) {
+    if (vs) *vs = (const uint8_t *)triangle_vert_spv;
+    if (vs_size) *vs_size = triangle_vert_spv_size;
+    if (ps) *ps = (const uint8_t *)triangle_frag_spv;
+    if (ps_size) *ps_size = triangle_frag_spv_size;
+}
+
 
 struct GfxTexture {
     VkImage image;
@@ -2375,8 +2383,27 @@ int gfx_backend_reflected_ubo_selftest(void) {
     return ok;
 }
 
-int gfx_backend_reflected_draw(GfxReflectedPipeline *p, GfxOffscreenTarget *t,
-                               float r, float g_, float b, float a) {
+static VkPrimitiveTopology vk_reflect_topology(uint32_t primitive) {
+    /* NVNdrawPrimitive (matches the macOS NVN mapping): 0 points, 1 lines,
+     * 3 line strip, 4 triangles, 5 triangle strip, 7 quads (triangle list).
+     * The reflected pipeline is created with TRIANGLE_LIST, which covers the
+     * first real frames; non-triangle types still draw with that topology and
+     * are logged by the caller. */
+    switch (primitive) {
+    case 0: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    case 1: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    case 3: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+    case 5: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    case 6: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+    case 4:
+    case 7:
+    default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    }
+}
+
+int gfx_backend_reflected_execute(GfxReflectedPipeline *p, GfxOffscreenTarget *t,
+                                  const GfxCmd *cmds, uint32_t count,
+                                  const float default_clear[4]) {
     if (!p || !t) return 0;
     pthread_mutex_lock(&g_lock);
     if (!g.ready || t->format != p->format || t->bpp != 4) { pthread_mutex_unlock(&g_lock); return 0; }
@@ -2391,25 +2418,70 @@ int gfx_backend_reflected_draw(GfxReflectedPipeline *p, GfxOffscreenTarget *t,
         }
         p->fb_view = t->view; p->fb_w = t->width; p->fb_h = t->height;
     }
+
+    float clear[4] = { 0.05f, 0.08f, 0.12f, 1.0f };
+    if (default_clear) memcpy(clear, default_clear, sizeof clear);
+    int first_is_clear = count && cmds[0].kind == GFX_CMD_CLEAR_COLOR;
+    if (first_is_clear) memcpy(clear, cmds[0].u.clear.rgba, sizeof clear);
+
     VkCommandBuffer cmd = g.cmd;
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-    if (!vk_ok(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer(reflected)")) {
+    if (!vk_ok(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer(reflected-execute)")) {
         pthread_mutex_unlock(&g_lock); return 0;
     }
-    VkClearValue clear = { .color = { .float32 = { r, g_, b, a } } };
+    VkClearValue cv = { .color = { .float32 = { clear[0], clear[1], clear[2], clear[3] } } };
     VkRenderPassBeginInfo rp = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .renderPass = p->pass, .framebuffer = p->fb,
-        .renderArea = { { 0, 0 }, { t->width, t->height } }, .clearValueCount = 1, .pClearValues = &clear };
+        .renderArea = { { 0, 0 }, { t->width, t->height } }, .clearValueCount = 1, .pClearValues = &cv };
     vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pipe);
     VkDescriptorSet sets[2] = { p->dset[0], p->dset[1] };
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, 2, sets, 0, NULL);
+
     VkViewport viewport = { 0, 0, (float)t->width, (float)t->height, 0, 1 };
     VkRect2D scissor = { { 0, 0 }, { t->width, t->height } };
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
-    vkCmdDraw(cmd, 3, 1, 0, 0);
+
+    for (uint32_t i = 0; i < count; i++) {
+        const GfxCmd *c = &cmds[i];
+        switch (c->kind) {
+        case GFX_CMD_CLEAR_COLOR: {
+            if (i == 0 && first_is_clear) break;   /* already the pass load value */
+            VkClearAttachment ca = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                     .colorAttachment = 0,
+                                     .clearValue = { .color = { .float32 = {
+                                         c->u.clear.rgba[0], c->u.clear.rgba[1],
+                                         c->u.clear.rgba[2], c->u.clear.rgba[3] } } } };
+            VkClearRect cr = { { { 0, 0 }, { t->width, t->height } }, 0, 1 };
+            vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
+            break;
+        }
+        case GFX_CMD_SET_VIEWPORT:
+            viewport = (VkViewport){ (float)c->u.rect.x, (float)c->u.rect.y,
+                                     (float)c->u.rect.width, (float)c->u.rect.height, 0, 1 };
+            if (c->u.rect.width > 0 && c->u.rect.height > 0)
+                vkCmdSetViewport(cmd, 0, 1, &viewport);
+            break;
+        case GFX_CMD_SET_SCISSOR:
+            if (c->u.rect.width > 0 && c->u.rect.height > 0) {
+                scissor = (VkRect2D){ { c->u.rect.x, c->u.rect.y },
+                                      { (uint32_t)c->u.rect.width, (uint32_t)c->u.rect.height } };
+                vkCmdSetScissor(cmd, 0, 1, &scissor);
+            }
+            break;
+        case GFX_CMD_DRAW: {
+            uint32_t prim = c->u.draw.primitive;
+            if (vk_reflect_topology(prim) != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+                vk_log("reflected execute: primitive %u uses the TRIANGLE_LIST pipeline", prim);
+            vkCmdDraw(cmd, c->u.draw.count, 1, c->u.draw.first, 0);
+            break;
+        }
+        default:
+            break;
+        }
+    }
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy region = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
                                  .imageExtent = { t->width, t->height, 1 } };
@@ -2420,16 +2492,23 @@ int gfx_backend_reflected_draw(GfxReflectedPipeline *p, GfxOffscreenTarget *t,
         .buffer = t->readback, .offset = 0, .size = VK_WHOLE_SIZE };
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                          0, 0, NULL, 1, &bb, 0, NULL);
-    if (!vk_submit_and_wait(cmd, "reflected")) { pthread_mutex_unlock(&g_lock); return 0; }
+    if (!vk_submit_and_wait(cmd, "reflected-execute")) { pthread_mutex_unlock(&g_lock); return 0; }
     t->layout = VK_IMAGE_LAYOUT_GENERAL;
     void *mapped = NULL;
-    if (!vk_ok(vkMapMemory(g.dev, t->readback_mem, 0, VK_WHOLE_SIZE, 0, &mapped), "vkMapMemory(reflected)")) {
+    if (!vk_ok(vkMapMemory(g.dev, t->readback_mem, 0, VK_WHOLE_SIZE, 0, &mapped), "vkMapMemory(reflected-execute)")) {
         pthread_mutex_unlock(&g_lock); return 0;
     }
     memcpy(t->pixels, mapped, t->pixels_size);
     vkUnmapMemory(g.dev, t->readback_mem);
     pthread_mutex_unlock(&g_lock);
     return 1;
+}
+
+int gfx_backend_reflected_draw(GfxReflectedPipeline *p, GfxOffscreenTarget *t,
+                               float r, float g_, float b, float a) {
+    const float clear[4] = { r, g_, b, a };
+    GfxCmd cmd = { .kind = GFX_CMD_DRAW, .u.draw = { 4, 0, 3 } };
+    return gfx_backend_reflected_execute(p, t, &cmd, 1, clear);
 }
 
 static GfxTexturedPipeline *g_builtin_textured;

@@ -60,6 +60,10 @@ void gfx_backend_triangle_pipeline_destroy(GfxTrianglePipeline *pipeline);
 int gfx_backend_triangle_draw(GfxTrianglePipeline *pipeline, GfxOffscreenTarget *target,
                               float r, float g, float b, float a);
 GfxTrianglePipeline *gfx_backend_builtin_triangle_pipeline(void);
+/* The built-in triangle SPIR-V pair (repository-owned test shader) so the NVN
+ * cache probe can populate a synthetic cache entry without game data. */
+void gfx_backend_builtin_triangle_modules(const uint8_t **vs, size_t *vs_size,
+                                          const uint8_t **ps, size_t *ps_size);
 
 typedef struct { uint32_t binding; uint32_t size; } GfxUboBinding;
 GfxTrianglePipeline *gfx_backend_triangle_pipeline_create_ubo(const uint8_t *vs, size_t vs_size,
@@ -121,6 +125,31 @@ GfxReflectedPipeline *gfx_backend_reflected_pipeline_create(const uint8_t *vs, s
 void gfx_backend_reflected_pipeline_destroy(GfxReflectedPipeline *pipeline);
 int gfx_backend_reflected_draw(GfxReflectedPipeline *pipeline, GfxOffscreenTarget *target,
                                float r, float g, float b, float a);
+
+/* Command-buffer translation, ordered the way the guest records it:
+ * clear colour, viewport, scissor, draw.  Descriptor/resource binds are still
+ * applied through the reflected pipeline's sets (dummy resources until the
+ * per-draw upload bridge lands).  `default_clear` is used when the list has no
+ * GFX_CMD_CLEAR_COLOR, matching the window's default clear. */
+typedef enum {
+    GFX_CMD_CLEAR_COLOR = 1,
+    GFX_CMD_SET_VIEWPORT,
+    GFX_CMD_SET_SCISSOR,
+    GFX_CMD_DRAW
+} GfxCmdKind;
+
+typedef struct {
+    uint32_t kind;
+    union {
+        struct { float rgba[4]; uint32_t mask; } clear;
+        struct { int32_t x, y, width, height; } rect;
+        struct { uint32_t primitive, first, count; } draw;
+    } u;
+} GfxCmd;
+
+int gfx_backend_reflected_execute(GfxReflectedPipeline *pipeline, GfxOffscreenTarget *target,
+                                  const GfxCmd *cmds, uint32_t count,
+                                  const float default_clear[4]);
 /* Replace the dummy resource of one reflected binding at runtime.  The binding
  * kind and count come from the pipeline's SPIR-V signature. */
 int gfx_backend_reflected_bind_texture(GfxReflectedPipeline *pipeline, uint32_t set,

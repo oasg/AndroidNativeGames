@@ -126,14 +126,44 @@ static uintptr_t next_commit(uintptr_t addr) {
     return next;
 }
 
-/* lm (LogManager): the SDK opens it from the first module initializer and sends
- * Initialize(process_id); the host logger is already running. */
+/* lm (LogManager): the SDK's ILogService command 0 is OpenLogger(pid).  The
+ * host returns an ILogger whose Log/SetDestination commands go to a silent
+ * sink, so nn::lm::detail::ShimLibraryGlobal initializes. */
+static void logger_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    (void)rs;
+    switch (rq->cmd) {
+    case 0: /* Log(in buffer) */
+    case 1: /* SetDestination(destination) */
+        return;
+    default:
+        ipc_unimplemented(s, rq);
+    }
+}
+
+static uint32_t lm_open_logger(IpcSession *s, IpcResponse *rs) {
+    if (s->domain) {
+        uint32_t id = ipc_domain_add_object(s, "ILogger", logger_handler, NULL, NULL);
+        IPC_OUT_OBJECT(rs, id);
+        return id;
+    }
+    uint32_t h = runtime_ipc_new_session("ILogger", logger_handler, NULL, NULL);
+    rs->move[rs->nmove++] = h;
+    return h;
+}
+
 static void lm_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     switch (rq->cmd) {
-    case 0: { /* Initialize(process_id): the host logger is already running */
-        if (rq->data_size != 8) { rs->result = 0xe401; return; }
-        uint64_t pid; memcpy(&pid, rq->data, 8);
-        fprintf(stderr, "[totk-ipc] lm initialized for process %#llx\n", (unsigned long long)pid);
+    case 0: { /* OpenLogger(pid) -> ILogger */
+        uint64_t pid = 0;
+        if (rq->data_size >= 8) memcpy(&pid, rq->data, 8);
+        fprintf(stderr, "[totk-ipc] lm OpenLogger pid=%#llx domain=%p\n",
+                (unsigned long long)pid, (void *)s->domain);
+        lm_open_logger(s, rs);
+        return;
+    }
+    case 3: { /* OpenLogger on a domain object -> ILogger */
+        fprintf(stderr, "[totk-ipc] lm OpenLogger cmd3 domain=%p\n", (void *)s->domain);
+        lm_open_logger(s, rs);
         return;
     }
     default:
@@ -333,6 +363,29 @@ uint64_t runtime_svc(unsigned num, uint64_t *r, const char *module, uint64_t off
             r[0] = 0; return 0;
         }
         case 0x06: query_memory(r[0], r[2]); r[0] = 0; r[1] = 0; return 0;
+        case 0x13: case 0x14: { /* MapSharedMemory / UnmapSharedMemory */
+            uint32_t h = (uint32_t)r[0];
+            uint64_t addr = r[1], size = r[2];
+            IpcTransferMemory *tm = runtime_handle_get(h, 0);
+            fprintf(stderr, "[totk-android] SVC %#x shared h=%#x addr=%#llx size=%#llx tm=%p\n",
+                    num, h, (unsigned long long)addr, (unsigned long long)size, (void *)tm);
+            if (num == 0x13) {
+                if (!tm || !addr || !size || addr + size < addr || size > tm->size) {
+                    r[0] = 0xd401; return 0;
+                }
+                if (mprotect((void *)(uintptr_t)addr, (size_t)size, PROT_READ | PROT_WRITE)) {
+                    r[0] = 0xd401; return 0;
+                }
+                /* Phase 1: copy the transfer-memory content; the host has no
+                 * userfaultfd-backed shared alias yet. */
+                if (addr != tm->addr) memcpy((void *)(uintptr_t)addr,
+                                             (const void *)(uintptr_t)tm->addr, (size_t)size);
+            } else {
+                if (!addr || !size || (addr & 0xfff) || (size & 0xfff)) { r[0] = 0xd401; return 0; }
+                if (mprotect((void *)(uintptr_t)addr, (size_t)size, PROT_NONE)) { r[0] = 0xd401; return 0; }
+            }
+            r[0] = 0; return 0;
+        }
         case 0x0b: { int64_t ns = (int64_t)r[0]; if (ns > 0) { struct timespec t = { ns / 1000000000, ns % 1000000000 }; nanosleep(&t, NULL); } r[0] = 0; return 0; }
         case 0x0c: case 0x0d: case 0x0e: case 0x0f: r[0] = 0; return 0;
         case 0x10: r[0] = 0; return 0;

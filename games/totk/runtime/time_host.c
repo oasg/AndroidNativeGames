@@ -3,7 +3,12 @@
    counts seconds of host continuous time with one source id per process. ClockSnapshot uses the public
    0xD0-byte layout because game code may read its fields through inline accessors. */
 #include "runtime.h"
+#if defined(__ANDROID__)
+#include <fcntl.h>
+#include <unistd.h>
+#else
 #include <mach/mach_time.h>
+#endif
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,11 +33,31 @@ _Static_assert(sizeof(ClockSnapshot) == 0xd0, "nn::time::ClockSnapshot");
 static uint8_t source_id[16];
 static int initialized;
 static pthread_once_t once = PTHREAD_ONCE_INIT;
-static void make_source(void) { arc4random_buf(source_id, sizeof source_id); }
+static void make_source(void) {
+#if defined(__ANDROID__)
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    ssize_t n = fd >= 0 ? read(fd, source_id, sizeof source_id) : -1;
+    if (fd >= 0) close(fd);
+    if (n != (ssize_t)sizeof source_id) {
+        uint64_t seed = (uint64_t)time(NULL) ^ (uint64_t)getpid();
+        memcpy(source_id, &seed, sizeof seed);
+    }
+#else
+    arc4random_buf(source_id, sizeof source_id);
+#endif
+}
 
 static int64_t steady_seconds(void) {
+#if defined(__ANDROID__)
+    struct timespec ts;
+    /* CLOCK_BOOTTIME is the continuous clock: like mach_continuous_time it
+     * keeps counting while the device is suspended. */
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+    return (int64_t)ts.tv_sec;
+#else
     mach_timebase_info_data_t tb; mach_timebase_info(&tb);
     return (int64_t)((__uint128_t)mach_continuous_time() * tb.numer / tb.denom / 1000000000u);
+#endif
 }
 static SteadyClockTimePoint steady_now(void) { pthread_once(&once, make_source); SteadyClockTimePoint p = {steady_seconds(), {0}}; memcpy(p.source, source_id, 16); return p; }
 static int64_t posix_now(void) {

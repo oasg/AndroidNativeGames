@@ -179,11 +179,20 @@ loudly if Vulkan is unavailable or the target format is unsupported.
   layouts; 2B.3 added a minimal RGBA8 texture upload/sampler/descriptor path
   (`probe-vulkan-texture` / `probe-nvn-texture`).  A full block-linear/modifier
   bridge remains the next renderer task.
-- NVN `prog_t` shader blobs are not yet compiled into Vulkan pipelines.  The
-  2B.2 spike has already proven the existing translator emits Vulkan SPIR-V
-  for a 112-shader TOTK sample; see `docs/android-hle-phase2b2-shader-spike.md`.
-- The game itself still stops at the `nn::gfx` context registry
-  (`main+0x794dd0`) before its own first submit; the Vulkan self-test proves the
+- NVN `prog_t` shader blobs are compiled through the offline cache:
+  `nvnProgramSetShaders*` hashes the NVN control+code pair with the 2B.2 key,
+  loads `<stage>/<key>.spv` (+ optional `.res.json`) from
+  `TOTK_ANDROID_SHADER_CACHE` and creates the reflected pipeline on the first
+  submit (`probe-nvn-frame`).  A miss presents the recorded clear instead of a
+  fabricated shader; packing the real startup subset is the remaining step.
+  See `docs/android-hle-phase2b2-shader-spike.md` for the spike.
+- The former `nn::gfx` context-registry stop (`main+0x794dd0`) was a missing
+  `ThreadLocalRegion+0x1f0` guest-TP field; it is fixed.  The boot now reaches
+  the Boot UI layout archives, the audio renderer (silent Android mixer) and the
+  SDK log manager, whose `lm` command 0 is `OpenLogger` and is now answered, so
+  `ShimLibraryGlobal` initializes.  The current stop is the missing boot
+  `TexToGo`/`Event` resource set on a texture-worker thread
+  (`main+0xc49974`).  The Vulkan self-test proves the
   device/target/clear/present path independently.
 - 2B.3 adds the real triangle, the NVN command-buffer draw path and an
   on-screen Surface clear test; see
@@ -192,7 +201,10 @@ loudly if Vulkan is unavailable or the target format is unsupported.
 The next steps are, in order:
 
 1. 2B.2: texture storage -> Vulkan image upload and sampler/format validation;
-2. 2B.3: NVN program/shader -> `VkShaderModule`/`VkPipeline` cache;
-3. 2B.4: command-buffer clear/draw recording and a first real frame;
+2. 2B.3: NVN program/shader -> `VkShaderModule`/`VkPipeline` cache (done:
+   `nvnProgramSetShaders*` loads the offline keyed cache and creates the
+   reflected pipeline on first submit);
+3. 2B.4: command-buffer clear/draw recording and a first real frame, starting
+   with clear/viewport/scissor/draw and then vertex/descriptor resources;
 4. 2B.5: Android `SurfaceView`/JNI app shell with
    `runtime_native_window_attach_android`.

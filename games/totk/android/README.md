@@ -73,6 +73,13 @@ gate + HLE-stack thunks + a minimal SVC layer.
   and a separate Android Surface clear APK under `surface_test/` (1,620+
   frames on the arm64 emulator).  See
   `docs/android-hle-phase2b3-rendering.md`.
+- Shader cache: `nvnProgramSetShaders`/`Ext` hash the NVN control+code pair
+  with the 2B.2 key and load `<stage>/<key>.spv` + `.res.json` from
+  `TOTK_ANDROID_SHADER_CACHE`.  The first submit creates the reflected
+  `VkPipeline`; a miss presents the recorded clear instead of a fake shader.
+  `tools/prepare_shader_cache.py` packs the offline spike output into that
+  layout, and `probe-nvn-frame` covers cache hit, pipeline creation,
+  clear/viewport/scissor/draw translation and the miss fallback.
 - `nn::hid::InitializeNpad` is a host no-pad backend for now (zero Npad/6-axis
   state, vibration stub). Keyboard/mouse/touch/debug-pad/gesture initialization
   are host no-device initializers too, because the HID shared-memory service is
@@ -125,6 +132,8 @@ adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-nvn-texture
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-totk-vs
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-totk-reflect
+adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-nvn-frame
+adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-shader-cache
 TOTK_ANDROID_TRACE_SVC=1 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android boot-sdk
 ```
 
@@ -141,6 +150,28 @@ adb shell 'TOTK_ANDROID_SPV_DIR=/data/local/tmp/totk-android/spv \
 `--all` translates every unique shader in the selected packages; the default
 is two per package.  The spike uses the macOS `totk_xlate` prebuilt and keeps
 game-derived output under `/tmp`.
+
+### Shader cache
+
+The runtime key is SHA-256 over the NVN control section and shader code.  Pack
+a spike result into the device cache layout with:
+
+```sh
+python3 games/totk/android/tools/prepare_shader_cache.py \
+  --spike /tmp/totk-shader-spike-all --out /tmp/totk-shader-cache
+adb push /tmp/totk-shader-cache /data/local/tmp/totk-android/shader-cache
+adb shell 'TOTK_ANDROID_SHADER_CACHE=/data/local/tmp/totk-android/shader-cache \
+  /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-shader-cache'
+adb shell 'TOTK_ANDROID_SHADER_CACHE=/data/local/tmp/totk-android/shader-cache \
+  /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-nvn-frame'
+```
+
+`probe-shader-cache` validates every packed module with
+`vkCreateShaderModule`.  `probe-nvn-frame` writes its own synthetic keys, so it
+works without game shader files; set `TOTK_ANDROID_SHADER_CACHE_MISS=1` to
+exercise the clear-only fallback and `TOTK_ANDROID_CLEAR_ONLY=1` for a
+clear-only command buffer.  The packed output is game-derived and must stay in
+the work folder.
 
 ### Surface clear test
 
@@ -159,6 +190,61 @@ animated clear.  The arm64 emulator reached 1,620+ frames (~60 Hz).  The physica
 Xiaomi device now accepts `adb install` (the streamed install succeeds), but the
 last run was on a locked/dozing screen, so Android destroyed the Surface after
 one frame; unlock and keep the screen on to measure it on-device.
+
+### Missing RomFS assets
+
+The debug `romfs-min` set is not the full game image.  Boot needs the Boot UI
+layout archives, which are **test data extracted from the local XCI**, not
+repository files:
+
+```text
+UI/LayoutArchive/Boot.Product.100.Nin_NX_NVN.blarc.zs
+UI/LayoutArchive/Common.Product.100.Nin_NX_NVN.blarc.zs
+UI/LayoutArchive/Title.Product.100.Nin_NX_NVN.blarc.zs
+Sound/Product.100.alto__AltoConfig.bgyml
+```
+
+The three archives and the sound config were extracted for the device test
+with `games/totk/scripts/extract_romfs.py`-style NCA/RomFS parsing and pushed
+under `/data/local/tmp/totk-android/romfs-min/`.  They are not committed.
+
+List any remaining misses with:
+
+```sh
+adb shell 'cd /data/local/tmp/totk-android && \
+  TOTK_ANDROID_INITS=1 TOTK_ANDROID_RUN_NNMAIN=1 \
+  TOTK_ANDROID_FS_TRACE=1 \
+  TOTK_ANDROID_ROMFS=/data/local/tmp/totk-android/romfs-min \
+  ./totk-android /data/local/tmp/totk-android boot-sdk' 2>&1 | grep 'not found'
+```
+
+Add the missing assets (or use the full RomFS) before treating the next crash
+as a renderer/HL issue.
+
+### Android audio and time
+
+`runtime/audio_renderer.c` is compiled for Android with
+`audio_mixer_android.c`, a silent backend that preserves the `audren:u`
+protocol (the game opens the renderer and submits REV11 updates).  `time_host.c`
+provides the host `nn::time` clock; SVC 0x13/0x14 map/unmap shared memory with
+copy semantics.  No AAudio output is wired yet.
+
+### SDK log manager (`lm`)
+
+The former `sdk+0x356128` stop was not a thread/name manager.  It was
+`nn::lm::detail::ShimLibraryGlobal::GetInstance`:
+
+```text
+guard     sdk+0xd18118 -> sdk+0xd80d78
+holder    sdk+0xd18120 -> sdk+0xd80d70
+getter    sdk+0x3560f0
+ctor      sdk+0x356060  (CreateLogServiceByHipc / ILogService::OpenLogger)
+```
+
+The SDK's `lm` command 0 is `OpenLogger`.  The host service now returns an
+`ILogger` session (moved handle for a direct request, domain object for a
+domain request), so `ShimLibraryGlobal` initializes and logging/asserts no
+longer crash.  The old `TOTK_ANDROID_LM_FAKE` diagnostic is gone.
 
 ### Host-call and IPC tracing
 
@@ -284,6 +370,9 @@ Expected results on an arm64 Android device:
 - **Native TLS**: the NDK defaults to emulated TLS in this configuration. The
   build uses `-fno-emulated-tls` and aligns `g_host`/`g_slots` to 64 bytes.
   Without that, `TPIDR_EL0 + KCTX` is not the `__thread` address.
+- **ThreadLocalRegion**: `TPIDRRO_EL0+0x1f0` holds the guest `TPIDR_EL0` value
+  and `+0x1f8` the ThreadType pointer.  Both are initialized per thread; the
+  SDK restores TP from `+0x1f0` during thread setup/teardown.
 - **W^X**: map the image `R-X` first, then make data/key page writable. Mapping
   it writable then adding `PROT_EXEC` is denied by Android (`execmod`).
 - **x18**: host code is built with `-ffixed-x18`; `gate_android.S` restores
@@ -303,9 +392,16 @@ Expected results on an arm64 Android device:
    production file path now uses the `nn::fs` host overrides instead.
 2. Continue past `nnMain` with the graphics/input/audio services. The original
    `main+0x1123f7c` null allocator is explained and fixed by the RomFS heap
-   definitions; the current stop is the `nn::gfx` context registry at
-   `main+0x794dd0` during window/queue setup, after the NVN object graph and the
-   host native window. See `docs/android-hle-phase2a.md`.
+   definitions. The former `nn::gfx` context-registry stop
+   (`main+0x794dd0`) was a missing `ThreadLocalRegion+0x1f0` guest-TP field and
+   is fixed.  The boot now loads the three `UI/LayoutArchive/` archives (test
+   data extracted from the XCI), `Sound/Product.100.alto__AltoConfig.bgyml`,
+   and runs the `audren:u` renderer with a silent Android mixer plus the host
+   `nn::time` clock.  The SDK `lm` logger now initializes (command 0 is
+   `OpenLogger`), and the Water textures fixed the null builder stop.  The next
+   crash is `main+0xc49974` on a texture-worker thread after missing
+   `TexToGo/CmnTex_DriftSand_Alb` and event setting resources.  See
+   `docs/android-hle-phase2a.md`.
 3. `nvdrv` is now a real service (`nvdrv_android.c`): Open/Close/Initialize/
    SetAruid/Ioctl3/MapSharedMem plus a guest-visible nvmap window at
    `0x500000000`.  `probe-nvdrv` exercises it.  The next nvdrv work is the
@@ -313,7 +409,7 @@ Expected results on an arm64 Android device:
 4. `vi` has a host layer/native-window object (`native_window_android.c`), and
    `probe-vi`/`probe-nvn-submit` prove the builder round trip and the first
    submit/present points through the Vulkan backend.  The game's own first
-   frame still depends on the `nn::gfx` context registration above.
+   frame now depends on the remaining boot `TexToGo`/`Event` resources above.
 5. 2B.2: ship an **offline SPIR-V shader cache**, not an on-device .NET
    translator.  The 112-shader spike translated 112/112 and the Adreno driver
    accepted 112/112 `VkShaderModule`s.  The Android reflection path now maps

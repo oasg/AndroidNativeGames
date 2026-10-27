@@ -9,6 +9,7 @@
 #include "runtime.h"
 #include "gfx_backend_android.h"
 #include <stdint.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +33,41 @@ typedef struct HostNativeWindow {
     uint8_t *buffer;
     size_t buffer_size;
 } HostNativeWindow;
+
+/* Host windows are the only pointers the NVN/VI handoff may pass back as a
+ * native window.  A guest pointer or an old VI handle must not be dereferenced
+ * to test it. */
+static HostNativeWindow *g_host_windows[64];
+static unsigned g_host_window_count;
+static pthread_mutex_t g_host_window_lock = PTHREAD_MUTEX_INITIALIZER;
+
+int runtime_native_window_valid(const void *p) {
+    if (!p) return 0;
+    int found = 0;
+    pthread_mutex_lock(&g_host_window_lock);
+    for (unsigned i = 0; i < g_host_window_count; i++)
+        if (g_host_windows[i] == p) { found = 1; break; }
+    pthread_mutex_unlock(&g_host_window_lock);
+    return found;
+}
+
+static void host_window_register(HostNativeWindow *w) {
+    if (!w) return;
+    pthread_mutex_lock(&g_host_window_lock);
+    if (g_host_window_count < sizeof g_host_windows / sizeof g_host_windows[0])
+        g_host_windows[g_host_window_count++] = w;
+    pthread_mutex_unlock(&g_host_window_lock);
+}
+
+static void host_window_unregister(HostNativeWindow *w) {
+    pthread_mutex_lock(&g_host_window_lock);
+    for (unsigned i = 0; i < g_host_window_count; i++) {
+        if (g_host_windows[i] != w) continue;
+        g_host_windows[i] = g_host_windows[--g_host_window_count];
+        break;
+    }
+    pthread_mutex_unlock(&g_host_window_lock);
+}
 
 void *runtime_native_window_create(uint32_t width, uint32_t height, uint32_t format, uint64_t layer_id) {
     if (!width || !height || width > 16384 || height > 16384) return NULL;
@@ -76,12 +112,14 @@ void *runtime_native_window_create(uint32_t width, uint32_t height, uint32_t for
     fprintf(stderr, "[totk-vi] host native window %ux%u format=%#x layer=%llu backend=%s buffer=%p/%zu\n",
             width, height, w->format, (unsigned long long)layer_id,
             w->gfx_target ? "vulkan" : "software", (void *)w->buffer, w->buffer_size);
+    host_window_register(w);
     return w;
 }
 
 void runtime_native_window_destroy(void *p) {
     HostNativeWindow *w = p;
     if (!w || w->magic != HOST_NW_MAGIC) return;
+    host_window_unregister(w);
     if (w->gfx_target) gfx_backend_offscreen_destroy(w->gfx_target);
     if (w->surface_ok) gfx_backend_detach_android_surface();
     free(w->buffer);
@@ -186,6 +224,45 @@ int runtime_native_window_draw_reflected_pipeline(void *p, void *pipeline) {
         return 0;
     const uint8_t *src = gfx_backend_offscreen_pixels(w->gfx_target, NULL);
     if (src) memcpy(w->buffer, src, w->buffer_size);
+    return 1;
+}
+
+int runtime_native_window_execute_reflected(void *p, void *pipeline,
+                                            const GfxCmd *cmds, uint32_t count,
+                                            const float default_clear[4]) {
+    HostNativeWindow *w = p;
+    if (!w || w->magic != HOST_NW_MAGIC || !w->gfx_target || !pipeline) return 0;
+    if (!gfx_backend_reflected_execute((GfxReflectedPipeline *)pipeline, w->gfx_target,
+                                       cmds, count, default_clear))
+        return 0;
+    const uint8_t *src = gfx_backend_offscreen_pixels(w->gfx_target, NULL);
+    if (src) memcpy(w->buffer, src, w->buffer_size);
+    return 1;
+}
+
+/* Clear-only frame used when a program has no cached pipeline yet.  The
+ * command buffer translation is still honoured (clear colour), but no draw is
+ * invented. */
+int runtime_native_window_clear_rgba(void *p, const float rgba[4]) {
+    HostNativeWindow *w = p;
+    if (!w || w->magic != HOST_NW_MAGIC || !rgba) return 0;
+    w->clear[0] = rgba[0]; w->clear[1] = rgba[1];
+    w->clear[2] = rgba[2]; w->clear[3] = rgba[3];
+    if (w->gfx_target) {
+        if (!gfx_backend_offscreen_clear(w->gfx_target, rgba[0], rgba[1], rgba[2], rgba[3]))
+            return 0;
+        size_t size = 0;
+        const uint8_t *src = gfx_backend_offscreen_pixels(w->gfx_target, &size);
+        if (src) memcpy(w->buffer, src, size < w->buffer_size ? size : w->buffer_size);
+        return 1;
+    }
+    uint32_t px = ((uint32_t)(rgba[0] * 255.0f + 0.5f) << 0) |
+                  ((uint32_t)(rgba[1] * 255.0f + 0.5f) << 8) |
+                  ((uint32_t)(rgba[2] * 255.0f + 0.5f) << 16) |
+                  ((uint32_t)(rgba[3] * 255.0f + 0.5f) << 24);
+    uint32_t *dst = (uint32_t *)w->buffer;
+    size_t n = w->buffer_size / 4;
+    for (size_t i = 0; i < n; i++) dst[i] = px;
     return 1;
 }
 
