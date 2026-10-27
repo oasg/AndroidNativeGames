@@ -462,6 +462,53 @@ int gfx_backend_vk_format_for_nvn(uint32_t f) {
     }
 }
 
+/* Ryujinx.Graphics.Shader.TextureFormat, in declaration order.  The .res.json
+ * writes the enum name, the Android loader converts it back to this number. */
+int gfx_backend_vk_format_for_texture_format(uint32_t f) {
+    switch (f) {
+    case 1:  return VK_FORMAT_R8_UNORM;
+    case 2:  return VK_FORMAT_R8_SNORM;
+    case 3:  return VK_FORMAT_R8_UINT;
+    case 4:  return VK_FORMAT_R8_SINT;
+    case 5:  return VK_FORMAT_R16_SFLOAT;
+    case 6:  return VK_FORMAT_R16_UNORM;
+    case 7:  return VK_FORMAT_R16_SNORM;
+    case 8:  return VK_FORMAT_R16_UINT;
+    case 9:  return VK_FORMAT_R16_SINT;
+    case 10: return VK_FORMAT_R32_SFLOAT;
+    case 11: return VK_FORMAT_R32_UINT;
+    case 12: return VK_FORMAT_R32_SINT;
+    case 13: return VK_FORMAT_R8G8_UNORM;
+    case 14: return VK_FORMAT_R8G8_SNORM;
+    case 15: return VK_FORMAT_R8G8_UINT;
+    case 16: return VK_FORMAT_R8G8_SINT;
+    case 17: return VK_FORMAT_R16G16_SFLOAT;
+    case 18: return VK_FORMAT_R16G16_UNORM;
+    case 19: return VK_FORMAT_R16G16_SNORM;
+    case 20: return VK_FORMAT_R16G16_UINT;
+    case 21: return VK_FORMAT_R16G16_SINT;
+    case 22: return VK_FORMAT_R32G32_SFLOAT;
+    case 23: return VK_FORMAT_R32G32_UINT;
+    case 24: return VK_FORMAT_R32G32_SINT;
+    case 25: return VK_FORMAT_R8G8B8A8_UNORM;
+    case 26: return VK_FORMAT_R8G8B8A8_SNORM;
+    case 27: return VK_FORMAT_R8G8B8A8_UINT;
+    case 28: return VK_FORMAT_R8G8B8A8_SINT;
+    case 29: return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case 30: return VK_FORMAT_R16G16B16A16_UNORM;
+    case 31: return VK_FORMAT_R16G16B16A16_SNORM;
+    case 32: return VK_FORMAT_R16G16B16A16_UINT;
+    case 33: return VK_FORMAT_R16G16B16A16_SINT;
+    case 34: return VK_FORMAT_R32G32B32A32_SFLOAT;
+    case 35: return VK_FORMAT_R32G32B32A32_UINT;
+    case 36: return VK_FORMAT_R32G32B32A32_SINT;
+    case 37: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case 38: return VK_FORMAT_A2B10G10R10_UINT_PACK32;
+    case 39: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
 int gfx_backend_vk_format_bpp(int vk_format) {
     VkFormatInfo i = vk_format_info((VkFormat)vk_format);
     return (int)i.bpp;
@@ -1755,6 +1802,9 @@ int gfx_backend_textured_draw(GfxTexturedPipeline *p, GfxTexture *tex, GfxOffscr
 }
 
 
+#define GFX_REFLECT_MAX_BINDINGS 64
+#define GFX_REFLECT_RUNTIME_ARRAY 32
+
 struct GfxReflectedPipeline {
     VkShaderModule vs, ps;
     VkDescriptorSetLayout dsl[2];
@@ -1767,21 +1817,29 @@ struct GfxReflectedPipeline {
     VkFramebuffer fb;
     uint32_t fb_w, fb_h;
     VkImageView fb_view;
-    GfxTexture *tex[16];
+    GfxTexture *tex[GFX_REFLECT_MAX_BINDINGS];
     unsigned ntex;
-    VkImage img[16];
-    VkDeviceMemory img_mem[16];
-    VkImageView img_view[16];
+    VkImage img[GFX_REFLECT_MAX_BINDINGS];
+    VkDeviceMemory img_mem[GFX_REFLECT_MAX_BINDINGS];
+    VkImageView img_view[GFX_REFLECT_MAX_BINDINGS];
     unsigned nimg;
-    VkBuffer buf[16];
-    VkDeviceMemory buf_mem[16];
+    VkBuffer buf[GFX_REFLECT_MAX_BINDINGS];
+    VkDeviceMemory buf_mem[GFX_REFLECT_MAX_BINDINGS];
     unsigned nbuf;
+    VkBufferView buf_view[GFX_REFLECT_MAX_BINDINGS];
+    unsigned nbuf_view;
+    VkSampler sampler[GFX_REFLECT_MAX_BINDINGS];
+    unsigned nsampler;
+    GfxBindingSpec spec[2][GFX_REFLECT_MAX_BINDINGS];
+    uint32_t nspec[2];
+    int32_t bind_buf[2][GFX_REFLECT_MAX_BINDINGS];
+    VkDeviceSize buf_size[GFX_REFLECT_MAX_BINDINGS];
 };
 
-static int vk_make_buffer(uint32_t size, VkBuffer *buf, VkDeviceMemory *mem) {
+static int vk_make_buffer_usage(uint32_t size, VkBufferUsageFlags usage,
+                                VkBuffer *buf, VkDeviceMemory *mem) {
     VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                               .size = size, .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                               .size = size, .usage = usage,
                                .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
     if (!vk_ok(vkCreateBuffer(g.dev, &bci, NULL, buf), "vkCreateBuffer(reflection)")) return 0;
     VkMemoryRequirements req; vkGetBufferMemoryRequirements(g.dev, *buf, &req);
@@ -1799,10 +1857,64 @@ static int vk_make_buffer(uint32_t size, VkBuffer *buf, VkDeviceMemory *mem) {
     return 1;
 }
 
-static int vk_make_storage_image(uint32_t w, uint32_t h, VkImage *img, VkDeviceMemory *mem,
-                                 VkImageView *view) {
+static int vk_make_buffer(uint32_t size, VkBuffer *buf, VkDeviceMemory *mem) {
+    return vk_make_buffer_usage(size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                buf, mem);
+}
+
+static int vk_make_sampler(VkSampler *sampler) {
+    VkSamplerCreateInfo sci = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .maxLod = VK_LOD_CLAMP_NONE,
+    };
+    return vk_ok(vkCreateSampler(g.dev, &sci, NULL, sampler),
+                 "vkCreateSampler(reflection)");
+}
+
+static VkFormat vk_reflect_texel_format(const GfxBindingSpec *spec, int storage) {
+    VkFormat f = (VkFormat)gfx_backend_vk_format_for_texture_format(spec->nvn_format);
+    if (!f && storage) f = VK_FORMAT_R32_UINT;
+    if (!f) f = VK_FORMAT_R8G8B8A8_UNORM;
+    VkFormatProperties props;
+    vkGetPhysicalDeviceFormatProperties(g.phys, f, &props);
+    VkFormatFeatureFlags need = storage ? VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT
+                                        : VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT;
+    if ((props.bufferFeatures & need) == need) return f;
+    return storage ? VK_FORMAT_R32_UINT : VK_FORMAT_R8G8B8A8_UNORM;
+}
+
+static int vk_make_buffer_view(uint32_t size, int storage, VkFormat format, VkBuffer *buf,
+                               VkDeviceMemory *mem, VkBufferView *view) {
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+        (storage ? VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT
+                 : VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT);
+    if (!vk_make_buffer_usage(size, usage, buf, mem)) return 0;
+    VkBufferViewCreateInfo vci = { .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
+        .buffer = *buf, .format = format, .offset = 0, .range = size };
+    return vk_ok(vkCreateBufferView(g.dev, &vci, NULL, view),
+                 "vkCreateBufferView(reflection)");
+}
+
+static int vk_make_storage_image(uint32_t w, uint32_t h, VkFormat format,
+                                 VkImage *img, VkDeviceMemory *mem, VkImageView *view) {
+    if (format == VK_FORMAT_UNDEFINED) format = VK_FORMAT_R8G8B8A8_UNORM;
+    VkFormatProperties props;
+    vkGetPhysicalDeviceFormatProperties(g.phys, format, &props);
+    if (!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+        format = VK_FORMAT_R32_UINT;
+        vkGetPhysicalDeviceFormatProperties(g.phys, format, &props);
+        if (!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
+            format = VK_FORMAT_R8G8B8A8_UNORM;
+    }
     VkImageCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .imageType = VK_IMAGE_TYPE_2D, .format = format,
         .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -1818,9 +1930,34 @@ static int vk_make_storage_image(uint32_t w, uint32_t h, VkImage *img, VkDeviceM
     if (!vk_ok(vkAllocateMemory(g.dev, &mai, NULL, mem), "vkAllocateMemory(reflection storage)")) return 0;
     if (!vk_ok(vkBindImageMemory(g.dev, *img, *mem, 0), "vkBindImageMemory(reflection storage)")) return 0;
     VkImageViewCreateInfo vci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image = *img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .image = *img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = format,
         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
     return vk_ok(vkCreateImageView(g.dev, &vci, NULL, view), "vkCreateImageView(reflection storage)");
+}
+
+static void vk_spirv_move_set(uint8_t *code, size_t size, uint32_t from, uint32_t to) {
+    if (!code || size < 20 || (size & 3)) return;
+    uint32_t *w = (uint32_t *)code;
+    for (size_t i = 5; i < size / 4;) {
+        uint32_t op = w[i] & 0xffffu, wc = w[i] >> 16;
+        if (!wc || i + wc > size / 4) break;
+        if (op == 71 && wc >= 4 && w[i + 2] == 34 && w[i + 3] == from) w[i + 3] = to;
+        i += wc;
+    }
+}
+
+static VkDescriptorType reflect_vk_type(GfxBindingKind kind) {
+    switch (kind) {
+    case GFX_BIND_SSBO: return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    case GFX_BIND_SAMPLER: return VK_DESCRIPTOR_TYPE_SAMPLER;
+    case GFX_BIND_SAMPLED_IMAGE: return VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    case GFX_BIND_COMBINED_IMAGE_SAMPLER: return VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    case GFX_BIND_STORAGE_IMAGE: return VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    case GFX_BIND_UNIFORM_TEXEL_BUFFER: return VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+    case GFX_BIND_STORAGE_TEXEL_BUFFER: return VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+    case GFX_BIND_UBO:
+    default: return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    }
 }
 
 GfxReflectedPipeline *gfx_backend_reflected_pipeline_create(const uint8_t *vs, size_t vs_size,
@@ -1839,89 +1976,171 @@ GfxReflectedPipeline *gfx_backend_reflected_pipeline_create(const uint8_t *vs, s
     }
     if (!p) { pthread_mutex_unlock(&g_lock); return NULL; }
     p->format = fmt;
-    if (!vk_shader_module(vs, vs_size, "vkCreateShaderModule(reflected vs)", &p->vs) ||
-        !vk_shader_module(ps, ps_size, "vkCreateShaderModule(reflected ps)", &p->ps))
-        goto fail;
+    /* The pixel module is always in set 1.  Copy before patching so the
+     * caller's SPIR-V (including the built-in test shader arrays) is not
+     * modified; callers that already moved the set are unaffected. */
+    uint8_t *ps_copy = NULL;
+    if (ps && ps_size >= 20 && !(ps_size & 3)) {
+        ps_copy = malloc(ps_size);
+        if (!ps_copy) goto fail;
+        memcpy(ps_copy, ps, ps_size);
+        vk_spirv_move_set(ps_copy, ps_size, 0, 1);
+    }
+    int modules_ok = vk_shader_module(vs, vs_size, "vkCreateShaderModule(reflected vs)", &p->vs) &&
+                     ps_copy && vk_shader_module(ps_copy, ps_size, "vkCreateShaderModule(reflected ps)", &p->ps);
+    free(ps_copy);
+    if (!modules_ok) goto fail;
+    vk_log("reflected step: shader modules");
 
     const GfxBindingSpec *sets[2] = { vs_specs, ps_specs };
     uint32_t counts[2] = { nvs, nps };
-    VkDescriptorPoolSize pool[4] = {0};
-    uint32_t npool = 0;
     for (unsigned s = 0; s < 2; s++) {
-        if (counts[s] > 16) goto fail;
-        VkDescriptorSetLayoutBinding b[16];
+        p->nspec[s] = counts[s] < GFX_REFLECT_MAX_BINDINGS ? counts[s] : GFX_REFLECT_MAX_BINDINGS;
+        for (uint32_t i = 0; i < p->nspec[s]; i++) {
+            p->spec[s][i] = sets[s][i];
+            p->spec[s][i].set = s;
+            p->bind_buf[s][i] = -1;
+        }
+    }
+    VkDescriptorPoolSize pool[8] = {0};
+    uint32_t npool = 0;
+    VkDescriptorSetLayoutBinding b[GFX_REFLECT_MAX_BINDINGS];
+    for (unsigned s = 0; s < 2; s++) {
+        if (counts[s] > GFX_REFLECT_MAX_BINDINGS) goto fail;
         for (uint32_t i = 0; i < counts[s]; i++) {
-            VkDescriptorType dt = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            if (sets[s][i].kind == GFX_BIND_SSBO) dt = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            else if (sets[s][i].kind == GFX_BIND_TEXTURE) dt = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            else if (sets[s][i].kind == GFX_BIND_IMAGE) dt = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            VkDescriptorType dt = reflect_vk_type(sets[s][i].kind);
+            uint32_t count = sets[s][i].count;
+            if (sets[s][i].kind == GFX_BIND_UBO || sets[s][i].kind == GFX_BIND_SSBO)
+                count = 1;
+            else if (!count)
+                count = GFX_REFLECT_RUNTIME_ARRAY;   /* runtime array / bindless pool */
+            if (count > GFX_REFLECT_MAX_BINDINGS) goto fail;
             b[i] = (VkDescriptorSetLayoutBinding){ .binding = sets[s][i].binding,
-                .descriptorType = dt, .descriptorCount = sets[s][i].count ? sets[s][i].count : 1,
+                .descriptorType = dt, .descriptorCount = count,
                 .stageFlags = s == 0 ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT };
             int found = -1;
             for (uint32_t j = 0; j < npool; j++) if (pool[j].type == dt) found = (int)j;
-            if (found < 0) { pool[npool].type = dt; found = (int)npool++; }
-            pool[found].descriptorCount += b[i].descriptorCount;
+            if (found < 0) {
+                if (npool >= sizeof pool / sizeof pool[0]) goto fail;
+                pool[npool].type = dt; found = (int)npool++;
+            }
+            pool[found].descriptorCount += count;
         }
         VkDescriptorSetLayoutCreateInfo dlci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                                  .bindingCount = counts[s], .pBindings = b };
         if (!vk_ok(vkCreateDescriptorSetLayout(g.dev, &dlci, NULL, &p->dsl[s]), "vkCreateDescriptorSetLayout(reflected)")) goto fail;
+        vk_log("reflected step: set %u layout (%u bindings)", s, counts[s]);
     }
-    if (!npool) { pool[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; pool[0].descriptorCount = 0; npool = 1; }
     VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
                                         .maxSets = 2, .poolSizeCount = npool, .pPoolSizes = pool };
     if (!vk_ok(vkCreateDescriptorPool(g.dev, &dpci, NULL, &p->dpool), "vkCreateDescriptorPool(reflected)")) goto fail;
+    vk_log("reflected step: pool (%u sizes)", npool);
     for (unsigned s = 0; s < 2; s++) {
         VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                                              .descriptorPool = p->dpool, .descriptorSetCount = 1, .pSetLayouts = &p->dsl[s] };
         if (!vk_ok(vkAllocateDescriptorSets(g.dev, &dsai, &p->dset[s]), "vkAllocateDescriptorSets(reflected)")) goto fail;
     }
+    vk_log("reflected step: sets allocated");
 
-    VkWriteDescriptorSet writes[32];
-    uint32_t nw = 0;
-    VkDescriptorBufferInfo binfo[16];
-    VkDescriptorImageInfo iinfo[16][4];
+    VkWriteDescriptorSet writes[GFX_REFLECT_MAX_BINDINGS * 2];
+    VkDescriptorBufferInfo binfo[GFX_REFLECT_MAX_BINDINGS * 2];
+    VkDescriptorImageInfo *iinfo = calloc((size_t)2 * GFX_REFLECT_MAX_BINDINGS *
+                                          GFX_REFLECT_MAX_BINDINGS, sizeof *iinfo);
+    VkBufferView *texel_views = calloc((size_t)2 * GFX_REFLECT_MAX_BINDINGS *
+                                       GFX_REFLECT_MAX_BINDINGS, sizeof *texel_views);
+    if (!iinfo || !texel_views) { free(iinfo); free(texel_views); goto fail; }
+    uint32_t nw = 0, niinfo = 0, ntexel = 0;
+    static const uint8_t checker[16] = { 255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,255,255 };
+
     for (unsigned s = 0; s < 2; s++) {
         for (uint32_t i = 0; i < counts[s]; i++) {
-            uint32_t count = sets[s][i].count ? sets[s][i].count : 1;
-            if (count > 4) goto fail;
+            const GfxBindingSpec *spec = &sets[s][i];
+            uint32_t count = spec->count;
+            if (spec->kind == GFX_BIND_UBO || spec->kind == GFX_BIND_SSBO) count = 1;
+            else if (!count) count = GFX_REFLECT_RUNTIME_ARRAY;
+            if (!count || count > GFX_REFLECT_MAX_BINDINGS ||
+                nw >= sizeof writes / sizeof writes[0]) goto cleanup_fail;
             VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                       .dstSet = p->dset[s], .dstBinding = sets[s][i].binding,
-                                       .descriptorCount = count };
-            if (sets[s][i].kind == GFX_BIND_UBO || sets[s][i].kind == GFX_BIND_SSBO) {
-                if (p->nbuf >= 16) goto fail;
-                uint32_t sz = sets[s][i].kind == GFX_BIND_UBO ? 0x10000 : 0x1000;
-                if (!vk_make_buffer(sz, &p->buf[p->nbuf], &p->buf_mem[p->nbuf])) goto fail;
-                binfo[i] = (VkDescriptorBufferInfo){ .buffer = p->buf[p->nbuf], .offset = 0, .range = VK_WHOLE_SIZE };
-                w.descriptorType = sets[s][i].kind == GFX_BIND_UBO ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
-                                                                  : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                w.pBufferInfo = &binfo[i];
+                                       .dstSet = p->dset[s], .dstBinding = spec->binding,
+                                       .descriptorCount = count,
+                                       .descriptorType = reflect_vk_type(spec->kind) };
+            vk_log("reflected descriptor: set %u binding %u kind=%d count=%u", s, spec->binding,
+                   (int)spec->kind, count);
+
+            if (spec->kind == GFX_BIND_UBO || spec->kind == GFX_BIND_SSBO) {
+                if (p->nbuf >= GFX_REFLECT_MAX_BINDINGS) goto cleanup_fail;
+                uint32_t sz = spec->kind == GFX_BIND_UBO ? 0x10000 : 0x1000;
+                if (!vk_make_buffer(sz, &p->buf[p->nbuf], &p->buf_mem[p->nbuf])) goto cleanup_fail;
+                binfo[nw] = (VkDescriptorBufferInfo){ .buffer = p->buf[p->nbuf], .offset = 0,
+                                                      .range = VK_WHOLE_SIZE };
+                w.pBufferInfo = &binfo[nw];
+                p->bind_buf[s][i] = (int32_t)p->nbuf;
+                p->buf_size[p->nbuf] = sz;
                 p->nbuf++;
-            } else if (sets[s][i].kind == GFX_BIND_TEXTURE) {
-                static const uint8_t checker[16] = { 255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,255,255 };
+            } else if (spec->kind == GFX_BIND_SAMPLER) {
+                if (p->nsampler >= GFX_REFLECT_MAX_BINDINGS) goto cleanup_fail;
+                if (!vk_make_sampler(&p->sampler[p->nsampler])) goto cleanup_fail;
+                for (uint32_t k = 0; k < count; k++)
+                    iinfo[niinfo + k] = (VkDescriptorImageInfo){
+                        .sampler = p->sampler[p->nsampler], .imageView = VK_NULL_HANDLE,
+                        .imageLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+                w.pImageInfo = &iinfo[niinfo];
+                niinfo += count;
+                p->nsampler++;
+            } else if (spec->kind == GFX_BIND_SAMPLED_IMAGE ||
+                       spec->kind == GFX_BIND_COMBINED_IMAGE_SAMPLER) {
+                if (p->ntex >= GFX_REFLECT_MAX_BINDINGS) goto cleanup_fail;
                 GfxTexture *tex = texture_create_rgba8_locked(2, 2, checker);
-                if (!tex) goto fail;
+                if (!tex) goto cleanup_fail;
                 p->tex[p->ntex++] = tex;
                 for (uint32_t k = 0; k < count; k++)
-                    iinfo[i][k] = (VkDescriptorImageInfo){ .sampler = tex->sampler, .imageView = tex->view,
-                                                           .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-                w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                w.pImageInfo = iinfo[i];
-            } else {
-                if (p->nimg >= 16) goto fail;
-                if (!vk_make_storage_image(2, 2, &p->img[p->nimg], &p->img_mem[p->nimg], &p->img_view[p->nimg])) goto fail;
+                    iinfo[niinfo + k] = (VkDescriptorImageInfo){
+                        .sampler = spec->kind == GFX_BIND_COMBINED_IMAGE_SAMPLER ? tex->sampler : VK_NULL_HANDLE,
+                        .imageView = tex->view,
+                        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                w.pImageInfo = &iinfo[niinfo];
+                niinfo += count;
+            } else if (spec->kind == GFX_BIND_STORAGE_IMAGE) {
+                if (p->nimg >= GFX_REFLECT_MAX_BINDINGS) goto cleanup_fail;
+                VkFormat f = (VkFormat)gfx_backend_vk_format_for_texture_format(spec->nvn_format);
+                if (!vk_make_storage_image(2, 2, f, &p->img[p->nimg], &p->img_mem[p->nimg],
+                                           &p->img_view[p->nimg])) goto cleanup_fail;
                 for (uint32_t k = 0; k < count; k++)
-                    iinfo[i][k] = (VkDescriptorImageInfo){ .sampler = VK_NULL_HANDLE,
-                                                           .imageView = p->img_view[p->nimg],
-                                                           .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
-                w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-                w.pImageInfo = iinfo[i];
+                    iinfo[niinfo + k] = (VkDescriptorImageInfo){
+                        .sampler = VK_NULL_HANDLE, .imageView = p->img_view[p->nimg],
+                        .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+                w.pImageInfo = &iinfo[niinfo];
+                niinfo += count;
                 p->nimg++;
+            } else { /* UNIFORM_TEXEL_BUFFER / STORAGE_TEXEL_BUFFER */
+                if (p->nbuf >= GFX_REFLECT_MAX_BINDINGS ||
+                    p->nbuf_view >= GFX_REFLECT_MAX_BINDINGS) goto cleanup_fail;
+                int storage = spec->kind == GFX_BIND_STORAGE_TEXEL_BUFFER;
+                VkFormat f = vk_reflect_texel_format(spec, storage);
+                if (!vk_make_buffer_view(4096, storage, f, &p->buf[p->nbuf],
+                                         &p->buf_mem[p->nbuf], &p->buf_view[p->nbuf_view]))
+                    goto cleanup_fail;
+                for (uint32_t k = 0; k < count; k++) texel_views[ntexel + k] = p->buf_view[p->nbuf_view];
+                w.pTexelBufferView = &texel_views[ntexel];
+                ntexel += count;
+                p->nbuf++;
+                p->nbuf_view++;
             }
             writes[nw++] = w;
         }
     }
+    vk_log("reflected step: descriptors written (%u)", nw);
     if (nw) vkUpdateDescriptorSets(g.dev, nw, writes, 0, NULL);
+    free(iinfo);
+    free(texel_views);
+    goto descriptors_done;
+
+cleanup_fail:
+    free(iinfo);
+    free(texel_views);
+    goto fail;
+
+descriptors_done:;
 
     VkAttachmentDescription att = { .format = fmt, .samples = VK_SAMPLE_COUNT_1_BIT,
         .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
@@ -1942,6 +2161,7 @@ GfxReflectedPipeline *gfx_backend_reflected_pipeline_create(const uint8_t *vs, s
     VkPipelineLayoutCreateInfo lci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                        .setLayoutCount = 2, .pSetLayouts = layouts };
     if (!vk_ok(vkCreatePipelineLayout(g.dev, &lci, NULL, &p->layout), "vkCreatePipelineLayout(reflected)")) goto fail;
+    vk_log("reflected step: pipeline layout");
     VkPipelineShaderStageCreateInfo stages[2] = {
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
           .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = p->vs, .pName = "main" },
@@ -1968,8 +2188,10 @@ GfxReflectedPipeline *gfx_backend_reflected_pipeline_create(const uint8_t *vs, s
         .stageCount = 2, .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
         .pViewportState = &vp, .pRasterizationState = &rast, .pMultisampleState = &ms,
         .pColorBlendState = &cb, .pDynamicState = &ds, .layout = p->layout, .renderPass = p->pass };
+    vk_log("reflected step: vkCreateGraphicsPipelines begin");
     if (!vk_ok(vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &gpci, NULL, &p->pipe),
                "vkCreateGraphicsPipelines(reflected)")) goto fail;
+    vk_log("reflected step: vkCreateGraphicsPipelines end");
     pthread_mutex_unlock(&g_lock);
     vk_log("reflected pipeline ready vs=%u ps=%u bindings format=%s", nvs, nps, vk_format_name(fmt));
     return p;
@@ -1988,6 +2210,10 @@ void gfx_backend_reflected_pipeline_destroy(GfxReflectedPipeline *p) {
             if (p->img[i]) vkDestroyImage(g.dev, p->img[i], NULL);
             if (p->img_mem[i]) vkFreeMemory(g.dev, p->img_mem[i], NULL);
         }
+        for (unsigned i = 0; i < p->nbuf_view; i++)
+            if (p->buf_view[i]) vkDestroyBufferView(g.dev, p->buf_view[i], NULL);
+        for (unsigned i = 0; i < p->nsampler; i++)
+            if (p->sampler[i]) vkDestroySampler(g.dev, p->sampler[i], NULL);
         for (unsigned i = 0; i < p->nbuf; i++) {
             if (p->buf[i]) vkDestroyBuffer(g.dev, p->buf[i], NULL);
             if (p->buf_mem[i]) vkFreeMemory(g.dev, p->buf_mem[i], NULL);
@@ -2003,6 +2229,150 @@ void gfx_backend_reflected_pipeline_destroy(GfxReflectedPipeline *p) {
         if (p->ps) vkDestroyShaderModule(g.dev, p->ps, NULL);
     }
     free(p);
+}
+
+static int reflect_find_spec(GfxReflectedPipeline *p, uint32_t set, uint32_t binding) {
+    if (!p || set > 1) return -1;
+    for (uint32_t i = 0; i < p->nspec[set]; i++)
+        if (p->spec[set][i].binding == binding) return (int)i;
+    return -1;
+}
+
+int gfx_backend_reflected_bind_texture(GfxReflectedPipeline *p, uint32_t set,
+                                       uint32_t binding, const GfxTexture *texture) {
+    if (!p || !texture) return 0;
+    pthread_mutex_lock(&g_lock);
+    if (!g.ready) { pthread_mutex_unlock(&g_lock); return 0; }
+    int i = reflect_find_spec(p, set, binding);
+    if (i < 0) { pthread_mutex_unlock(&g_lock); return 0; }
+    const GfxBindingSpec *spec = &p->spec[set][i];
+    if (spec->kind != GFX_BIND_COMBINED_IMAGE_SAMPLER &&
+        spec->kind != GFX_BIND_SAMPLED_IMAGE) {
+        pthread_mutex_unlock(&g_lock); return 0;
+    }
+    uint32_t count = spec->count ? spec->count : GFX_REFLECT_RUNTIME_ARRAY;
+    VkDescriptorImageInfo *ii = calloc(count, sizeof *ii);
+    if (!ii) { pthread_mutex_unlock(&g_lock); return 0; }
+    for (uint32_t k = 0; k < count; k++) {
+        ii[k] = (VkDescriptorImageInfo){
+            .sampler = spec->kind == GFX_BIND_COMBINED_IMAGE_SAMPLER ? texture->sampler : VK_NULL_HANDLE,
+            .imageView = texture->view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+    }
+    VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = p->dset[set], .dstBinding = binding, .descriptorCount = count,
+        .descriptorType = spec->kind == GFX_BIND_COMBINED_IMAGE_SAMPLER
+                              ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                              : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+        .pImageInfo = ii };
+    vkUpdateDescriptorSets(g.dev, 1, &w, 0, NULL);
+    free(ii);
+    pthread_mutex_unlock(&g_lock);
+    vk_log("reflected bind texture set=%u binding=%u texture=%p", set, binding, (const void *)texture);
+    return 1;
+}
+
+static int reflect_write_buffer(GfxReflectedPipeline *p, uint32_t set, uint32_t binding,
+                                uint32_t offset, const void *data, size_t size, int storage) {
+    if (!p || !data || !size) return 0;
+    pthread_mutex_lock(&g_lock);
+    if (!g.ready) { pthread_mutex_unlock(&g_lock); return 0; }
+    int i = reflect_find_spec(p, set, binding);
+    if (i < 0) { pthread_mutex_unlock(&g_lock); return 0; }
+    const GfxBindingSpec *spec = &p->spec[set][i];
+    if ((storage && spec->kind != GFX_BIND_SSBO) ||
+        (!storage && spec->kind != GFX_BIND_UBO)) {
+        pthread_mutex_unlock(&g_lock); return 0;
+    }
+    int32_t idx = p->bind_buf[set][i];
+    if (idx < 0 || (uint64_t)offset + size > p->buf_size[idx]) {
+        pthread_mutex_unlock(&g_lock); return 0;
+    }
+    void *mapped = NULL;
+    if (!vk_ok(vkMapMemory(g.dev, p->buf_mem[idx], offset, size, 0, &mapped),
+               "vkMapMemory(reflected write)")) {
+        pthread_mutex_unlock(&g_lock); return 0;
+    }
+    memcpy(mapped, data, size);
+    vkUnmapMemory(g.dev, p->buf_mem[idx]);
+    pthread_mutex_unlock(&g_lock);
+    return 1;
+}
+
+int gfx_backend_reflected_write_uniform(GfxReflectedPipeline *p, uint32_t set,
+                                        uint32_t binding, uint32_t offset,
+                                        const void *data, size_t size) {
+    return reflect_write_buffer(p, set, binding, offset, data, size, 0);
+}
+
+int gfx_backend_reflected_write_storage(GfxReflectedPipeline *p, uint32_t set,
+                                        uint32_t binding, uint32_t offset,
+                                        const void *data, size_t size) {
+    return reflect_write_buffer(p, set, binding, offset, data, size, 1);
+}
+
+GfxReflectedPipeline *gfx_backend_reflected_builtin_texture_pipeline_create(void) {
+    GfxBindingSpec ps = {
+        .set = 1, .binding = 0, .kind = GFX_BIND_COMBINED_IMAGE_SAMPLER, .count = 1,
+    };
+    return gfx_backend_reflected_pipeline_create(
+        (const uint8_t *)triangle_tex_vert_spv, triangle_tex_vert_spv_size,
+        (const uint8_t *)triangle_tex_frag_spv, triangle_tex_frag_spv_size,
+        gfx_backend_vk_format_for_nvn(0x25), NULL, 0, &ps, 1);
+}
+
+int gfx_backend_reflected_texture_selftest(void) {
+    static const uint8_t checker[16] = {
+        255, 0, 0, 255,   0, 255, 0, 255,
+        0, 0, 255, 255,   255, 255, 255, 255,
+    };
+    GfxOffscreenTarget *t = gfx_backend_offscreen_create(1280, 720, 0x25);
+    GfxTexture *tex = gfx_backend_texture_create_rgba8(2, 2, checker);
+    GfxReflectedPipeline *p = t && tex ? gfx_backend_reflected_builtin_texture_pipeline_create() : NULL;
+    int ok = 0;
+    if (p && gfx_backend_reflected_bind_texture(p, 1, 0, tex)) {
+        for (int i = 0; i < 10; i++)
+            if (!gfx_backend_reflected_draw(p, t, 0.05f, 0.08f, 0.12f, 1.0f)) break;
+        uint8_t center[4] = {0}, corner[4] = {0};
+        gfx_backend_offscreen_read_pixel(t, 640, 360, center);
+        gfx_backend_offscreen_read_pixel(t, 0, 0, corner);
+        ok = center[0] > 80 && center[0] < 180 &&
+             center[1] > 80 && center[1] < 180 &&
+             center[2] > 80 && center[2] < 180 && corner[0] < 40;
+        vk_log("reflected texture selftest center=%02x%02x%02x%02x corner=%02x%02x%02x%02x",
+               center[0], center[1], center[2], center[3],
+               corner[0], corner[1], corner[2], corner[3]);
+    }
+    if (p) gfx_backend_reflected_pipeline_destroy(p);
+    if (tex) gfx_backend_texture_destroy(tex);
+    if (t) gfx_backend_offscreen_destroy(t);
+    return ok;
+}
+
+int gfx_backend_reflected_ubo_selftest(void) {
+    GfxBindingSpec ps = {
+        .set = 1, .binding = 0, .kind = GFX_BIND_UBO, .count = 1,
+    };
+    GfxOffscreenTarget *t = gfx_backend_offscreen_create(1280, 720, 0x25);
+    GfxReflectedPipeline *p = t ? gfx_backend_reflected_pipeline_create(
+        (const uint8_t *)triangle_vert_spv, triangle_vert_spv_size,
+        (const uint8_t *)reflect_ubo_frag_spv, reflect_ubo_frag_spv_size,
+        gfx_backend_vk_format_for_nvn(0x25), NULL, 0, &ps, 1) : NULL;
+    float color[4] = { 0.25f, 0.5f, 0.75f, 1.0f };
+    int ok = 0;
+    if (p && gfx_backend_reflected_write_uniform(p, 1, 0, 0, color, sizeof color)) {
+        for (int i = 0; i < 10; i++)
+            if (!gfx_backend_reflected_draw(p, t, 0.05f, 0.08f, 0.12f, 1.0f)) break;
+        uint8_t center[4] = {0};
+        gfx_backend_offscreen_read_pixel(t, 640, 360, center);
+        ok = center[0] == 0x40 && center[1] == 0x80 && center[2] == 0xbf && center[3] == 0xff;
+        vk_log("reflected ubo selftest center=%02x%02x%02x%02x", center[0], center[1],
+               center[2], center[3]);
+    }
+    if (p) gfx_backend_reflected_pipeline_destroy(p);
+    if (t) gfx_backend_offscreen_destroy(t);
+    return ok;
 }
 
 int gfx_backend_reflected_draw(GfxReflectedPipeline *p, GfxOffscreenTarget *t,

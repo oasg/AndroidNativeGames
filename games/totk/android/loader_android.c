@@ -1071,70 +1071,475 @@ static unsigned reflect_cbufs(const char *path, uint32_t *out, unsigned max) {
         }
         p = close + 1;
     }
-    for (const char *key = "\"sbufs\""; *key; ) {
-        const char *q = strstr(text, key);
-        if (!q) break;
-        const char *a = strchr(q, '[');
-        const char *b = a ? strchr(a, ']') : NULL;
-        if (a && b && b > a + 1)
-            fprintf(stderr, "[totk-vk] reflection %s has sbufs; descriptor mapping for them is next\n", path);
-        break;
-    }
     free(text);
     return n;
 }
 
 
-static unsigned reflect_section(const char *path, const char *section, GfxBindingKind kind,
-                                GfxBindingSpec *out, unsigned max) {
-    if (!path || !*path || !out || !max) return 0;
-    char *text = read_text_file(path, NULL);
-    if (!text) { fprintf(stderr, "[totk-vk] ERROR read reflection %s\n", path); return 0; }
+/* The generated .res.json is trusted, flat JSON: arrays of small objects with
+ * no nested objects.  These helpers locate one member without pulling a JSON
+ * dependency into the CLI; bounds are always the current object's close brace. */
+static const char *json_member(const char *obj, const char *end, const char *key) {
+    size_t klen = strlen(key);
+    const char *p = obj;
+    while (p < end) {
+        p = memchr(p, '"', (size_t)(end - p));
+        if (!p) return NULL;
+        const char *q = memchr(p + 1, '"', (size_t)(end - p - 1));
+        if (!q) return NULL;
+        if ((size_t)(q - p - 1) == klen && !memcmp(p + 1, key, klen)) {
+            const char *c = q + 1;
+            while (c < end && (*c == ':' || *c == ' ' || *c == '\t' || *c == '\r' || *c == '\n')) c++;
+            return c < end ? c : NULL;
+        }
+        p = q + 1;
+    }
+    return NULL;
+}
+
+static long json_long(const char *obj, const char *end, const char *key, long dflt) {
+    const char *p = json_member(obj, end, key);
+    if (!p) return dflt;
+    char *e = NULL;
+    long v = strtol(p, &e, 10);
+    return e == p ? dflt : v;
+}
+
+static int json_bool(const char *obj, const char *end, const char *key, int dflt) {
+    const char *p = json_member(obj, end, key);
+    if (!p) return dflt;
+    if ((size_t)(end - p) >= 4 && !memcmp(p, "true", 4)) return 1;
+    if ((size_t)(end - p) >= 5 && !memcmp(p, "false", 5)) return 0;
+    return dflt;
+}
+
+static void json_string(const char *obj, const char *end, const char *key,
+                        char *out, size_t out_size) {
+    if (out && out_size) out[0] = 0;
+    const char *p = json_member(obj, end, key);
+    if (!p || p >= end || *p != '"') return;
+    p++;
+    const char *q = memchr(p, '"', (size_t)(end - p));
+    if (!q) return;
+    size_t n = (size_t)(q - p);
+    if (n >= out_size) n = out_size - 1;
+    memcpy(out, p, n);
+    out[n] = 0;
+}
+
+/* Ryujinx.Graphics.Shader.TextureFormat, in declaration order. */
+static uint32_t reflect_texture_format(const char *name) {
+    static const char *const names[] = {
+        "Unknown", "R8Unorm", "R8Snorm", "R8Uint", "R8Sint",
+        "R16Float", "R16Unorm", "R16Snorm", "R16Uint", "R16Sint",
+        "R32Float", "R32Uint", "R32Sint",
+        "R8G8Unorm", "R8G8Snorm", "R8G8Uint", "R8G8Sint",
+        "R16G16Float", "R16G16Unorm", "R16G16Snorm", "R16G16Uint", "R16G16Sint",
+        "R32G32Float", "R32G32Uint", "R32G32Sint",
+        "R8G8B8A8Unorm", "R8G8B8A8Snorm", "R8G8B8A8Uint", "R8G8B8A8Sint",
+        "R16G16B16A16Float", "R16G16B16A16Unorm", "R16G16B16A16Snorm",
+        "R16G16B16A16Uint", "R16G16B16A16Sint",
+        "R32G32B32A32Float", "R32G32B32A32Uint", "R32G32B32A32Sint",
+        "R10G10B10A2Unorm", "R10G10B10A2Uint", "R11G11B10Float",
+    };
+    for (uint32_t i = 0; i < sizeof names / sizeof names[0]; i++)
+        if (!strcmp(name, names[i])) return i;
+    return 0;
+}
+
+static GfxBindingKind reflect_json_kind(const char *section, long type, int separate) {
+    if (!strcmp(section, "cbufs")) return GFX_BIND_UBO;
+    if (!strcmp(section, "sbufs")) return GFX_BIND_SSBO;
+    if (!strcmp(section, "images"))
+        return (type & 0xff) == 2 ? GFX_BIND_STORAGE_TEXEL_BUFFER : GFX_BIND_STORAGE_IMAGE;
+    if (type == 0) return GFX_BIND_SAMPLER;
+    if ((type & 0xff) == 2) return GFX_BIND_UNIFORM_TEXEL_BUFFER;
+    return separate ? GFX_BIND_SAMPLED_IMAGE : GFX_BIND_COMBINED_IMAGE_SAMPLER;
+}
+
+static unsigned reflect_json_section(const char *text, const char *section,
+                                     GfxBindingSpec *out, unsigned max) {
     char key[64]; snprintf(key, sizeof key, "\"%s\"", section);
     const char *p = strstr(text, key);
-    if (!p) { free(text); return 0; }
+    if (!p) return 0;
     p = strchr(p, '[');
+    if (!p) return 0;
+    const char *end_arr = strchr(p, ']');
+    if (!end_arr) return 0;
     unsigned n = 0;
-    while (p && n < max) {
+    while (p < end_arr && n < max) {
         const char *obj = strchr(p, '{');
-        const char *end = strchr(p, ']');
-        if (!obj || (end && obj > end)) break;
+        if (!obj || obj > end_arr) break;
         const char *close = strchr(obj, '}');
-        if (!close) break;
-        const char *b = strstr(obj, "\"binding\"");
-        if (b && b < close) {
-            b += strlen("\"binding\"");
-            while (*b && (*b == ' ' || *b == ':' || *b == '\t')) b++;
-            uint32_t binding = (uint32_t)strtoul(b, NULL, 10);
-            uint32_t count = 1;
-            const char *a = strstr(obj, "\"array\"");
-            if (a && a < close) {
-                a += strlen("\"array\"");
-                while (*a && (*a == ' ' || *a == ':' || *a == '\t')) a++;
-                uint32_t v = (uint32_t)strtoul(a, NULL, 10);
-                if (v) count = v;
+        if (!close || close > end_arr) break;
+
+        long lb = json_long(obj, close, "binding", -1);
+        if (lb >= 0) {
+            GfxBindingSpec s; memset(&s, 0, sizeof s);
+            s.binding = (uint32_t)lb;
+            long type = json_long(obj, close, "type", 0);
+            s.separate = json_bool(obj, close, "separate", 0);
+            s.kind = reflect_json_kind(section, type, s.separate);
+            s.count = 1;
+            long array = json_long(obj, close, "array", 1);
+            if (!strcmp(section, "textures") || !strcmp(section, "images"))
+                s.count = array > 0 ? (uint32_t)array : 0;
+            s.nvn_slot = (int32_t)json_long(obj, close, "slot", -1);
+            s.nvn_cbuf_slot = (int32_t)json_long(obj, close, "cbuf_slot",
+                                                json_long(obj, close, "cb_slot", -1));
+            s.nvn_cb_offset = (int32_t)json_long(obj, close, "cb_offset", 0);
+            s.nvn_handle = (uint32_t)json_long(obj, close, "handle", 0);
+            s.nvn_type = (uint32_t)type;
+            s.nvn_flags = (uint32_t)json_long(obj, close, "flags", 0);
+            char fmt[48]; json_string(obj, close, "format", fmt, sizeof fmt);
+            s.nvn_format = reflect_texture_format(fmt);
+            /* The translated immediate is the texture slot in the default c2
+             * table (cbuf_slot < 0), or the encoded table offset when the
+             * translator named c2 explicitly.  Keep both forms. */
+            if ((!strcmp(section, "textures") || !strcmp(section, "images")) &&
+                s.nvn_slot < 0 && s.nvn_handle && (s.nvn_cbuf_slot < 0 || s.nvn_cbuf_slot == 2)) {
+                uint32_t off0 = s.nvn_handle & 0x3fffu;
+                uint32_t bytes = off0 * 4u;
+                if (bytes >= 0x168u && bytes < 0x568u) s.nvn_slot = (int32_t)((bytes - 0x168u) / 8u);
+                else if (off0 < 128u) s.nvn_slot = (int32_t)off0;
             }
+
             int dup = 0;
             for (unsigned i = 0; i < n; i++)
-                if (out[i].binding == binding) { dup = 1; break; }
-            if (!dup) out[n++] = (GfxBindingSpec){ binding, kind, count };
+                if (out[i].binding == s.binding) { dup = 1; break; }
+            if (!dup) out[n++] = s;
         }
         p = close + 1;
     }
+    return n;
+}
+
+static unsigned reflect_json_file(const char *path, GfxBindingSpec *out, unsigned max) {
+    if (!path || !*path || !out || !max) return 0;
+    char *text = read_text_file(path, NULL);
+    if (!text) { fprintf(stderr, "[totk-vk] ERROR read reflection %s\n", path); return 0; }
+    unsigned n = 0;
+    n += reflect_json_section(text, "cbufs", out + n, max - n);
+    n += reflect_json_section(text, "sbufs", out + n, max - n);
+    n += reflect_json_section(text, "textures", out + n, max - n);
+    n += reflect_json_section(text, "images", out + n, max - n);
     free(text);
     return n;
 }
 
-static unsigned reflect_file(const char *path, GfxBindingSpec *out, unsigned max) {
+/* ------------------------------------------------------------------------- */
+/* SPIR-V descriptor signature                                               */
+
+typedef struct {
+    uint32_t kind;        /* 0 none, 1 image, 2 sampler, 3 sampled image, 4 array,
+                           * 5 runtime array, 6 struct, 7 pointer */
+    uint32_t elem;
+    uint32_t length;
+    uint32_t dim, depth, arrayed, ms, sampled, format;
+    uint32_t storage, block;
+} ReflectSpvType;
+
+typedef struct { uint32_t id, ptr, storage; } ReflectSpvVar;
+
+#define REFLECT_SPV_MAX_BOUND (1u << 20)
+
+static int reflect_spirv_file(const char *path, uint32_t target_set,
+                              GfxBindingSpec *out, unsigned max) {
+    if (!path || !*path || !out || !max) return 0;
+    size_t size = 0;
+    uint8_t *raw = (uint8_t *)read_text_file(path, &size);
+    if (!raw) { fprintf(stderr, "[totk-vk] ERROR read SPIR-V %s\n", path); return 0; }
+    int ok = 0;
+    if (size < 20 || (size & 3) || memcmp(raw, "\x03\x02\x23\x07", 4)) {
+        fprintf(stderr, "[totk-vk] ERROR bad SPIR-V %s\n", path);
+        free(raw);
+        return 0;
+    }
+    uint32_t *w = (uint32_t *)raw;
+    uint32_t bound = w[3];
+    if (!bound || bound > REFLECT_SPV_MAX_BOUND) { free(raw); return 0; }
+
+    ReflectSpvType *types = calloc(bound, sizeof *types);
+    ReflectSpvVar *vars = calloc(bound, sizeof *vars);
+    uint32_t *dset = malloc(bound * sizeof *dset);
+    uint32_t *dbind = malloc(bound * sizeof *dbind);
+    uint32_t *dblock = calloc(bound, sizeof *dblock);
+    uint32_t *consts = calloc(bound, sizeof *consts);
+    uint8_t *const_ok = calloc(bound, 1);
+    if (!types || !vars || !dset || !dbind || !dblock || !consts || !const_ok) goto done;
+    for (uint32_t i = 0; i < bound; i++) { dset[i] = UINT32_MAX; dbind[i] = UINT32_MAX; }
+    unsigned nvars = 0;
+
+    for (size_t i = 5; i < size / 4;) {
+        uint32_t op = w[i] & 0xffffu, wc = w[i] >> 16;
+        if (!wc || i + wc > size / 4) break;
+        const uint32_t *o = w + i + 1;
+        switch (op) {
+        case 25: /* OpTypeImage */
+            if (wc >= 9) {
+                uint32_t id = o[0];
+                if (id < bound) {
+                    types[id].kind = 1;
+                    types[id].dim = o[2]; types[id].depth = o[3];
+                    types[id].arrayed = o[4]; types[id].ms = o[5];
+                    types[id].sampled = o[6]; types[id].format = o[7];
+                }
+            }
+            break;
+        case 26: /* OpTypeSampler */
+            if (wc >= 2 && o[0] < bound) types[o[0]].kind = 2;
+            break;
+        case 27: /* OpTypeSampledImage */
+            if (wc >= 3 && o[0] < bound) { types[o[0]].kind = 3; types[o[0]].elem = o[1]; }
+            break;
+        case 28: /* OpTypeArray */
+            if (wc >= 4 && o[0] < bound) {
+                types[o[0]].kind = 4; types[o[0]].elem = o[1]; types[o[0]].length = o[2];
+            }
+            break;
+        case 29: /* OpTypeRuntimeArray */
+            if (wc >= 3 && o[0] < bound) { types[o[0]].kind = 5; types[o[0]].elem = o[1]; }
+            break;
+        case 30: /* OpTypeStruct */
+            if (wc >= 2 && o[0] < bound) types[o[0]].kind = 6;
+            break;
+        case 32: /* OpTypePointer */
+            if (wc >= 4 && o[0] < bound) {
+                types[o[0]].kind = 7; types[o[0]].storage = o[1]; types[o[0]].elem = o[2];
+            }
+            break;
+        case 43: /* OpConstant */
+        case 50: /* OpSpecConstant */
+            if (wc >= 4 && o[1] < bound) { consts[o[1]] = o[2]; const_ok[o[1]] = 1; }
+            break;
+        case 59: /* OpVariable */
+            if (wc >= 4 && nvars < bound) {
+                vars[nvars++] = (ReflectSpvVar){ o[1], o[0], o[2] };
+            }
+            break;
+        case 71: /* OpDecorate */
+            if (wc >= 4 && o[0] < bound) {
+                if (o[1] == 33) dbind[o[0]] = o[2];       /* Binding */
+                else if (o[1] == 34) dset[o[0]] = o[2];   /* DescriptorSet */
+                else if (o[1] == 2) dblock[o[0]] = 2;     /* Block */
+                else if (o[1] == 3) dblock[o[0]] = 3;     /* BufferBlock */
+            }
+            break;
+        default:
+            break;
+        }
+        i += wc;
+    }
+
     unsigned n = 0;
-    n += reflect_section(path, "cbufs", GFX_BIND_UBO, out + n, max - n);
-    n += reflect_section(path, "sbufs", GFX_BIND_SSBO, out + n, max - n);
-    n += reflect_section(path, "textures", GFX_BIND_TEXTURE, out + n, max - n);
-    n += reflect_section(path, "images", GFX_BIND_IMAGE, out + n, max - n);
+    for (unsigned v = 0; v < nvars && n < max; v++) {
+        uint32_t id = vars[v].id, ptr = vars[v].ptr;
+        if (id >= bound || ptr >= bound || dset[id] == UINT32_MAX || dbind[id] == UINT32_MAX)
+            continue;
+        if (types[ptr].kind != 7) continue;
+        uint32_t t = types[ptr].elem;
+        uint32_t count = 1;
+        for (unsigned guard = 0; guard < 8 && t < bound; guard++) {
+            uint32_t k = types[t].kind;
+            if (k == 4) {
+                uint32_t len = types[t].length < bound && const_ok[types[t].length]
+                                   ? consts[types[t].length] : 0;
+                count = len;
+                t = types[t].elem;
+            } else if (k == 5) {
+                count = 0;
+                t = types[t].elem;
+            } else break;
+        }
+        if (t >= bound) continue;
+        GfxBindingSpec s; memset(&s, 0, sizeof s);
+        s.set = target_set;
+        s.binding = dbind[id];
+        s.count = count;   /* 0 = runtime array; the backend uses the pool size */
+        uint32_t k = types[t].kind;
+        if (k == 3) { /* sampled image: Buffer dimension is a texel buffer */
+            uint32_t img = types[t].elem;
+            s.kind = (img < bound && types[img].kind == 1 && types[img].dim == 5)
+                         ? GFX_BIND_UNIFORM_TEXEL_BUFFER
+                         : GFX_BIND_COMBINED_IMAGE_SAMPLER;
+        } else if (k == 2) {
+            s.kind = GFX_BIND_SAMPLER;
+        } else if (k == 1) {
+            int buffer = types[t].dim == 5;
+            int storage = types[t].sampled == 2 || (types[t].sampled != 1 && types[t].format != 0);
+            s.kind = buffer ? (storage ? GFX_BIND_STORAGE_TEXEL_BUFFER : GFX_BIND_UNIFORM_TEXEL_BUFFER)
+                            : (storage ? GFX_BIND_STORAGE_IMAGE : GFX_BIND_SAMPLED_IMAGE);
+        } else if (k == 6) {
+            /* SPIR-V 1.3 uses StorageBuffer (12) for SSBOs; older frontends use
+             * Uniform (2) plus the legacy BufferBlock decoration. */
+            s.kind = (types[ptr].storage == 12 || dblock[t] == 3) ? GFX_BIND_SSBO : GFX_BIND_UBO;
+        } else {
+            /* Uniform variables point at a struct; if the type was not seen,
+             * storage class 2 is still a uniform block. */
+            s.kind = GFX_BIND_UBO;
+        }
+        int dup = 0;
+        for (unsigned i = 0; i < n; i++)
+            if (out[i].binding == s.binding) { dup = 1; break; }
+        if (!dup) out[n++] = s;
+    }
+    ok = (int)n;
+
+done:
+    free(types); free(vars); free(dset); free(dbind); free(dblock);
+    free(consts); free(const_ok); free(raw);
+    return ok;
+}
+
+/* User-defined interface locations.  A fragment input with no matching vertex
+ * output is not a valid pipeline test: some Adreno driver versions fail (or
+ * appear to hang) inside vkCreateGraphicsPipelines before reporting an error. */
+static int spirv_interface_locations(const char *path, int fragment,
+                                     uint32_t *out, unsigned max) {
+    if (!path || !*path || !out || !max) return 0;
+    size_t size = 0;
+    uint8_t *raw = (uint8_t *)read_text_file(path, &size);
+    if (!raw) return 0;
+    if (size < 20 || (size & 3) || memcmp(raw, "\x03\x02\x23\x07", 4)) { free(raw); return 0; }
+    uint32_t *w = (uint32_t *)raw, bound = w[3];
+    if (!bound || bound > REFLECT_SPV_MAX_BOUND) { free(raw); return 0; }
+    uint32_t *ptr_of = calloc(bound, sizeof *ptr_of);
+    uint32_t *storage = calloc(bound, sizeof *storage);
+    int32_t *location = malloc(bound * sizeof *location);
+    uint8_t *builtin = calloc(bound, 1);
+    uint32_t *entry_vars = calloc(bound, sizeof *entry_vars);
+    if (!ptr_of || !storage || !location || !builtin || !entry_vars) {
+        free(ptr_of); free(storage); free(location); free(builtin); free(entry_vars); free(raw);
+        return 0;
+    }
+    for (uint32_t i = 0; i < bound; i++) location[i] = -1;
+    unsigned nentry = 0, n = 0;
+
+    for (size_t i = 5; i < size / 4;) {
+        uint32_t op = w[i] & 0xffffu, wc = w[i] >> 16;
+        if (!wc || i + wc > size / 4) break;
+        const uint32_t *o = w + i + 1;
+        if (op == 32 && wc >= 4 && o[0] < bound) {          /* OpTypePointer */
+            storage[o[0]] = o[1];
+        } else if (op == 59 && wc >= 4 && o[1] < bound) {   /* OpVariable */
+            ptr_of[o[1]] = o[0];
+        } else if (op == 71 && wc >= 4 && o[0] < bound) {   /* OpDecorate */
+            if (o[1] == 30) location[o[0]] = (int32_t)o[2]; /* Location */
+            else if (o[1] == 11) builtin[o[0]] = 1;         /* BuiltIn */
+        } else if (op == 15 && wc >= 4) {                   /* OpEntryPoint */
+            uint32_t model = o[0];
+            if ((fragment && model != 4) || (!fragment && model != 0)) { i += wc; continue; }
+            unsigned k = 2;  /* entry point name, null-terminated and padded */
+            while (k < wc - 1) {
+                uint32_t v = o[k++];
+                if ((v & 0xff) == 0 || (v & 0xff00) == 0 ||
+                    (v & 0xff0000) == 0 || (v & 0xff000000) == 0) break;
+            }
+            for (; k < wc - 1 && nentry < bound; k++) entry_vars[nentry++] = o[k];
+        }
+        i += wc;
+    }
+
+    for (unsigned i = 0; i < nentry && n < max; i++) {
+        uint32_t id = entry_vars[i];
+        if (id >= bound || builtin[id] || location[id] < 0) continue;
+        uint32_t ptr = ptr_of[id];
+        uint32_t want = fragment ? 1 : 3;   /* Input / Output */
+        if (ptr >= bound || storage[ptr] != want) continue;
+        int dup = 0;
+        for (unsigned j = 0; j < n; j++) if (out[j] == (uint32_t)location[id]) dup = 1;
+        if (!dup) out[n++] = (uint32_t)location[id];
+    }
+    free(ptr_of); free(storage); free(location); free(builtin); free(entry_vars); free(raw);
+    return (int)n;
+}
+
+static int reflect_check_interface(const char *vs_path, const char *ps_path) {
+    uint32_t vs_out[64], ps_in[64];
+    int nvs = spirv_interface_locations(vs_path, 0, vs_out, 64);
+    int nps = spirv_interface_locations(ps_path, 1, ps_in, 64);
+    int bad = 0;
+    for (int i = 0; i < nps; i++) {
+        int found = 0;
+        for (int j = 0; j < nvs; j++) if (vs_out[j] == ps_in[i]) found = 1;
+        if (!found) {
+            fprintf(stderr, "[totk-vk] ERROR PS input location %u has no VS output "
+                            "(pipeline interface mismatch; use a matching VS/PS pair)\n", ps_in[i]);
+            bad = 1;
+        }
+    }
+    return bad ? 0 : 1;
+}
+
+/* SPIR-V owns the descriptor type and array length; .res.json only supplies
+ * the NVN source metadata (slot/handle/format/flags). */
+static unsigned reflect_merge(GfxBindingSpec *out, unsigned max,
+                              const GfxBindingSpec *json, unsigned njson,
+                              const GfxBindingSpec *spv, unsigned nspv) {
+    unsigned n = 0;
+    for (unsigned i = 0; i < nspv && n < max; i++) {
+        GfxBindingSpec s = spv[i];
+        for (unsigned j = 0; j < njson; j++) {
+            if (json[j].binding != s.binding) continue;
+            s.nvn_slot = json[j].nvn_slot;
+            s.nvn_cbuf_slot = json[j].nvn_cbuf_slot;
+            s.nvn_cb_offset = json[j].nvn_cb_offset;
+            s.nvn_handle = json[j].nvn_handle;
+            s.nvn_type = json[j].nvn_type;
+            s.nvn_format = json[j].nvn_format;
+            s.nvn_flags = json[j].nvn_flags;
+            s.separate = json[j].separate;
+            break;
+        }
+        out[n++] = s;
+    }
     return n;
 }
 
-static int spirv_move_set(uint8_t *code, size_t size, uint32_t from, uint32_t to) {
+unsigned gfx_reflect_full(const char *json_path, const char *spv_path, uint32_t target_set,
+                          GfxBindingSpec *out, unsigned max) {
+    GfxBindingSpec json[64], spv[64];
+    unsigned njson = reflect_json_file(json_path, json, 64);
+    unsigned nspv = reflect_spirv_file(spv_path, target_set, spv, 64);
+    if (!nspv) {
+        for (unsigned i = 0; i < njson && i < max; i++) { json[i].set = target_set; out[i] = json[i]; }
+        return njson < max ? njson : max;
+    }
+    return reflect_merge(out, max, json, njson, spv, nspv);
+}
+
+static const char *reflect_kind_name(GfxBindingKind k) {
+    switch (k) {
+    case GFX_BIND_UBO: return "ubo";
+    case GFX_BIND_SSBO: return "ssbo";
+    case GFX_BIND_SAMPLER: return "sampler";
+    case GFX_BIND_SAMPLED_IMAGE: return "sampled-image";
+    case GFX_BIND_COMBINED_IMAGE_SAMPLER: return "combined-sampler";
+    case GFX_BIND_STORAGE_IMAGE: return "storage-image";
+    case GFX_BIND_UNIFORM_TEXEL_BUFFER: return "uniform-texel-buffer";
+    case GFX_BIND_STORAGE_TEXEL_BUFFER: return "storage-texel-buffer";
+    default: return "?";
+    }
+}
+
+static int reflect_has_non_ubo(const char *path) {
+    GfxBindingSpec s[64];
+    unsigned n = reflect_json_file(path, s, 64);
+    for (unsigned i = 0; i < n; i++)
+        if (s[i].kind != GFX_BIND_UBO) return 1;
+    return 0;
+}
+
+static void reflect_log(const char *stage, const GfxBindingSpec *s, unsigned n) {
+    for (unsigned i = 0; i < n; i++)
+        fprintf(stderr, "[totk-vk] reflect %s set=%u binding=%u kind=%s count=%u"
+                        " nvn(slot=%d cbuf=%d off=%d handle=%#x type=%#x fmt=%u flags=%#x separate=%d)\n",
+                stage, s[i].set, s[i].binding, reflect_kind_name(s[i].kind), s[i].count,
+                s[i].nvn_slot, s[i].nvn_cbuf_slot, s[i].nvn_cb_offset, s[i].nvn_handle,
+                s[i].nvn_type, s[i].nvn_format, s[i].nvn_flags, s[i].separate);
+}
+
+int gfx_spirv_move_set(uint8_t *code, size_t size, uint32_t from, uint32_t to) {
     if (!code || size < 20 || (size & 3)) return 0;
     uint32_t *w = (uint32_t *)code;
     for (size_t i = 5; i < size / 4; ) {
@@ -1269,15 +1674,19 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[totk-vk] ERROR probe-totk-reflect needs SPV_VS/SPV_PS/REFL_VS/REFL_PS\n");
             return 1;
         }
+        if (!reflect_check_interface(vsp, psp) && !getenv("TOTK_ANDROID_ALLOW_INTERFACE_MISMATCH"))
+            return 1;
         size_t vsn = 0, psn = 0;
         uint8_t *vs = (uint8_t *)read_text_file(vsp, &vsn);
         uint8_t *ps = (uint8_t *)read_text_file(psp, &psn);
         if (!vs || !ps) { free(vs); free(ps); return 1; }
-        spirv_move_set(ps, psn, 0, 1);
-        GfxBindingSpec vss[16], pss[16];
-        unsigned nvs = reflect_file(rvp, vss, 16);
-        unsigned nps = reflect_file(rpp, pss, 16);
+        gfx_spirv_move_set(ps, psn, 0, 1);
+        GfxBindingSpec vss[64], pss[64];
+        unsigned nvs = gfx_reflect_full(rvp, vsp, 0, vss, 64);
+        unsigned nps = gfx_reflect_full(rpp, psp, 1, pss, 64);
         fprintf(stderr, "[totk-vk] reflected bindings vs=%u ps=%u\n", nvs, nps);
+        reflect_log("vs", vss, nvs);
+        reflect_log("ps", pss, nps);
         GfxOffscreenTarget *t = gfx_backend_offscreen_create(1280, 720, 0x25);
         GfxReflectedPipeline *p = t ? gfx_backend_reflected_pipeline_create(
             vs, vsn, ps, psn, gfx_backend_vk_format_for_nvn(0x25), vss, nvs, pss, nps) : NULL;
@@ -1325,6 +1734,11 @@ int main(int argc, char **argv) {
         close(fd);
         if (!vs || got != st.st_size) { free(vs); return 1; }
         const char *ps_path = getenv("TOTK_ANDROID_SPV_PS");
+        if (ps_path && *ps_path &&
+            !reflect_check_interface(path, ps_path) && !getenv("TOTK_ANDROID_ALLOW_INTERFACE_MISMATCH")) {
+            free(vs);
+            return 1;
+        }
         uint8_t *ps = NULL;
         size_t ps_size = 0;
         if (ps_path && *ps_path) {
@@ -1345,6 +1759,13 @@ int main(int argc, char **argv) {
         uint32_t nubo = 0;
         const char *rv = getenv("TOTK_ANDROID_REFL_VS");
         const char *rp = getenv("TOTK_ANDROID_REFL_PS");
+        if (((rv && reflect_has_non_ubo(rv)) || (rp && reflect_has_non_ubo(rp))) &&
+            !getenv("TOTK_ANDROID_ALLOW_PARTIAL_REFLECTION")) {
+            fprintf(stderr, "[totk-vk] ERROR probe-totk-vs only builds cbuf UBOs; "
+                            "use probe-totk-reflect for sbufs/textures/images\n");
+            free(vs); free(ps);
+            return 1;
+        }
         if (rv || rp) {
             uint32_t b[8];
             unsigned n = reflect_cbufs(rv, b, 8);
@@ -1405,6 +1826,22 @@ int main(int argc, char **argv) {
                corner[0], corner[1], corner[2], corner[3], shot, shot_ok ? "true" : "false");
         gfx_backend_offscreen_destroy(t);
         return ok ? 0 : 1;
+    }
+    if (!strcmp(argv[2], "probe-vulkan-reflect-texture")) {
+        if (!gfx_backend_reflected_texture_selftest()) {
+            fprintf(stderr, "[totk-vk] reflected texture selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"vulkan-reflect-texture\"}\n");
+        return 0;
+    }
+    if (!strcmp(argv[2], "probe-vulkan-reflect-ubo")) {
+        if (!gfx_backend_reflected_ubo_selftest()) {
+            fprintf(stderr, "[totk-vk] reflected UBO selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"vulkan-reflect-ubo\"}\n");
+        return 0;
     }
     if (!strcmp(argv[2], "probe-vulkan-texture")) {
         GfxOffscreenTarget *t = gfx_backend_offscreen_create(1280, 720, 0x25);
@@ -1516,6 +1953,59 @@ int main(int argc, char **argv) {
         printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-draw\","
                "\"frames\":%d,\"visible\":%s,\"screenshot\":\"%s\"}\n",
                frames, visible ? "true" : "false", shot);
+        return 0;
+    }
+    if (!strcmp(argv[2], "probe-nvn-reflect")) {
+        int runtime_nvn_draw_reflect_selftest(const char *screenshot, int frames,
+                                              const char *vs_path, const char *ps_path,
+                                              const char *vs_res, const char *ps_res);
+        const char *vs = getenv("TOTK_ANDROID_SPV_VS");
+        const char *ps = getenv("TOTK_ANDROID_SPV_PS");
+        const char *vres = getenv("TOTK_ANDROID_REFL_VS");
+        const char *pres = getenv("TOTK_ANDROID_REFL_PS");
+        if (!vs || !ps || !vres || !pres) {
+            fprintf(stderr, "[totk-nvn] ERROR probe-nvn-reflect needs SPV_VS/SPV_PS/REFL_VS/REFL_PS\n");
+            return 1;
+        }
+        if (!reflect_check_interface(vs, ps) && !getenv("TOTK_ANDROID_ALLOW_INTERFACE_MISMATCH"))
+            return 1;
+        char shot[PATH_MAX];
+        const char *env = getenv("TOTK_ANDROID_SCREENSHOT");
+        if (env && *env) snprintf(shot, sizeof shot, "%s", env);
+        else snprintf(shot, sizeof shot, "%s/nvn-reflect.ppm", argv[1]);
+        const char *fs = getenv("TOTK_ANDROID_NVN_DRAW_FRAMES");
+        int frames = fs && *fs ? atoi(fs) : 60;
+        if (!runtime_nvn_draw_reflect_selftest(shot, frames, vs, ps, vres, pres)) {
+            fprintf(stderr, "[totk-nvn] NVN reflected draw selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-reflect\","
+               "\"frames\":%d,\"screenshot\":\"%s\"}\n", frames, shot);
+        return 0;
+    }
+    if (!strcmp(argv[2], "probe-nvn-texture-reflect")) {
+        int runtime_nvn_texture_bind_selftest(const char *screenshot, int frames);
+        char shot[PATH_MAX];
+        const char *env = getenv("TOTK_ANDROID_SCREENSHOT");
+        if (env && *env) snprintf(shot, sizeof shot, "%s", env);
+        else snprintf(shot, sizeof shot, "%s/nvn-texture-reflect.ppm", argv[1]);
+        const char *fs = getenv("TOTK_ANDROID_NVN_DRAW_FRAMES");
+        int frames = fs && *fs ? atoi(fs) : 2;
+        if (!runtime_nvn_texture_bind_selftest(shot, frames)) {
+            fprintf(stderr, "[totk-nvn] NVN textured reflected draw selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-texture-reflect\","
+               "\"frames\":%d,\"screenshot\":\"%s\"}\n", frames, shot);
+        return 0;
+    }
+    if (!strcmp(argv[2], "probe-nvn-bind")) {
+        int runtime_nvn_bind_selftest(void);
+        if (!runtime_nvn_bind_selftest()) {
+            fprintf(stderr, "[totk-nvn] NVN bind selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-bind\"}\n");
         return 0;
     }
     if (!strcmp(argv[2], "probe-nvn-submit")) {

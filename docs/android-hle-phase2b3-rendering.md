@@ -117,10 +117,12 @@ The NVN object layer now has a real draw path, not just a log:
 {"status":"pass","probe":"nvn-draw","frames":60,"screenshot":"..."}
 ```
 
-The program currently owns a host-created Vulkan pipeline from translated
-SPIR-V.  A game NVN `prog_t` still carries the original shader data/control
-pointers; cbuf UBOs are mapped from `.res.json`, while sbufs/textures/images and
-full mip/format coverage remain the next descriptor step.
+The program owns a host-created Vulkan pipeline from translated SPIR-V.  A game
+NVN `prog_t` still carries the original shader data/control pointers; the test
+path now maps all four `.res.json` descriptor sections (`cbufs`, `sbufs`,
+`textures`, `images`), including separate samplers, arrays, storage images and
+texel buffers.  Real per-draw texture/image upload and full mip/format coverage
+remain the next step.
 
 ### Minimal NVN texture path
 
@@ -191,10 +193,91 @@ Result:
 ```
 
 The PS used here is a constant-black shader, so `visible:false` is expected; the
-pipeline and both descriptor sets were created and drawn.  The backend also
-implements SSBO/storage-image/combined-sampler descriptors, but the sampled
-textured PS currently stalls Adreno pipeline compilation and is not claimed as
-working yet.  That is the remaining descriptor work.
+pipeline and both descriptor sets were created and drawn.
+
+### Full `.res.json` descriptor mapping
+
+`probe-totk-reflect` now reads the SPIR-V descriptor signature and the
+`.res.json` source metadata together:
+
+- `cbufs` -> `UNIFORM_BUFFER`, NVN slot -> `BindUniformBuffer`;
+- `sbufs` -> `STORAGE_BUFFER`, with `cb_slot`/`cb_offset` kept for the pointer
+  source and `flags & 1` as read/write;
+- `textures` combos:
+  - `type == 0` + `separate` -> `SAMPLER`;
+  - `type != 0` + `separate` -> `SAMPLED_IMAGE`;
+  - `type != 0` without `separate` -> `COMBINED_IMAGE_SAMPLER`;
+  - `TextureBuffer` -> `UNIFORM_TEXEL_BUFFER` + `VkBufferView`;
+- `images` -> `STORAGE_IMAGE` or `STORAGE_TEXEL_BUFFER`, with the
+  `.res.json` format (`R8G8B8A8Unorm`, `R32G32B32A32Float`, ...) mapped to
+  `VkFormat`;
+- `array` 1 / N / 0 -> descriptor count 1 / N / pool-sized runtime array.
+
+The SPIR-V signature is authoritative: the Android parser reads
+`OpDecorate DescriptorSet/Binding`, `OpTypeImage`, `OpTypeSampler`,
+`OpTypeSampledImage`, arrays and pointer storage classes, then merges only the
+NVN slot/handle/format fields from `.res.json`.  This also adds the implicit
+Ryujinx `support_buffer` binding that `.res.json` does not list.
+
+On the Adreno 830 the following combinations create a pipeline and draw:
+
+- 5 combined samplers + 4 UBOs + `support_buffer` (`system-ps-06b4f948`);
+- separate `texture2D` + `sampler`;
+- `texture2D[4]` + `sampler[4]` descriptor arrays;
+- SSBO + storage image + separate texture/sampler;
+- `samplerBuffer` (uniform texel buffer) + `imageBuffer` (storage texel
+  buffer).
+
+The previous "sampled PS hangs" repro was a **VS/PS interface mismatch**: the
+probe paired a PS that reads input locations 0, 1, 2, 3 with `system-vs` that
+only writes location 2.  `probe-totk-reflect` now checks the entry-point
+interface first and fails with the missing locations instead of entering the
+driver compiler.  A matching VS makes the same 5-texture PS compile and draw.
+
+```sh
+TOTK_ANDROID_ALLOW_INTERFACE_MISMATCH=1 can force the old diagnostic path;
+it is not a valid pipeline test.
+```
+
+The NVN side has the corresponding bind surface:
+`nvnCommandBufferSetTexturePool`, `SetSamplerPool`, `BindUniformBuffer(s)`,
+`BindStorageBuffer(s)`, `BindTexture(s)` and `BindImage(s)`, with host-side
+pool id -> `tex_t`/`samp_t` maps.  `probe-nvn-bind` checks the combined handle
+packing (`texture id | sampler id << 20`) and lookup, and
+`probe-nvn-reflect` loads a `.spv + .res.json` pair through
+`runtime_nvn_program_load_spirv_reflect` and draws it.
+
+### Replacing dummy descriptors with real resources
+
+The reflected pipeline creates a valid dummy resource for every binding so the
+layout and pipeline exist even before a draw.  Three runtime entry points then
+replace those descriptors without recreating the pipeline:
+
+- `gfx_backend_reflected_bind_texture(pipeline, set, binding, texture)`;
+- `gfx_backend_reflected_write_uniform(pipeline, set, binding, offset, data, size)`;
+- `gfx_backend_reflected_write_storage(...)`.
+
+`probe-vulkan-reflect-texture` uses the repository's `triangle_tex` shaders,
+binds a real 2x2 checker after pipeline creation and draws it.  Result:
+
+```text
+[totk-vk] reflected bind texture set=1 binding=0 texture=...
+[totk-vk] reflected texture selftest center=808080ff corner=0d141fff
+{"status":"pass","probe":"vulkan-reflect-texture"}
+```
+
+`probe-vulkan-reflect-ubo` writes `(0.25, 0.5, 0.75, 1.0)` into a reflected
+UBO after pipeline creation and reads back `4080bfff`.  On the NVN side,
+`runtime_nvn_program_bind_texture` accepts a `tex_t` and
+`probe-nvn-texture-reflect` creates a real guest block-linear texture, uploads
+it, binds it to the reflected PS and executes an NVN submit/present.  These
+three probes run without game shader files; the NVN texture comes from the
+guest memory pool.
+
+The same path is ready for `sbufs` data
+(`gfx_backend_reflected_write_storage`) and for storage-image/texel-buffer
+resources; they still use the dummy image/buffer until the per-draw upload
+bridge lands.
 
 ### Translated TOTK shader -> NVN program
 
@@ -214,6 +297,19 @@ system/material pair writes `gl_Position=(1,1)` and a zero fragment color, so
 it produces no visible triangle; the probe reports `"visible":false`.  Visible
 game output requires the full NVN vertex/UBO/texture binding, not a missing
 shader translation step.
+
+`probe-nvn-reflect` uses the same NVN program path with the complete
+`.res.json` reflection:
+
+```sh
+TOTK_ANDROID_SPV_VS=.../match.spv TOTK_ANDROID_SPV_PS=.../system-ps-06b4f948.spv \
+TOTK_ANDROID_REFL_VS=.../empty.res.json TOTK_ANDROID_REFL_PS=.../system-ps-06b4f948.res.json \
+TOTK_ANDROID_NVN_DRAW_FRAMES=2 totk-android <dir> probe-nvn-reflect
+```
+
+The sampled PS is a real 5-texture material/system shader; the probe creates
+its full two-set layout, loads the descriptor map into the NVN program, submits
+two draws and presents a PPM.
 
 ## 6. Game first frame
 
@@ -241,6 +337,11 @@ totk-android <dir> probe-nvn-draw
 totk-android <dir> probe-nvn-texture
 totk-android <dir> probe-totk-vs
 totk-android <dir> probe-totk-reflect
+totk-android <dir> probe-nvn-reflect
+totk-android <dir> probe-vulkan-reflect-texture
+totk-android <dir> probe-vulkan-reflect-ubo
+totk-android <dir> probe-nvn-texture-reflect
+totk-android <dir> probe-nvn-bind
 totk-android <dir> probe-spirv
 totk-android <dir> probe-nvn-submit
 ```
@@ -255,20 +356,32 @@ Expected:
   storage, checker PPM.
 - `probe-totk-vs`: visible translated TOTK VS/PS triangle with UBOs; cbuf
   bindings from `.res.json`.
-- `probe-totk-reflect`: two-set descriptor pipeline from `.res.json`
-  cbufs; the current constant-black PS produces `visible:false`, while the
-  pipeline/draw path passes.
+- `probe-totk-reflect`: two-set descriptor pipeline from the complete
+  `.res.json` and the SPIR-V signature; rejects a VS/PS interface mismatch and
+  logs the resolved binding kinds.  With a matching VS, the 5-texture
+  `system-ps-06b4f948` pipeline/draw passes.
+- `probe-nvn-reflect`: the same full reflection map loaded through an NVN
+  program, drawn and presented.
+- `probe-vulkan-reflect-texture`: real texture bound after pipeline creation;
+  center `808080ff`, corner `0d141fff`.
+- `probe-vulkan-reflect-ubo`: UBO written after pipeline creation; center
+  `4080bfff`.
+- `probe-nvn-texture-reflect`: real guest block-linear texture through an NVN
+  program and reflected pipeline; visible draw and PPM.
+- `probe-nvn-bind`: NVN texture/sampler pool registration, combined-handle
+  packing and the descriptor bind entry points pass.
 - `probe-spirv`: all cached SPIR-V modules accepted by the driver.
 - `probe-nvn-submit`: the older submit/present self-test still passes.
 
 ## 8. Next
 
-1. Feed the NVN texture bridge from guest texture memory/layout automatically,
-   and map the full translated `res.json` reflection to descriptor sets.
-2. Map translated TOTK SPIR-V into `nvnProgramSetShaders*`; use the 2B.2 cache
-   key, not a hardcoded built-in pipeline.  The current translated-shader probe
-   executes a draw but its system/material pair produces no visible fragments;
-   real game geometry needs vertex/UBO/descriptor binding.
+1. Feed real storage-image/texel-buffer resources and guest storage ranges
+   into the reflected descriptor sets at draw time; real sampled textures, NVN
+   texture objects and uniform buffers are now bound after pipeline creation.
+   The remaining work is the upload/copy path for images and full mip/format
+   coverage.
+2. Use the 2B.2 cache key when loading `nvnProgramSetShaders*` instead of a
+   probe-selected path, and persist the translated `.spv + .res.json` pair.
 3. Return to the `nn::gfx` context registry stop; until it is fixed, the game
    cannot reach its own first frame regardless of renderer readiness.
 4. Unlock the physical device and keep the screen on, then re-run the Surface

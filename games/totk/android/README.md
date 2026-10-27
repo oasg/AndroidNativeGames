@@ -67,9 +67,11 @@ gate + HLE-stack thunks + a minimal SVC layer.
   screenshot, an NVN command-buffer draw path (`probe-nvn-draw`, 60
   draws/presents), a sampled-texture path (`probe-vulkan-texture` and
   `probe-nvn-texture`, including guest block-linear deswizzle), a visible
-  translated TOTK VS/PS draw with UBO/`.res.json` cbuf mapping
-  (`probe-totk-vs`), and a separate Android Surface clear APK under
-  `surface_test/` (1,620+ frames on the arm64 emulator).  See
+  translated TOTK VS/PS draw with the full `.res.json` descriptor map
+  (`probe-totk-vs` for cbuf-only probes, `probe-totk-reflect` for
+  cbufs/sbufs/textures/images, `probe-nvn-reflect` through the NVN program),
+  and a separate Android Surface clear APK under `surface_test/` (1,620+
+  frames on the arm64 emulator).  See
   `docs/android-hle-phase2b3-rendering.md`.
 - `nn::hid::InitializeNpad` is a host no-pad backend for now (zero Npad/6-axis
   state, vibration stub). Keyboard/mouse/touch/debug-pad/gesture initialization
@@ -224,12 +226,33 @@ Expected results on an arm64 Android device:
   deswizzles it and runs 60 NVN textured draws/presents.
 - `probe-totk-vs`: draws a visible full-screen triangle with the translated
   TOTK `system-vs` and `material-ps`, using `.res.json` cbuf bindings and UBOs.
-- `probe-totk-reflect`: creates a two-set descriptor pipeline from full
-  `.res.json` cbufs; sampled-textured PS compilation is still under debug.
+- `probe-totk-reflect`: creates the two-set descriptor pipeline from the full
+  `.res.json` (`cbufs`/`sbufs`/`textures`/`images`) and checks the SPIR-V
+  descriptor signature.  Combined samplers, separate image+sampler pairs,
+  texture arrays, storage images, SSBOs and uniform/storage texel buffers all
+  compile on the Adreno 830.  It also rejects a VS/PS pair whose fragment
+  input locations are not written by the vertex stage instead of relying on a
+  driver failure.
+- `probe-nvn-reflect`: the same full reflection map loaded into an NVN program
+  and drawn through `nvnQueueSubmitCommands`; verifies NVN program -> Vulkan
+  pipeline -> present with real `.res.json` bindings.
+- `probe-vulkan-reflect-texture`: creates a reflected pipeline from the
+  repository's `triangle_tex` shaders, then binds a real `GfxTexture` after
+  pipeline creation and draws it (`808080` center / dark corner).
+- `probe-vulkan-reflect-ubo`: creates a reflected UBO pipeline, writes
+  `(0.25, 0.5, 0.75)` into the UBO after pipeline creation, draws it and reads
+  back `4080bfff`.
+- `probe-nvn-texture-reflect`: runs a real NVN texture object through the
+  repository `triangle_tex` reflected pipeline and an NVN draw/present, proving
+  the descriptor resource replacement path.
+- `probe-nvn-bind`: creates texture/sampler pools, packs a combined NVN handle,
+  resolves it through the pool maps and exercises
+  `SetTexturePool`/`SetSamplerPool`/`BindTexture`/`BindImage`/
+  `BindUniformBuffer`/`BindStorageBuffer`.
 - `probe-nvn-draw` with `TOTK_ANDROID_SPV_VS`/`TOTK_ANDROID_SPV_PS` loads a
   translated TOTK SPIR-V pair into the NVN program and executes the draw.  The
   sampled system/material pair is not a visible triangle (`visible:false`);
-  full game shader/UBO/vertex binding is the next step.
+  real per-draw texture/UBO upload is the next step, not descriptor mapping.
 - `probe-nvn-submit`: builds a CPU-only NVN device/queue/window, records one
   command buffer, submits it and presents it through Vulkan.  This is the
   first explicit `nvnQueueSubmitCommands`/`nvnQueuePresentTexture` point; it is
@@ -293,17 +316,20 @@ Expected results on an arm64 Android device:
    frame still depends on the `nn::gfx` context registration above.
 5. 2B.2: ship an **offline SPIR-V shader cache**, not an on-device .NET
    translator.  The 112-shader spike translated 112/112 and the Adreno driver
-   accepted 112/112 `VkShaderModule`s.  Next: translate the startup/title
-   subset, map NVN reflection to Vulkan descriptor sets, and create real
-   pipelines.  cbuf UBOs and a visible translated TOTK VS/PS draw are now
-   working; sbufs/textures/images and full mip/format coverage remain.
-   Missing variants fall back to clear/simple triangle; full game visuals are
-   not promised yet.  See `docs/android-hle-phase2b2-shader-spike.md`.
+   accepted 112/112 `VkShaderModule`s.  The Android reflection path now maps
+   `cbufs`/`sbufs`/`textures`/`images` from `.res.json` plus the SPIR-V
+   descriptor signature, including separate samplers/textures, arrays,
+   storage images and texel buffers.  Next: translate the startup/title
+   subset into that cache and feed the actual NVN pool objects into the
+   descriptors.  Missing variants fall back to clear/simple triangle; full
+   game visuals are not promised yet.  See
+   `docs/android-hle-phase2b2-shader-spike.md`.
 6. 2B.3: texture storage -> `VkImage` upload/format-modifier validation and
    the Android Surface app shell (SurfaceView + JNI + a worker running the
    loader, attaching the `ANativeWindow*` to the host native window).  The
-   minimal Vulkan and NVN texture draw paths and the Surface clear APK are now
-   in place; full game texture/descriptor mapping is next.
+   descriptor map, NVN bind state, real texture/UBO descriptor replacement and
+   the Surface clear APK are now in place; per-draw image/storage-image upload
+   and full mip/format coverage are next.
 7. Port the remaining memory SVCs (`MapMemory` is currently a copy, not a
    shared alias; `MapPhysicalMemory` details) and the rest of the HLE service
    registry.

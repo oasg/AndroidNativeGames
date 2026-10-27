@@ -13,6 +13,7 @@
 #include <stdint.h>
 
 typedef struct GfxOffscreenTarget GfxOffscreenTarget;
+typedef struct GfxTexture GfxTexture;
 
 /* Backend availability is explicit: a failed Vulkan path never reports a fake
  * success.  `gfx_backend_vulkan_init` is idempotent and thread-safe. */
@@ -24,6 +25,9 @@ const char *gfx_backend_name(void);
 /* NVN format id -> Vulkan VkFormat.  Returns VK_FORMAT_UNDEFINED (0) for an
  * unsupported format; callers must treat that as an error. */
 int gfx_backend_vk_format_for_nvn(uint32_t nvn_format);
+/* Ryujinx TextureFormat enum (the string in .res.json images[].format) ->
+ * Vulkan format.  Unknown/unsupported returns VK_FORMAT_UNDEFINED (0). */
+int gfx_backend_vk_format_for_texture_format(uint32_t texture_format);
 int gfx_backend_vk_format_bpp(int vk_format);
 
 /* Offscreen render target.  The image is device-local; a host-visible
@@ -72,8 +76,42 @@ GfxTrianglePipeline *gfx_backend_totk_vs_pipeline_create(const uint8_t *vs, size
 /* Reflected multi-descriptor pipeline.  Set 0 belongs to the vertex stage and
  * set 1 to the fragment stage (the translated PS SPIR-V is moved to set 1 so
  * independent NVN binding numbers cannot collide). */
-typedef enum { GFX_BIND_UBO = 0, GFX_BIND_SSBO = 1, GFX_BIND_TEXTURE = 2, GFX_BIND_IMAGE = 3 } GfxBindingKind;
-typedef struct { uint32_t binding; GfxBindingKind kind; uint32_t count; } GfxBindingSpec;
+typedef enum {
+    GFX_BIND_UBO = 0,
+    GFX_BIND_SSBO,
+    GFX_BIND_SAMPLER,
+    GFX_BIND_SAMPLED_IMAGE,
+    GFX_BIND_COMBINED_IMAGE_SAMPLER,
+    GFX_BIND_STORAGE_IMAGE,
+    GFX_BIND_UNIFORM_TEXEL_BUFFER,
+    GFX_BIND_STORAGE_TEXEL_BUFFER
+} GfxBindingKind;
+
+/* A descriptor binding as declared by the translated SPIR-V, plus the NVN
+ * source information from the matching .res.json entry.  `kind` and `count`
+ * are the SPIR-V view; `nvn_*` is only used to resolve the runtime resource. */
+typedef struct {
+    uint32_t set;
+    uint32_t binding;
+    GfxBindingKind kind;
+    uint32_t count;
+
+    int32_t  nvn_slot;        /* cbuf/sbuf slot, texture slot when known */
+    int32_t  nvn_cbuf_slot;   /* constant bank holding the NVN handle/address */
+    int32_t  nvn_cb_offset;   /* word offset in that bank (sbufs cb_offset) */
+    uint32_t nvn_handle;      /* translator fake handle, not the runtime handle */
+    uint32_t nvn_type;        /* Ryujinx SamplerType value */
+    uint32_t nvn_format;      /* Ryujinx TextureFormat value */
+    uint32_t nvn_flags;       /* BufferUsageFlags / TextureUsageFlags */
+    int      separate;        /* separate texture + sampler binding */
+} GfxBindingSpec;
+/* Offline reflection helpers shared by the probes and the NVN program bridge.
+ * They are implemented in loader_android.c; `json_path` is the .res.json and
+ * `spv_path` the translated module.  SPIR-V wins for descriptor type/count. */
+unsigned gfx_reflect_full(const char *json_path, const char *spv_path, uint32_t target_set,
+                          GfxBindingSpec *out, unsigned max);
+int gfx_spirv_move_set(uint8_t *code, size_t size, uint32_t from, uint32_t to);
+
 typedef struct GfxReflectedPipeline GfxReflectedPipeline;
 GfxReflectedPipeline *gfx_backend_reflected_pipeline_create(const uint8_t *vs, size_t vs_size,
                                                             const uint8_t *ps, size_t ps_size,
@@ -83,11 +121,28 @@ GfxReflectedPipeline *gfx_backend_reflected_pipeline_create(const uint8_t *vs, s
 void gfx_backend_reflected_pipeline_destroy(GfxReflectedPipeline *pipeline);
 int gfx_backend_reflected_draw(GfxReflectedPipeline *pipeline, GfxOffscreenTarget *target,
                                float r, float g, float b, float a);
+/* Replace the dummy resource of one reflected binding at runtime.  The binding
+ * kind and count come from the pipeline's SPIR-V signature. */
+int gfx_backend_reflected_bind_texture(GfxReflectedPipeline *pipeline, uint32_t set,
+                                       uint32_t binding, const GfxTexture *texture);
+int gfx_backend_reflected_write_uniform(GfxReflectedPipeline *pipeline, uint32_t set,
+                                        uint32_t binding, uint32_t offset,
+                                        const void *data, size_t size);
+int gfx_backend_reflected_write_storage(GfxReflectedPipeline *pipeline, uint32_t set,
+                                        uint32_t binding, uint32_t offset,
+                                        const void *data, size_t size);
+/* Built-in reflected texture test: repository shaders + a real VkTexture
+ * bound after pipeline creation.  No game data. */
+int gfx_backend_reflected_texture_selftest(void);
+/* New pipeline from the repository's triangle_tex shaders; the caller owns it. */
+GfxReflectedPipeline *gfx_backend_reflected_builtin_texture_pipeline_create(void);
+/* Built-in reflected UBO test: writes a colour into a reflected UBO after
+ * pipeline creation, then draws it.  No game data. */
+int gfx_backend_reflected_ubo_selftest(void);
 
 /* Minimal sampled-texture path: RGBA8 texture -> VkImage/VkSampler and a
  * textured triangle pipeline.  This is the 2B.3 NVN texture bridge's Vulkan
  * half; the NVN object wraps it. */
-typedef struct GfxTexture GfxTexture;
 typedef struct GfxTexturedPipeline GfxTexturedPipeline;
 GfxTexture *gfx_backend_texture_create_rgba8(uint32_t width, uint32_t height,
                                              const uint8_t *pixels);

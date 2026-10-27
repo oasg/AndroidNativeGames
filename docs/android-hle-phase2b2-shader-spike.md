@@ -164,7 +164,9 @@ pipeline binding work continue.
 - 2B.2a: translate the startup/title shader subset (not all 28k) and measure
   the packaged size.
 - 2B.2b: map the NVN reflection (`cbufs`/`sbufs`/`textures`/`images`) to
-  Vulkan descriptor sets and create the first real pipeline.
+  Vulkan descriptor sets and create the first real pipeline.  Implemented in
+  2B.3: `.res.json` + SPIR-V descriptor signatures, including separate
+  samplers, arrays, storage images and texel buffers.
 - 2B.2c: run the first actual draw; keep the clear/simple-triangle fallback for
   missing shader variants.
 - 2B.3: Android Surface/JNI app shell.

@@ -178,6 +178,17 @@ int runtime_native_window_draw_triangle(void *p) {
     return runtime_native_window_draw_triangle_pipeline(p, gfx_backend_builtin_triangle_pipeline());
 }
 
+int runtime_native_window_draw_reflected_pipeline(void *p, void *pipeline) {
+    HostNativeWindow *w = p;
+    if (!w || w->magic != HOST_NW_MAGIC || !w->gfx_target || !pipeline) return 0;
+    if (!gfx_backend_reflected_draw((GfxReflectedPipeline *)pipeline, w->gfx_target,
+                                    0.05f, 0.08f, 0.12f, 1.0f))
+        return 0;
+    const uint8_t *src = gfx_backend_offscreen_pixels(w->gfx_target, NULL);
+    if (src) memcpy(w->buffer, src, w->buffer_size);
+    return 1;
+}
+
 int runtime_native_window_draw_textured_triangle(void *p, void *pipeline, void *texture) {
     HostNativeWindow *w = p;
     if (!w || w->magic != HOST_NW_MAGIC || !w->gfx_target || !pipeline || !texture) return 0;

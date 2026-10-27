@@ -27,6 +27,7 @@ extern int runtime_native_window_present(void *p);
 extern int runtime_native_window_draw_triangle(void *p);
 extern int runtime_native_window_draw_triangle_pipeline(void *p, void *pipeline);
 extern int runtime_native_window_draw_textured_triangle(void *p, void *pipeline, void *texture);
+extern int runtime_native_window_draw_reflected_pipeline(void *p, void *pipeline);
 extern int runtime_native_window_read_pixel(void *p, uint32_t x, uint32_t y, uint8_t out[4]);
 extern int runtime_native_window_screenshot(void *p, const char *path);
 static void nvn_process_submit_commands(const uint64_t *cmds, int n);
@@ -245,6 +246,15 @@ typedef struct { void *dev; samp_par p; } samp_builder_t;
 typedef struct { uint32_t magic; samp_par p; } samp_t;
 typedef struct { uint32_t magic, n; pool_t *pool; int64_t off; } samp_pool_t;
 
+/* NVN texture/sampler pool registrations.  The pool objects themselves are
+ * guest-sized (0x20 bytes), so the id -> object map lives on the host. */
+typedef struct { const tex_pool_t *pool; int id; const tex_t *tex; } tex_pool_map_t;
+typedef struct { const samp_pool_t *pool; int id; const samp_t *samp; } samp_pool_map_t;
+static tex_pool_map_t g_tex_pool_map[256];
+static unsigned g_tex_pool_map_count;
+static samp_pool_map_t g_samp_pool_map[256];
+static unsigned g_samp_pool_map_count;
+
 typedef struct {
     uint32_t magic, nstage;
     uint64_t data[6];
@@ -252,6 +262,7 @@ typedef struct {
     void *gfx_pipeline;       /* host Vulkan pipeline for the 2B.3 draw path */
     void *gfx_textured_pipeline;
     void *gfx_texture;
+    void *gfx_reflected_pipeline;  /* full .res.json descriptor layout */
     uint32_t textured;
     uint64_t serial;
 } prog_t;
@@ -496,25 +507,29 @@ static uint64_t nvnDeviceGetTimestampInNanoseconds(const nvn_dev_t *d, const voi
     (void)d; (void)counter;
     return 0;
 }
+/* NVN texture handles pack the texture pool id in the low 20 bits and the
+ * sampler pool id in bits 20..31 (see TextureHandle.Unpack* in the translator).
+ * Separate handles are the raw pool ids; the combined handle below is what the
+ * game writes into the shader's c[2] handle slots. */
 static uint64_t nvnDeviceGetTextureHandle(const nvn_dev_t *d, int index, int sampler) {
-    (void)d; (void)sampler;
-    return 0x100000000ull | ((uint64_t)(uint32_t)index << 8) | 0x11;
+    (void)d;
+    return ((uint64_t)((uint32_t)sampler & 0xfffu) << 20) | ((uint32_t)index & 0xfffffu);
 }
 static uint64_t nvnDeviceGetTexelFetchHandle(const nvn_dev_t *d, int index) {
     (void)d;
-    return 0x100000000ull | ((uint64_t)(uint32_t)index << 8) | 0x12;
+    return (uint32_t)index & 0xfffffu;
 }
 static uint64_t nvnDeviceGetImageHandle(const nvn_dev_t *d, int index) {
     (void)d;
-    return 0x100000000ull | ((uint64_t)(uint32_t)index << 8) | 0x13;
+    return (uint32_t)index & 0xfffffu;
 }
 static uint64_t nvnDeviceGetSeparateTextureHandle(const nvn_dev_t *d, int index) {
     (void)d;
-    return 0x100000000ull | ((uint64_t)(uint32_t)index << 8) | 0x21;
+    return (uint32_t)index & 0xfffffu;
 }
 static uint64_t nvnDeviceGetSeparateSamplerHandle(const nvn_dev_t *d, int index) {
     (void)d;
-    return 0x100000000ull | ((uint64_t)(uint32_t)index << 8) | 0x22;
+    return (uint32_t)index & 0xfffu;
 }
 static uint32_t nvnDeviceIsExternalDebuggerAttached(const nvn_dev_t *d) { (void)d; return 0; }
 static void nvnDeviceInstallDebugCallback(nvn_dev_t *d, const void *cb, void *data, uint32_t enable) {
@@ -1383,6 +1398,49 @@ static uint32_t nvnSamplerCompare(const samp_t *a, const samp_t *b) {
 static uint64_t nvnSamplerGetDebugID(const samp_t *s) { return s ? (uint64_t)(uintptr_t)s : 0; }
 
 /* Pools of descriptors. */
+static void nvn_tex_pool_forget(const tex_pool_t *p) {
+    unsigned n = 0;
+    for (unsigned i = 0; i < g_tex_pool_map_count; i++)
+        if (g_tex_pool_map[i].pool != p) g_tex_pool_map[n++] = g_tex_pool_map[i];
+    g_tex_pool_map_count = n;
+}
+static void nvn_tex_pool_add(const tex_pool_t *p, int id, const tex_t *t) {
+    for (unsigned i = 0; i < g_tex_pool_map_count; i++)
+        if (g_tex_pool_map[i].pool == p && g_tex_pool_map[i].id == id) {
+            g_tex_pool_map[i].tex = t;
+            return;
+        }
+    if (g_tex_pool_map_count < sizeof g_tex_pool_map / sizeof g_tex_pool_map[0])
+        g_tex_pool_map[g_tex_pool_map_count++] = (tex_pool_map_t){ p, id, t };
+}
+static const tex_t *nvn_tex_pool_lookup(const tex_pool_t *p, int id) {
+    for (unsigned i = 0; i < g_tex_pool_map_count; i++)
+        if (g_tex_pool_map[i].pool == p && g_tex_pool_map[i].id == id)
+            return g_tex_pool_map[i].tex;
+    return NULL;
+}
+static void nvn_samp_pool_forget(const samp_pool_t *p) {
+    unsigned n = 0;
+    for (unsigned i = 0; i < g_samp_pool_map_count; i++)
+        if (g_samp_pool_map[i].pool != p) g_samp_pool_map[n++] = g_samp_pool_map[i];
+    g_samp_pool_map_count = n;
+}
+static void nvn_samp_pool_add(const samp_pool_t *p, int id, const samp_t *s) {
+    for (unsigned i = 0; i < g_samp_pool_map_count; i++)
+        if (g_samp_pool_map[i].pool == p && g_samp_pool_map[i].id == id) {
+            g_samp_pool_map[i].samp = s;
+            return;
+        }
+    if (g_samp_pool_map_count < sizeof g_samp_pool_map / sizeof g_samp_pool_map[0])
+        g_samp_pool_map[g_samp_pool_map_count++] = (samp_pool_map_t){ p, id, s };
+}
+static const samp_t *nvn_samp_pool_lookup(const samp_pool_t *p, int id) {
+    for (unsigned i = 0; i < g_samp_pool_map_count; i++)
+        if (g_samp_pool_map[i].pool == p && g_samp_pool_map[i].id == id)
+            return g_samp_pool_map[i].samp;
+    return NULL;
+}
+
 static uint32_t nvnTexturePoolInitialize(tex_pool_t *p, const pool_t *pool, ptrdiff_t off, int n) { nvn_api("nvnTexturePoolInitialize");
     if (!p || !nvn_obj(pool, NVN_MAGIC('P', 'O', 'O', 'L'), "nvnTexturePoolInitialize(pool)")) return 0;
     if (n < 0) { nvn_fail("nvnTexturePoolInitialize", "negative count"); return 0; }
@@ -1390,12 +1448,13 @@ static uint32_t nvnTexturePoolInitialize(tex_pool_t *p, const pool_t *pool, ptrd
     p->magic = NVN_MAGIC('T', 'P', 'O', 'L'); p->pool = (pool_t *)pool; p->off = off; p->n = (uint32_t)n;
     return 1;
 }
-static void nvnTexturePoolFinalize(tex_pool_t *p) { if (p) p->magic = 0; }
+static void nvnTexturePoolFinalize(tex_pool_t *p) { if (p) { nvn_tex_pool_forget(p); p->magic = 0; } }
 static void nvnTexturePoolSetDebugLabel(tex_pool_t *p, const char *l) { (void)p; (void)l; }
 static void nvnTexturePoolRegisterTexture(const tex_pool_t *p, int id, const tex_t *t, const void *v) { nvn_api("nvnTexturePoolRegisterTexture");
     (void)v;
     if (!p || p->magic != NVN_MAGIC('T', 'P', 'O', 'L') || !nvn_obj(t, NVN_MAGIC('T', 'E', 'X', 0), "nvnTexturePoolRegisterTexture(texture)")) return;
     if (id < 0 || (uint32_t)id >= p->n) { nvn_fail("nvnTexturePoolRegisterTexture", "id out of range"); return; }
+    nvn_tex_pool_add(p, id, t);
 }
 static void nvnTexturePoolRegisterImage(const tex_pool_t *p, int id, const tex_t *t, const void *v) {
     nvnTexturePoolRegisterTexture(p, id, t, v);
@@ -1411,7 +1470,7 @@ static uint32_t nvnSamplerPoolInitialize(samp_pool_t *p, const pool_t *pool, ptr
     p->magic = NVN_MAGIC('S', 'P', 'O', 'L'); p->pool = (pool_t *)pool; p->off = off; p->n = (uint32_t)n;
     return 1;
 }
-static void nvnSamplerPoolFinalize(samp_pool_t *p) { if (p) p->magic = 0; }
+static void nvnSamplerPoolFinalize(samp_pool_t *p) { if (p) { nvn_samp_pool_forget(p); p->magic = 0; } }
 static void nvnSamplerPoolSetDebugLabel(samp_pool_t *p, const char *l) { (void)p; (void)l; }
 static void nvnSamplerPoolRegisterSampler(const samp_pool_t *p, int id, const samp_t *s) { nvn_api("nvnSamplerPoolRegisterSampler");
     if (getenv("TOTK_ANDROID_TRACE_NVN"))
@@ -1419,6 +1478,7 @@ static void nvnSamplerPoolRegisterSampler(const samp_pool_t *p, int id, const sa
                 (const void *)p, id, (const void *)s, __builtin_return_address(0));
     if (!p || p->magic != NVN_MAGIC('S', 'P', 'O', 'L') || !nvn_obj(s, NVN_MAGIC('S', 'A', 'M', 'P'), "nvnSamplerPoolRegisterSampler(sampler)")) return;
     if (id < 0 || (uint32_t)id >= p->n) { nvn_fail("nvnSamplerPoolRegisterSampler", "id out of range"); return; }
+    nvn_samp_pool_add(p, id, s);
     /* Real NVN writes an opaque 32-byte sampler descriptor into the pool.
      * The host has no GPU, but the descriptor memory must be defined so the
      * guest never reads stale bytes from its own pool. */
@@ -1452,6 +1512,8 @@ typedef struct {
     void *mem_cb, *mem_cb_data;
     void *prog;
     void *win;
+    const tex_pool_t *tex_pool;
+    const samp_pool_t *samp_pool;
     uint64_t serial, handle;
     int draw_first, draw_count;
 } cb_t;
@@ -1534,6 +1596,96 @@ static void nvnCommandBufferClearDepthStencil(cb_t *c, float d, int dm, int sm, 
 static void nvnCommandBufferSetViewport(cb_t *c, int x, int y, int w, int h) { (void)c; (void)x; (void)y; (void)w; (void)h; }
 static void nvnCommandBufferSetScissor(cb_t *c, int x, int y, int w, int h) { (void)c; (void)x; (void)y; (void)w; (void)h; }
 
+/* NVN descriptor state.  The shader reflection names a NVN slot (cbufs/sbufs)
+ * or a c[2] handle (textures/images); these calls are the source of the actual
+ * resources.  Drawing still uses the host pipeline until the guest reaches the
+ * nn::gfx context path, but the state is kept and traced so a future bind is
+ * not another guess. */
+static void nvnCommandBufferSetTexturePool(cb_t *c, const tex_pool_t *p) {
+    nvn_api("nvnCommandBufferSetTexturePool");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferSetTexturePool", "invalid command buffer"); return; }
+    if (p && p->magic != NVN_MAGIC('T', 'P', 'O', 'L')) { nvn_fail("nvnCommandBufferSetTexturePool", "invalid texture pool"); return; }
+    c->tex_pool = p;
+}
+static void nvnCommandBufferSetSamplerPool(cb_t *c, const samp_pool_t *p) {
+    nvn_api("nvnCommandBufferSetSamplerPool");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferSetSamplerPool", "invalid command buffer"); return; }
+    if (p && p->magic != NVN_MAGIC('S', 'P', 'O', 'L')) { nvn_fail("nvnCommandBufferSetSamplerPool", "invalid sampler pool"); return; }
+    c->samp_pool = p;
+}
+static void nvnCommandBufferBindUniformBuffer(cb_t *c, int stage, int i, uint64_t address, size_t size) {
+    nvn_api("nvnCommandBufferBindUniformBuffer");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferBindUniformBuffer", "invalid command buffer"); return; }
+    if (i < 0 || !address || !size) { nvn_fail("nvnCommandBufferBindUniformBuffer", "invalid binding"); return; }
+    if (nvn_trace())
+        fprintf(stderr, "[totk-nvn] BindUniformBuffer stage=%d index=%d addr=%#llx size=%zu\n",
+                stage, i, (unsigned long long)address, size);
+}
+static void nvnCommandBufferBindUniformBuffers(cb_t *c, int stage, int first, int n, const void *ranges) {
+    nvn_api("nvnCommandBufferBindUniformBuffers");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferBindUniformBuffers", "invalid command buffer"); return; }
+    if (first < 0 || n < 0 || (!ranges && n)) { nvn_fail("nvnCommandBufferBindUniformBuffers", "invalid range"); return; }
+    if (nvn_trace())
+        fprintf(stderr, "[totk-nvn] BindUniformBuffers stage=%d first=%d count=%d ranges=%p\n",
+                stage, first, n, ranges);
+}
+static void nvnCommandBufferBindStorageBuffer(cb_t *c, int stage, int i, uint64_t address, size_t size) {
+    nvn_api("nvnCommandBufferBindStorageBuffer");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferBindStorageBuffer", "invalid command buffer"); return; }
+    if (i < 0 || !address || !size) { nvn_fail("nvnCommandBufferBindStorageBuffer", "invalid binding"); return; }
+    if (nvn_trace())
+        fprintf(stderr, "[totk-nvn] BindStorageBuffer stage=%d index=%d addr=%#llx size=%zu\n",
+                stage, i, (unsigned long long)address, size);
+}
+static void nvnCommandBufferBindStorageBuffers(cb_t *c, int stage, int first, int n, const void *ranges) {
+    nvn_api("nvnCommandBufferBindStorageBuffers");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferBindStorageBuffers", "invalid command buffer"); return; }
+    if (first < 0 || n < 0 || (!ranges && n)) { nvn_fail("nvnCommandBufferBindStorageBuffers", "invalid range"); return; }
+    if (nvn_trace())
+        fprintf(stderr, "[totk-nvn] BindStorageBuffers stage=%d first=%d count=%d ranges=%p\n",
+                stage, first, n, ranges);
+}
+static void nvnCommandBufferBindTexture(cb_t *c, int stage, int i, uint64_t handle) {
+    nvn_api("nvnCommandBufferBindTexture");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferBindTexture", "invalid command buffer"); return; }
+    if (i < 0) { nvn_fail("nvnCommandBufferBindTexture", "invalid binding"); return; }
+    if (nvn_trace()) {
+        int tid = (int)(handle & 0xfffff), sid = (int)((handle >> 20) & 0xfff);
+        const tex_t *t = c->tex_pool ? nvn_tex_pool_lookup(c->tex_pool, tid) : NULL;
+        const samp_t *s = c->samp_pool ? nvn_samp_pool_lookup(c->samp_pool, sid) : NULL;
+        fprintf(stderr, "[totk-nvn] BindTexture stage=%d index=%d handle=%#llx tex=%d(%p) samp=%d(%p)\n",
+                stage, i, (unsigned long long)handle, tid, (const void *)t, sid, (const void *)s);
+    }
+}
+static void nvnCommandBufferBindTextures(cb_t *c, int stage, int first, int n, const uint64_t *handles) {
+    nvn_api("nvnCommandBufferBindTextures");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferBindTextures", "invalid command buffer"); return; }
+    if (first < 0 || n < 0 || (!handles && n)) { nvn_fail("nvnCommandBufferBindTextures", "invalid handles"); return; }
+    if (nvn_trace()) {
+        for (int i = 0; i < n; i++)
+            fprintf(stderr, "[totk-nvn] BindTextures stage=%d index=%d handle=%#llx\n",
+                    stage, first + i, (unsigned long long)handles[i]);
+    }
+}
+static void nvnCommandBufferBindImage(cb_t *c, int stage, int i, uint64_t handle) {
+    nvn_api("nvnCommandBufferBindImage");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferBindImage", "invalid command buffer"); return; }
+    if (i < 0) { nvn_fail("nvnCommandBufferBindImage", "invalid binding"); return; }
+    if (nvn_trace())
+        fprintf(stderr, "[totk-nvn] BindImage stage=%d index=%d handle=%#llx\n",
+                stage, i, (unsigned long long)handle);
+}
+static void nvnCommandBufferBindImages(cb_t *c, int stage, int first, int n, const uint64_t *handles) {
+    nvn_api("nvnCommandBufferBindImages");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferBindImages", "invalid command buffer"); return; }
+    if (first < 0 || n < 0 || (!handles && n)) { nvn_fail("nvnCommandBufferBindImages", "invalid handles"); return; }
+    if (nvn_trace()) {
+        for (int i = 0; i < n; i++)
+            fprintf(stderr, "[totk-nvn] BindImages stage=%d index=%d handle=%#llx\n",
+                    stage, first + i, (unsigned long long)handles[i]);
+    }
+}
+
 /* Program, sync, event                                                */
 
 static uint32_t nvnProgramInitialize(prog_t *p, const nvn_dev_t *d) { nvn_api("nvnProgramInitialize");
@@ -1543,7 +1695,14 @@ static uint32_t nvnProgramInitialize(prog_t *p, const nvn_dev_t *d) { nvn_api("n
     p->serial = (uint64_t)(uintptr_t)p;
     return 1;
 }
-static void nvnProgramFinalize(prog_t *p) { if (p) p->magic = 0; }
+static void nvnProgramFinalize(prog_t *p) {
+    if (!p) return;
+    if (p->gfx_reflected_pipeline) {
+        gfx_backend_reflected_pipeline_destroy((GfxReflectedPipeline *)p->gfx_reflected_pipeline);
+        p->gfx_reflected_pipeline = NULL;
+    }
+    p->magic = 0;
+}
 static void nvnProgramSetDebugLabel(prog_t *p, const char *l) { (void)p; (void)l; }
 static uint32_t nvnProgramSetShaders(prog_t *p, int n, const void *shaders) {
     if (!nvn_obj(p, NVN_MAGIC('P', 'R', 'O', 'G'), "nvnProgramSetShaders")) return 0;
@@ -1608,6 +1767,69 @@ int runtime_nvn_program_load_spirv(void *prog, const char *vs_path, const char *
     return 1;
 }
 
+/* Load a translated pair with the complete .res.json descriptor map.  The
+ * vertex side stays in set 0 and the pixel side is moved to set 1, matching
+ * the Android reflected-pipeline convention. */
+int runtime_nvn_program_load_spirv_reflect(void *prog, const char *vs_path, const char *ps_path,
+                                           const char *vs_res, const char *ps_res) {
+    prog_t *p = prog;
+    if (!p || p->magic != NVN_MAGIC('P', 'R', 'O', 'G') ||
+        !vs_path || !ps_path || !vs_res || !ps_res) return 0;
+    uint8_t *vs = NULL, *ps = NULL;
+    size_t vs_size = 0, ps_size = 0;
+    if (!nvn_read_file(vs_path, &vs, &vs_size) || !nvn_read_file(ps_path, &ps, &ps_size)) {
+        free(vs); free(ps);
+        fprintf(stderr, "[totk-nvn] ERROR read SPIR-V %s / %s\n", vs_path, ps_path);
+        return 0;
+    }
+    gfx_spirv_move_set(ps, ps_size, 0, 1);
+    GfxBindingSpec vss[64], pss[64];
+    unsigned nvs = gfx_reflect_full(vs_res, vs_path, 0, vss, 64);
+    unsigned nps = gfx_reflect_full(ps_res, ps_path, 1, pss, 64);
+    int fmt = gfx_backend_vk_format_for_nvn(0x25);
+    GfxReflectedPipeline *pipeline = gfx_backend_reflected_pipeline_create(
+        vs, vs_size, ps, ps_size, fmt, vss, nvs, pss, nps);
+    free(vs); free(ps);
+    if (!pipeline) {
+        fprintf(stderr, "[totk-nvn] ERROR create reflected pipeline vs=%s ps=%s\n", vs_path, ps_path);
+        return 0;
+    }
+    p->gfx_reflected_pipeline = pipeline;
+    fprintf(stderr, "[totk-nvn] loaded reflected SPIR-V vs=%s(%u) ps=%s(%u)\n",
+            vs_path, nvs, ps_path, nps);
+    return 1;
+}
+
+int runtime_nvn_program_bind_texture(void *prog, uint32_t set, uint32_t binding,
+                                     const void *texture) {
+    prog_t *p = prog;
+    const tex_t *t = texture;
+    if (!p || p->magic != NVN_MAGIC('P', 'R', 'O', 'G') || !p->gfx_reflected_pipeline ||
+        !t || t->magic != NVN_MAGIC('T', 'E', 'X', 0)) return 0;
+    GfxTexture *g = nvn_texture_gfx(t);
+    if (!g) return 0;
+    return gfx_backend_reflected_bind_texture((GfxReflectedPipeline *)p->gfx_reflected_pipeline,
+                                              set, binding, g);
+}
+
+int runtime_nvn_program_write_uniform(void *prog, uint32_t set, uint32_t binding,
+                                      uint32_t offset, const void *data, size_t size) {
+    prog_t *p = prog;
+    if (!p || p->magic != NVN_MAGIC('P', 'R', 'O', 'G') || !p->gfx_reflected_pipeline)
+        return 0;
+    return gfx_backend_reflected_write_uniform((GfxReflectedPipeline *)p->gfx_reflected_pipeline,
+                                               set, binding, offset, data, size);
+}
+
+int runtime_nvn_program_write_storage(void *prog, uint32_t set, uint32_t binding,
+                                      uint32_t offset, const void *data, size_t size) {
+    prog_t *p = prog;
+    if (!p || p->magic != NVN_MAGIC('P', 'R', 'O', 'G') || !p->gfx_reflected_pipeline)
+        return 0;
+    return gfx_backend_reflected_write_storage((GfxReflectedPipeline *)p->gfx_reflected_pipeline,
+                                               set, binding, offset, data, size);
+}
+
 static void nvnProgramSetSampleShading(prog_t *p, int v) { (void)p; (void)v; }
 static int nvnProgramGetSubtileSize(const prog_t *p) { (void)p; return 0x1000; }
 static void nvnProgramSetSubroutineLinkage(prog_t *p, int n, const void *l) { (void)p; (void)n; (void)l; }
@@ -1621,14 +1843,17 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
         if (!cb || !cb->draw_count || !cb->prog || !cb->win) continue;
         prog_t *p = cb->prog;
         win_t *w = cb->win;
-        int has_pipeline = p->gfx_pipeline || (p->textured && p->gfx_textured_pipeline);
+        int has_pipeline = p->gfx_pipeline || p->gfx_reflected_pipeline ||
+                           (p->textured && p->gfx_textured_pipeline);
         if (p->magic != NVN_MAGIC('P', 'R', 'O', 'G') || !has_pipeline ||
             w->magic != NVN_MAGIC('W', 'I', 'N', 'D') || !w->native) {
             nvn_fail("nvnQueueSubmitCommands", "draw has no program/pipeline/window");
             continue;
         }
         int drew;
-        if (p->textured && p->gfx_textured_pipeline && p->gfx_texture)
+        if (p->gfx_reflected_pipeline)
+            drew = runtime_native_window_draw_reflected_pipeline(w->native, p->gfx_reflected_pipeline);
+        else if (p->textured && p->gfx_textured_pipeline && p->gfx_texture)
             drew = runtime_native_window_draw_textured_triangle(w->native, p->gfx_textured_pipeline,
                                                                  p->gfx_texture);
         else
@@ -1705,6 +1930,94 @@ int runtime_nvn_draw_selftest(const char *screenshot, int frames,
         fprintf(stderr, "[totk-nvn] NVN draw selftest center=%02x%02x%02x%02x corner=%02x%02x%02x%02x\n",
                 center[0], center[1], center[2], center[3], corner[0], corner[1], corner[2], corner[3]);
     return ok;
+}
+
+int runtime_nvn_bind_selftest(void) {
+    tex_t tex;
+    samp_t samp;
+    tex_pool_t tp;
+    samp_pool_t sp;
+    cb_t cb;
+    memset(&tex, 0, sizeof tex);
+    memset(&samp, 0, sizeof samp);
+    memset(&tp, 0, sizeof tp);
+    memset(&sp, 0, sizeof sp);
+    memset(&cb, 0, sizeof cb);
+    tex.magic = NVN_MAGIC('T', 'E', 'X', 0);
+    samp.magic = NVN_MAGIC('S', 'A', 'M', 'P');
+    tp.magic = NVN_MAGIC('T', 'P', 'O', 'L'); tp.n = 4;
+    sp.magic = NVN_MAGIC('S', 'P', 'O', 'L'); sp.n = 4;
+    cb.magic = NVN_MAGIC('C', 'M', 'D', 'B');
+    nvn_tex_pool_add(&tp, 3, &tex);
+    nvn_samp_pool_add(&sp, 2, &samp);
+    nvnCommandBufferSetTexturePool(&cb, &tp);
+    nvnCommandBufferSetSamplerPool(&cb, &sp);
+
+    uint64_t h = nvnDeviceGetTextureHandle(NULL, 3, 2);
+    int ok = (h & 0xfffffu) == 3 && ((h >> 20) & 0xfffu) == 2;
+    ok &= nvn_tex_pool_lookup(&tp, 3) == &tex;
+    ok &= nvn_samp_pool_lookup(&sp, 2) == &samp;
+    nvnCommandBufferBindTexture(&cb, 5, 0, h);
+    nvnCommandBufferBindTexture(&cb, 5, 1, nvnDeviceGetSeparateTextureHandle(NULL, 3));
+    nvnCommandBufferBindImage(&cb, 5, 0, nvnDeviceGetImageHandle(NULL, 3));
+    nvnCommandBufferBindUniformBuffer(&cb, 0, 4, 0x1000, 0x100);
+    nvnCommandBufferBindStorageBuffer(&cb, 5, 0, 0x2000, 0x100);
+    if (nvn_trace())
+        fprintf(stderr, "[totk-nvn] bind selftest handle=%#llx ok=%d\n",
+                (unsigned long long)h, ok);
+    nvn_tex_pool_forget(&tp);
+    nvn_samp_pool_forget(&sp);
+    return ok;
+}
+
+int runtime_nvn_draw_reflect_selftest(const char *screenshot, int frames,
+                                      const char *vs_path, const char *ps_path,
+                                      const char *vs_res, const char *ps_res) {
+    if (frames < 1) frames = 1;
+    if (frames > 60) frames = 60;
+    void *nw = runtime_native_window_create(1280, 720, 0x25, 0xA1);
+    if (!nw) return 0;
+    nvn_dev_t d;
+    dev_builder_t db;
+    memset(&d, 0, sizeof d);
+    memset(&db, 0, sizeof db);
+    if (!nvnDeviceInitialize(&d, &db)) return 0;
+    queue_t q;
+    queue_builder_t qb;
+    memset(&q, 0, sizeof q);
+    memset(&qb, 0, sizeof qb);
+    qb.dev = &d; qb.flags = 1; qb.cmd_sz = 0x10000; qb.ctl_sz = 0x1000; qb.mem_sz = 0x2000;
+    if (!nvnQueueInitialize(&q, &qb)) return 0;
+    prog_t p;
+    memset(&p, 0, sizeof p);
+    if (!nvnProgramInitialize(&p, &d)) return 0;
+    if (!runtime_nvn_program_load_spirv_reflect(&p, vs_path, ps_path, vs_res, ps_res)) return 0;
+    win_t w;
+    win_builder_t wb;
+    memset(&w, 0, sizeof w);
+    memset(&wb, 0, sizeof wb);
+    wb.dev = &d; wb.native = nw; wb.ntex = 1; wb.tex[0] = (void *)(uintptr_t)1;
+    if (!nvnWindowInitialize(&w, &wb)) return 0;
+    for (int i = 0; i < frames; i++) {
+        cb_t cb;
+        if (!nvnCommandBufferInitialize(&cb, &d)) return 0;
+        cb.prog = &p;
+        cb.win = &w;
+        nvnCommandBufferBeginRecording(&cb);
+        nvnCommandBufferDrawArrays(&cb, 0, 0, 3);
+        uint64_t handle = nvnCommandBufferEndRecording(&cb);
+        nvnQueueSubmitCommands(&q, 1, &handle);
+        nvnQueuePresentTexture(&q, &w, 0);
+    }
+    uint8_t center[4] = {0}, corner[4] = {0};
+    runtime_native_window_read_pixel(nw, 640, 360, center);
+    runtime_native_window_read_pixel(nw, 0, 0, corner);
+    if (screenshot && *screenshot) runtime_native_window_screenshot(nw, screenshot);
+    if (nvn_trace())
+        fprintf(stderr, "[totk-nvn] reflected draw selftest center=%02x%02x%02x%02x corner=%02x%02x%02x%02x\n",
+                center[0], center[1], center[2], center[3], corner[0], corner[1], corner[2], corner[3]);
+    nvnProgramFinalize(&p);
+    return 1;
 }
 
 int runtime_nvn_textured_draw_selftest(const char *screenshot, int frames) {
@@ -1786,6 +2099,98 @@ int runtime_nvn_textured_draw_selftest(const char *screenshot, int frames) {
              center[2] > 80 && center[2] < 180 && corner[0] < 40;
     free(pool_mem);
     return ok;
+}
+
+int runtime_nvn_texture_bind_selftest(const char *screenshot, int frames) {
+    if (frames < 1) frames = 1;
+    if (frames > 60) frames = 60;
+    void *nw = runtime_native_window_create(1280, 720, 0x25, 0xA2);
+    if (!nw) return 0;
+    nvn_dev_t d;
+    dev_builder_t db;
+    memset(&d, 0, sizeof d);
+    memset(&db, 0, sizeof db);
+    if (!nvnDeviceInitialize(&d, &db)) return 0;
+    queue_t q;
+    queue_builder_t qb;
+    memset(&q, 0, sizeof q);
+    memset(&qb, 0, sizeof qb);
+    qb.dev = &d; qb.flags = 1; qb.cmd_sz = 0x10000; qb.ctl_sz = 0x1000; qb.mem_sz = 0x2000;
+    if (!nvnQueueInitialize(&q, &qb)) return 0;
+
+    uint8_t *pool_mem = calloc(1, 0x10000);
+    if (!pool_mem) return 0;
+    pool_t pool;
+    pool_builder_t pb;
+    memset(&pool, 0, sizeof pool);
+    memset(&pb, 0, sizeof pb);
+    pb.dev = &d; pb.mem = pool_mem; pb.size = 0x10000; pb.flags = 1;
+    if (!nvnMemoryPoolInitialize(&pool, &pb)) { free(pool_mem); return 0; }
+    tex_builder_t tb;
+    tex_t tex;
+    memset(&tex, 0, sizeof tex);
+    nvnTextureBuilderSetDefaults(&tb);
+    tb.dev = &d;
+    nvnTextureBuilderSetSize2D(&tb, 2, 2);
+    nvnTextureBuilderSetFormat(&tb, 0x25);
+    nvnTextureBuilderSetLevels(&tb, 1);
+    nvnTextureBuilderSetStorage(&tb, &pool, 0);
+    if (!nvnTextureInitialize(&tex, &tb)) { free(pool_mem); return 0; }
+    static const uint8_t checker[16] = {
+        255, 0, 0, 255,   0, 255, 0, 255,
+        0, 0, 255, 255,   255, 255, 255, 255,
+    };
+    if (runtime_guest_texture_swizzle(tex.mem, checker, 8, tex.d.target, tex.d.format,
+                                       tex.d.flags, tex.d.samples, tex.d.width, tex.d.height,
+                                       tex.d.depth, tex.d.levels, tex.d.stride,
+                                       tex.d.pkg_block_h)) { free(pool_mem); return 0; }
+    if (!runtime_nvn_texture_upload_guest(&tex)) { free(pool_mem); return 0; }
+
+    prog_t p;
+    memset(&p, 0, sizeof p);
+    if (!nvnProgramInitialize(&p, &d)) { free(pool_mem); return 0; }
+    p.gfx_reflected_pipeline = gfx_backend_reflected_builtin_texture_pipeline_create();
+    if (!p.gfx_reflected_pipeline) { free(pool_mem); return 0; }
+    if (!runtime_nvn_program_bind_texture(&p, 1, 0, &tex)) {
+        fprintf(stderr, "[totk-nvn] ERROR bind real texture to reflected PS\n");
+        nvnProgramFinalize(&p); free(pool_mem); return 0;
+    }
+
+    win_t w;
+    win_builder_t wb;
+    memset(&w, 0, sizeof w);
+    memset(&wb, 0, sizeof wb);
+    wb.dev = &d; wb.native = nw; wb.ntex = 1; wb.tex[0] = (void *)(uintptr_t)1;
+    if (!nvnWindowInitialize(&w, &wb)) {
+        nvnProgramFinalize(&p); free(pool_mem); return 0;
+    }
+    for (int i = 0; i < frames; i++) {
+        cb_t cb;
+        if (!nvnCommandBufferInitialize(&cb, &d)) {
+            nvnProgramFinalize(&p); free(pool_mem); return 0;
+        }
+        cb.prog = &p;
+        cb.win = &w;
+        nvnCommandBufferBeginRecording(&cb);
+        nvnCommandBufferDrawArrays(&cb, 0, 0, 3);
+        uint64_t handle = nvnCommandBufferEndRecording(&cb);
+        nvnQueueSubmitCommands(&q, 1, &handle);
+        nvnQueuePresentTexture(&q, &w, 0);
+    }
+    uint8_t center[4] = {0}, corner[4] = {0};
+    runtime_native_window_read_pixel(nw, 640, 360, center);
+    runtime_native_window_read_pixel(nw, 0, 0, corner);
+    if (screenshot && *screenshot) runtime_native_window_screenshot(nw, screenshot);
+    int visible = center[0] != corner[0] || center[1] != corner[1] ||
+                  center[2] != corner[2] || center[3] != corner[3];
+    if (nvn_trace())
+        fprintf(stderr, "[totk-nvn] textured reflected selftest center=%02x%02x%02x%02x"
+                        " corner=%02x%02x%02x%02x visible=%d\n",
+                center[0], center[1], center[2], center[3],
+                corner[0], corner[1], corner[2], corner[3], visible);
+    nvnProgramFinalize(&p);
+    free(pool_mem);
+    return visible;
 }
 
 static uint32_t nvnSyncInitialize(sync_t *s, const nvn_dev_t *d) { nvn_api("nvnSyncInitialize");
@@ -2017,7 +2422,12 @@ static const nvn_entry nvn_entries[] = {
     NVN_E(nvnCommandBufferEndRecording), NVN_E(nvnCommandBufferSetRenderEnable),
     NVN_E(nvnCommandBufferSetRenderTargets), NVN_E(nvnCommandBufferClearColor),
     NVN_E(nvnCommandBufferDrawArrays), NVN_E(nvnCommandBufferClearDepthStencil), NVN_E(nvnCommandBufferSetViewport),
-    NVN_E(nvnCommandBufferSetScissor),
+    NVN_E(nvnCommandBufferSetScissor), NVN_E(nvnCommandBufferSetTexturePool),
+    NVN_E(nvnCommandBufferSetSamplerPool), NVN_E(nvnCommandBufferBindUniformBuffer),
+    NVN_E(nvnCommandBufferBindUniformBuffers), NVN_E(nvnCommandBufferBindStorageBuffer),
+    NVN_E(nvnCommandBufferBindStorageBuffers), NVN_E(nvnCommandBufferBindTexture),
+    NVN_E(nvnCommandBufferBindTextures), NVN_E(nvnCommandBufferBindImage),
+    NVN_E(nvnCommandBufferBindImages),
     NVN_E(nvnProgramInitialize), NVN_E(nvnProgramFinalize), NVN_E(nvnProgramSetDebugLabel),
     NVN_E(nvnProgramSetShaders), NVN_E(nvnProgramSetShadersExt),
     NVN_E(nvnProgramSetSampleShading), NVN_E(nvnProgramGetSubtileSize),
