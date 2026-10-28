@@ -788,11 +788,21 @@ static int nvnDeviceGenerateDebugDomainId(const nvn_dev_t *d, const char *name) 
     (void)d; (void)name; return 1;
 }
 static void nvnDeviceSetWindowOriginMode(nvn_dev_t *d, int mode) {
-    if (d && nvn_obj(d, NVN_MAGIC('D', 'E', 'V', 0), "nvnDeviceSetWindowOriginMode")) d->origin = mode;
+    if (d && nvn_obj(d, NVN_MAGIC('D', 'E', 'V', 0), "nvnDeviceSetWindowOriginMode")) {
+        d->origin = mode;
+        if (nvn_trace_frame())
+            fprintf(stderr, "[totk-frame] window origin mode=%d (%s)\n", mode,
+                    mode == 1 ? "upper-left" : "lower-left");
+    }
 }
 static int nvnDeviceGetWindowOriginMode(const nvn_dev_t *d) { return d ? d->origin : 0; }
 static void nvnDeviceSetDepthMode(nvn_dev_t *d, int mode) {
-    if (d && nvn_obj(d, NVN_MAGIC('D', 'E', 'V', 0), "nvnDeviceSetDepthMode")) d->depth_mode = mode;
+    if (d && nvn_obj(d, NVN_MAGIC('D', 'E', 'V', 0), "nvnDeviceSetDepthMode")) {
+        d->depth_mode = mode;
+        if (nvn_trace_frame())
+            fprintf(stderr, "[totk-frame] depth mode=%d (%s)\n", mode,
+                    mode == 1 ? "near-is-zero" : "near-is-minus-w");
+    }
 }
 static int nvnDeviceGetDepthMode(const nvn_dev_t *d) { return d ? d->depth_mode : 0; }
 static uint32_t nvnDeviceRegisterFastClearColor(nvn_dev_t *d, const float *c, int f) { (void)d; (void)c; (void)f; return 1; }
@@ -4665,41 +4675,22 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
          * shader cbuf slot 3.) */
         if (nbound == 1 && nspec == 1) {
             int target = pspec->ubo_slot[stage][0];
-            /* The engine may bind one large support buffer (c0) and publish the
-             * draw's real constants with nvnCommandBufferUpdateUniformBuffer
-             * into a subrange of it; the shader's cbuf is that subrange.  Use
-             * the game's own most recent update that lies inside the bound
-             * range instead of handing the shader the buffer header. */
-            const void *bind_data = failed_data;
-            size_t bind_size = failed_size;
-            if (cb && failed_data) {
-                uint64_t base = (uint64_t)(uintptr_t)failed_data;
-                for (uint32_t i = cb->ncmds; i > 0; i--) {
-                    const nvn_cmd_t *uc = &cb->cmds[i - 1];
-                    if (uc->kind != NVN_CMD_UPDATE_UBO || !uc->u.update.size) continue;
-                    if (uc->u.update.dst >= base &&
-                        uc->u.update.dst + uc->u.update.size <= base + failed_size) {
-                        bind_data = (const void *)(uintptr_t)uc->u.update.dst;
-                        bind_size = uc->u.update.size;
-                        break;
-                    }
-                }
-            }
+            /* The NVN bind address is the shader cbuf base: never rebase
+             * onto an UpdateUniformBuffer subrange.  The update is replayed
+             * into the guest buffer before translation, so a shader reading
+             * rows 1..4 of a large support buffer sees the uploaded matrix at
+             * its correct offset (L1 observed the 64-byte update at +16). */
             if (target >= 0 && target != failed_slot &&
                 gfx_backend_reflected_bind_ubo_slot(rp, (uint32_t)stage, (uint32_t)target,
-                                                    bind_data, bind_size)) {
+                                                    failed_data, failed_size)) {
                 static unsigned logged;
-                if (logged++ < 8) {
-                    char range[64] = "whole";
-                    if (bind_data != failed_data)
-                        snprintf(range, sizeof range, "+%zu", (size_t)((const uint8_t *)bind_data - (const uint8_t *)failed_data));
+                if (logged++ < 8)
                     fprintf(stderr, "[totk-nvn] UBO stage=%d nvn index=%d -> shader cbuf"
-                                    " slot=%d (single-UBO program, base_size=%zu bind=%s/%zu"
-                                    " first=%08x %08x %08x %08x)\n",
-                            stage, failed_slot, target, failed_size, range, bind_size,
-                            ((const uint32_t *)bind_data)[0], ((const uint32_t *)bind_data)[1],
-                            ((const uint32_t *)bind_data)[2], ((const uint32_t *)bind_data)[3]);
-                }
+                                    " slot=%d (single-UBO program, size=%zu first=%08x"
+                                    " %08x %08x %08x)\n",
+                            stage, failed_slot, target, failed_size,
+                            ((const uint32_t *)failed_data)[0], ((const uint32_t *)failed_data)[1],
+                            ((const uint32_t *)failed_data)[2], ((const uint32_t *)failed_data)[3]);
             }
         }
         for (int i = 0; i < 16; i++) {
@@ -4760,7 +4751,13 @@ static void nvn_state_to_gfx(const nvn_render_state_t *rs, GfxPipelineState *o) 
     o->stencil_zfail_back = rs->ds.zfail_b;
     o->stencil_pass_back = rs->ds.zpass_b;
     o->cull_mode = rs->poly.cull;                  /* VkCullModeFlags values match */
-    o->front_face = rs->poly.front ? 0 : 1;        /* CCW=0, CW=1 in Vulkan */
+    /* NVN uses the OpenGL convention: NDC has +Y up and front faces are CCW
+     * in that space (NVN_FRONT_FACE_CCW = 1).  Vulkan's NDC and framebuffer
+     * have +Y down, so the same vertex order has the opposite winding; map
+     * NVN CCW to VkFrontFace CW or every NVN front face gets culled.  The
+     * guest's own matrices are authored for NVN's Y-up clip space, so this is
+     * the origin-mode transform, not a per-game flip. */
+    o->front_face = rs->poly.front ? 1 : 0;        /* CCW=1 in Vulkan, CW=0 */
     o->polygon_mode = rs->poly.mode == 2 ? 0 : rs->poly.mode == 1 ? 1 : 2;
     o->stencil_ref = (uint32_t)rs->stencil_ref;
     memcpy(o->blend_color, rs->blend_color, sizeof o->blend_color);
@@ -6103,7 +6100,9 @@ int runtime_nvn_state_selftest(const char *screenshot, int frames) {
         nvn_probe_pair_free(&pair);
     }
 
-    /* 2e. Raster cull: front-facing CCW triangle with front-face culling. */
+    /* 2e. Raster cull: the builtin triangle is CCW in NVN's Y-up clip space
+     * (CW in Vulkan's Y-down space).  NVN front=CCW + cull BACK must keep it,
+     * and cull FRONT must drop it; this pins the NVN->Vulkan winding mapping. */
     {
         const uint8_t *vs = NULL, *ps = NULL;
         size_t vs_size = 0, ps_size = 0;
@@ -6143,7 +6142,30 @@ int runtime_nvn_state_selftest(const char *screenshot, int frames) {
                 nvnQueuePresentTexture(&q, &w, 0);
             }
             runtime_native_window_read_pixel(nw, 640, 360, center);
-            ok &= nvn_probe_check("cull", center, 0x0d, 0x14, 0x14, 0x1f, 0x1f, 0x24);
+            ok &= nvn_probe_check("cullB", center, 0xf0, 0xff, 0x00, 0x0f, 0x00, 0x0f);
+
+            /* Front-face culling must remove the same NVN-CCW triangle. */
+            nvnPolygonStateSetCullFace(&poly, 1);   /* FRONT */
+            for (int i = 0; i < 1; i++) {
+                nvn_probe_cb_reset(&cb);
+                cb.tex_pool = NULL;
+                cb.draw_count = 0;
+                nvnCommandBufferBeginRecording(&cb);
+                nvnCommandBufferBindProgram(&cb, &p, -1);
+                nvnCommandBufferSetWindow(&cb, &w);
+                const float clear[4] = { 0.05f, 0.08f, 0.12f, 1.0f };
+                nvnCommandBufferClearColor(&cb, 0, clear, 0xf);
+                nvnCommandBufferSetViewport(&cb, 0, 0, 1280, 720);
+                nvnCommandBufferSetScissor(&cb, 0, 0, 1280, 720);
+                nvnCommandBufferBindPolygonState(&cb, &poly);
+                nvnCommandBufferBindUniformBuffer(&cb, 1, 0, (uint64_t)(uintptr_t)red, sizeof red);
+                nvnCommandBufferDrawArrays(&cb, NVN_DRAW_TRIANGLES, 0, 3);
+                uint64_t h2 = nvnCommandBufferEndRecording(&cb);
+                nvnQueueSubmitCommands(&q, 1, &h2);
+                nvnQueuePresentTexture(&q, &w, 0);
+            }
+            runtime_native_window_read_pixel(nw, 640, 360, center);
+            ok &= nvn_probe_check("cullF", center, 0x0d, 0x14, 0x14, 0x1f, 0x1f, 0x24);
         }
         nvnProgramFinalize(&p);
         nvn_probe_pair_free(&pair);
