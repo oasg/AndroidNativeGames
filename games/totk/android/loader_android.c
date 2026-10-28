@@ -2026,6 +2026,24 @@ int main(int argc, char **argv) {
         printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"vulkan-offscreen\"}\n");
         return 0;
     }
+    if (!strcmp(argv[2], "probe-vulkan-texture-formats")) {
+        int gfx_backend_texture_formats_selftest(void);
+        if (!gfx_backend_texture_formats_selftest()) {
+            fprintf(stderr, "[totk-vk] texture formats selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"vulkan-texture-formats\"}\n");
+        return 0;
+    }
+    if (!strcmp(argv[2], "probe-vulkan-mrt")) {
+        int gfx_backend_mrt_selftest(void);
+        if (!gfx_backend_mrt_selftest()) {
+            fprintf(stderr, "[totk-vk] MRT selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"vulkan-mrt\"}\n");
+        return 0;
+    }
     if (!strcmp(argv[2], "probe-nvn-texture")) {
         int runtime_nvn_textured_draw_selftest(const char *screenshot, int frames);
         char shot[PATH_MAX];
