@@ -29,7 +29,6 @@ Usage:
   adb push /tmp/totk-shader-cache-runtime /data/local/tmp/totk-android/shader-cache
 """
 import argparse
-import hashlib
 import json
 import pathlib
 import shutil
@@ -48,11 +47,6 @@ from prepare_shader_cache import (  # noqa: E402
 
 MAGIC = b'\x03\x02\x23\x07'
 STAGES = {0: 'vs', 1: 'ps', 5: 'cs'}
-
-
-def control_key_len(control):
-    declared = struct.unpack_from('<I', control, 0x20)[0] if len(control) >= 0x24 else 0
-    return declared if 0x7cc <= declared < 0x880 else 0x880
 
 
 def load_answers(spec):
