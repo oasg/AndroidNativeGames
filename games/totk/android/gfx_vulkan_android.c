@@ -69,22 +69,23 @@ typedef struct {
 } VulkanState;
 
 struct GfxOffscreenTarget {
-    VkImage image;
-    VkDeviceMemory image_mem;
-    VkImageView view;
-    VkBuffer readback;
-    VkDeviceMemory readback_mem;
-    VkFormat format;
+    GfxRenderTargetLayout rt_layout;
+    VkImage color_image[GFX_MAX_COLOR_TARGETS];
+    VkDeviceMemory color_mem[GFX_MAX_COLOR_TARGETS];
+    VkImageView color_view[GFX_MAX_COLOR_TARGETS];
+    VkBuffer color_readback[GFX_MAX_COLOR_TARGETS];
+    VkDeviceMemory color_readback_mem[GFX_MAX_COLOR_TARGETS];
+    uint8_t *color_pixels[GFX_MAX_COLOR_TARGETS];
+    size_t color_size[GFX_MAX_COLOR_TARGETS];
+    VkFormat color_format[GFX_MAX_COLOR_TARGETS];
+    uint32_t color_bpp[GFX_MAX_COLOR_TARGETS];
     VkImage depth_image;
     VkDeviceMemory depth_mem;
     VkImageView depth_view;
     VkFormat depth_format;
     uint32_t width;
     uint32_t height;
-    uint32_t bpp;
-    VkImageLayout layout;
-    uint8_t *pixels;
-    size_t pixels_size;
+    VkImageLayout layout_state;
     unsigned presents;
 };
 
@@ -352,8 +353,17 @@ const char *gfx_backend_name(void) {
 static VkFormatInfo vk_format_info(VkFormat f) {
     switch (f) {
     case VK_FORMAT_R8_UNORM: return (VkFormatInfo){f, "R8_UNORM", 1};
+    case VK_FORMAT_R8_SNORM: return (VkFormatInfo){f, "R8_SNORM", 1};
+    case VK_FORMAT_R8_UINT: return (VkFormatInfo){f, "R8_UINT", 1};
+    case VK_FORMAT_R8_SINT: return (VkFormatInfo){f, "R8_SINT", 1};
     case VK_FORMAT_R8G8_UNORM: return (VkFormatInfo){f, "R8G8_UNORM", 2};
+    case VK_FORMAT_R8G8_SNORM: return (VkFormatInfo){f, "R8G8_SNORM", 2};
+    case VK_FORMAT_R8G8_UINT: return (VkFormatInfo){f, "R8G8_UINT", 2};
+    case VK_FORMAT_R8G8_SINT: return (VkFormatInfo){f, "R8G8_SINT", 2};
     case VK_FORMAT_R8G8B8_UNORM: return (VkFormatInfo){f, "R8G8B8_UNORM", 3};
+    case VK_FORMAT_R8G8B8_SNORM: return (VkFormatInfo){f, "R8G8B8_SNORM", 3};
+    case VK_FORMAT_R8G8B8_UINT: return (VkFormatInfo){f, "R8G8B8_UINT", 3};
+    case VK_FORMAT_R8G8B8_SINT: return (VkFormatInfo){f, "R8G8B8_SINT", 3};
     case VK_FORMAT_R8G8B8A8_UNORM: return (VkFormatInfo){f, "R8G8B8A8_UNORM", 4};
     case VK_FORMAT_R8G8B8A8_SRGB: return (VkFormatInfo){f, "R8G8B8A8_SRGB", 4};
     case VK_FORMAT_R5G6B5_UNORM_PACK16: return (VkFormatInfo){f, "R5G6B5_UNORM", 2};
@@ -364,24 +374,59 @@ static VkFormatInfo vk_format_info(VkFormat f) {
     case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return (VkFormatInfo){f, "B10G11R11_UFLOAT", 4};
     case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: return (VkFormatInfo){f, "E5B9G9R9_UFLOAT", 4};
     case VK_FORMAT_R16_UNORM: return (VkFormatInfo){f, "R16_UNORM", 2};
+    case VK_FORMAT_R16_SNORM: return (VkFormatInfo){f, "R16_SNORM", 2};
+    case VK_FORMAT_R16_UINT: return (VkFormatInfo){f, "R16_UINT", 2};
+    case VK_FORMAT_R16_SINT: return (VkFormatInfo){f, "R16_SINT", 2};
     case VK_FORMAT_R16_SFLOAT: return (VkFormatInfo){f, "R16_SFLOAT", 2};
     case VK_FORMAT_R16G16_UNORM: return (VkFormatInfo){f, "R16G16_UNORM", 4};
+    case VK_FORMAT_R16G16_SNORM: return (VkFormatInfo){f, "R16G16_SNORM", 4};
+    case VK_FORMAT_R16G16_UINT: return (VkFormatInfo){f, "R16G16_UINT", 4};
+    case VK_FORMAT_R16G16_SINT: return (VkFormatInfo){f, "R16G16_SINT", 4};
     case VK_FORMAT_R16G16_SFLOAT: return (VkFormatInfo){f, "R16G16_SFLOAT", 4};
+    case VK_FORMAT_R16G16B16_UNORM: return (VkFormatInfo){f, "R16G16B16_UNORM", 6};
+    case VK_FORMAT_R16G16B16_SNORM: return (VkFormatInfo){f, "R16G16B16_SNORM", 6};
+    case VK_FORMAT_R16G16B16_UINT: return (VkFormatInfo){f, "R16G16B16_UINT", 6};
+    case VK_FORMAT_R16G16B16_SINT: return (VkFormatInfo){f, "R16G16B16_SINT", 6};
+    case VK_FORMAT_R16G16B16_SFLOAT: return (VkFormatInfo){f, "R16G16B16_SFLOAT", 6};
     case VK_FORMAT_R16G16B16A16_UNORM: return (VkFormatInfo){f, "R16G16B16A16_UNORM", 8};
+    case VK_FORMAT_R16G16B16A16_SNORM: return (VkFormatInfo){f, "R16G16B16A16_SNORM", 8};
+    case VK_FORMAT_R16G16B16A16_UINT: return (VkFormatInfo){f, "R16G16B16A16_UINT", 8};
+    case VK_FORMAT_R16G16B16A16_SINT: return (VkFormatInfo){f, "R16G16B16A16_SINT", 8};
     case VK_FORMAT_R16G16B16A16_SFLOAT: return (VkFormatInfo){f, "R16G16B16A16_SFLOAT", 8};
     case VK_FORMAT_R32_SFLOAT: return (VkFormatInfo){f, "R32_SFLOAT", 4};
+    case VK_FORMAT_R32_UINT: return (VkFormatInfo){f, "R32_UINT", 4};
+    case VK_FORMAT_R32_SINT: return (VkFormatInfo){f, "R32_SINT", 4};
     case VK_FORMAT_R32G32_SFLOAT: return (VkFormatInfo){f, "R32G32_SFLOAT", 8};
+    case VK_FORMAT_R32G32_UINT: return (VkFormatInfo){f, "R32G32_UINT", 8};
+    case VK_FORMAT_R32G32_SINT: return (VkFormatInfo){f, "R32G32_SINT", 8};
+    case VK_FORMAT_R32G32B32_SFLOAT: return (VkFormatInfo){f, "R32G32B32_SFLOAT", 12};
+    case VK_FORMAT_R32G32B32_UINT: return (VkFormatInfo){f, "R32G32B32_UINT", 12};
+    case VK_FORMAT_R32G32B32_SINT: return (VkFormatInfo){f, "R32G32B32_SINT", 12};
     case VK_FORMAT_R32G32B32A32_SFLOAT: return (VkFormatInfo){f, "R32G32B32A32_SFLOAT", 16};
+    case VK_FORMAT_R32G32B32A32_UINT: return (VkFormatInfo){f, "R32G32B32A32_UINT", 16};
+    case VK_FORMAT_R32G32B32A32_SINT: return (VkFormatInfo){f, "R32G32B32A32_SINT", 16};
+    case VK_FORMAT_B8G8R8A8_UNORM: return (VkFormatInfo){f, "B8G8R8A8_UNORM", 4};
+    case VK_FORMAT_A2B10G10R10_SNORM_PACK32: return (VkFormatInfo){f, "A2B10G10R10_SNORM", 4};
     case VK_FORMAT_D16_UNORM: return (VkFormatInfo){f, "D16_UNORM", 2};
     case VK_FORMAT_X8_D24_UNORM_PACK32: return (VkFormatInfo){f, "X8_D24_UNORM", 4};
     case VK_FORMAT_D24_UNORM_S8_UINT: return (VkFormatInfo){f, "D24_UNORM_S8", 4};
     case VK_FORMAT_D32_SFLOAT: return (VkFormatInfo){f, "D32_SFLOAT", 4};
     case VK_FORMAT_D32_SFLOAT_S8_UINT: return (VkFormatInfo){f, "D32_SFLOAT_S8", 8};
     case VK_FORMAT_S8_UINT: return (VkFormatInfo){f, "S8_UINT", 1};
+    case VK_FORMAT_BC1_RGB_UNORM_BLOCK: return (VkFormatInfo){f, "BC1_RGB_UNORM", 8};
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return (VkFormatInfo){f, "BC1_RGBA_UNORM", 8};
+    case VK_FORMAT_BC2_UNORM_BLOCK: return (VkFormatInfo){f, "BC2_UNORM", 16};
     case VK_FORMAT_BC3_UNORM_BLOCK: return (VkFormatInfo){f, "BC3_UNORM", 16};
+    case VK_FORMAT_BC1_RGB_SRGB_BLOCK: return (VkFormatInfo){f, "BC1_RGB_SRGB", 8};
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return (VkFormatInfo){f, "BC1_RGBA_SRGB", 8};
+    case VK_FORMAT_BC2_SRGB_BLOCK: return (VkFormatInfo){f, "BC2_SRGB", 16};
+    case VK_FORMAT_BC3_SRGB_BLOCK: return (VkFormatInfo){f, "BC3_SRGB", 16};
+    case VK_FORMAT_BC4_UNORM_BLOCK: return (VkFormatInfo){f, "BC4_UNORM", 8};
+    case VK_FORMAT_BC4_SNORM_BLOCK: return (VkFormatInfo){f, "BC4_SNORM", 8};
     case VK_FORMAT_BC5_UNORM_BLOCK: return (VkFormatInfo){f, "BC5_UNORM", 16};
+    case VK_FORMAT_BC5_SNORM_BLOCK: return (VkFormatInfo){f, "BC5_SNORM", 16};
     case VK_FORMAT_BC7_UNORM_BLOCK: return (VkFormatInfo){f, "BC7_UNORM", 16};
+    case VK_FORMAT_BC7_SRGB_BLOCK: return (VkFormatInfo){f, "BC7_SRGB", 16};
     default: return (VkFormatInfo){VK_FORMAT_UNDEFINED, "UNSUPPORTED", 0};
     }
 }
@@ -585,6 +630,101 @@ static int vk_format_is_color_target(VkFormat f) {
     }
 }
 
+static int vk_format_is_depth(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_D16_UNORM:
+    case VK_FORMAT_X8_D24_UNORM_PACK32:
+    case VK_FORMAT_D24_UNORM_S8_UINT:
+    case VK_FORMAT_D32_SFLOAT:
+    case VK_FORMAT_D32_SFLOAT_S8_UINT:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int vk_format_is_compressed(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+    case VK_FORMAT_BC2_UNORM_BLOCK:
+    case VK_FORMAT_BC3_UNORM_BLOCK:
+    case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+    case VK_FORMAT_BC2_SRGB_BLOCK:
+    case VK_FORMAT_BC3_SRGB_BLOCK:
+    case VK_FORMAT_BC4_UNORM_BLOCK:
+    case VK_FORMAT_BC4_SNORM_BLOCK:
+    case VK_FORMAT_BC5_UNORM_BLOCK:
+    case VK_FORMAT_BC5_SNORM_BLOCK:
+    case VK_FORMAT_BC7_UNORM_BLOCK:
+    case VK_FORMAT_BC7_SRGB_BLOCK:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Tightly packed block geometry for one formatted image slice.  Compressed
+ * formats are 4x4 blocks sized 8 or 16 bytes; everything else is 1x1 texels. */
+static int vk_format_block(VkFormat f, uint32_t *bw, uint32_t *bh, uint32_t *bytes) {
+    VkFormatInfo info = vk_format_info(f);
+    if (info.bpp == 0) return 0;
+    if (vk_format_is_compressed(f)) {
+        *bw = 4; *bh = 4; *bytes = info.bpp;
+    } else {
+        *bw = 1; *bh = 1; *bytes = info.bpp;
+    }
+    return 1;
+}
+
+static VkImageAspectFlags vk_format_copy_aspect(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_D24_UNORM_S8_UINT:
+    case VK_FORMAT_D32_SFLOAT_S8_UINT:
+        return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+    case VK_FORMAT_D16_UNORM:
+    case VK_FORMAT_X8_D24_UNORM_PACK32:
+    case VK_FORMAT_D32_SFLOAT:
+        return VK_IMAGE_ASPECT_DEPTH_BIT;
+    case VK_FORMAT_S8_UINT:
+        return VK_IMAGE_ASPECT_STENCIL_BIT;
+    default:
+        return VK_IMAGE_ASPECT_COLOR_BIT;
+    }
+}
+
+/* A sampled texture view can only expose the depth aspect of a combined
+ * depth/stencil format. */
+static VkImageAspectFlags vk_format_view_aspect(VkFormat f) {
+    if (vk_format_is_depth(f)) return VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (f == VK_FORMAT_S8_UINT) return VK_IMAGE_ASPECT_STENCIL_BIT;
+    return VK_IMAGE_ASPECT_COLOR_BIT;
+}
+
+static VkSampleCountFlagBits vk_sample_count(uint32_t samples) {
+    switch (samples) {
+    case 1: return VK_SAMPLE_COUNT_1_BIT;
+    case 2: return VK_SAMPLE_COUNT_2_BIT;
+    case 4: return VK_SAMPLE_COUNT_4_BIT;
+    case 8: return VK_SAMPLE_COUNT_8_BIT;
+    case 16: return VK_SAMPLE_COUNT_16_BIT;
+    case 32: return VK_SAMPLE_COUNT_32_BIT;
+    case 64: return VK_SAMPLE_COUNT_64_BIT;
+    default: return (VkSampleCountFlagBits)0;
+    }
+}
+
+static int vk_format_can_texture(VkFormat f, VkFormatFeatureFlags *out_features) {
+    if (f == VK_FORMAT_UNDEFINED || vk_format_info(f).bpp == 0) return 0;
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(g.phys, f, &fp);
+    if (out_features) *out_features = fp.optimalTilingFeatures;
+    VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    return (fp.optimalTilingFeatures & need) == need;
+}
+
 static int vk_image_barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout old_layout,
                             VkImageLayout new_layout, VkAccessFlags src_access,
                             VkAccessFlags dst_access, VkPipelineStageFlags src_stage,
@@ -610,6 +750,33 @@ static int vk_image_barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout ol
     return 1;
 }
 
+static int vk_image_barrier_range(VkCommandBuffer cmd, VkImage image, VkImageLayout old_layout,
+                                  VkImageLayout new_layout, VkAccessFlags src_access,
+                                  VkAccessFlags dst_access, VkPipelineStageFlags src_stage,
+                                  VkPipelineStageFlags dst_stage, VkImageAspectFlags aspect,
+                                  uint32_t base_level, uint32_t level_count,
+                                  uint32_t base_layer, uint32_t layer_count) {
+    VkImageMemoryBarrier b = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = src_access,
+        .dstAccessMask = dst_access,
+        .oldLayout = old_layout,
+        .newLayout = new_layout,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresourceRange = {
+            .aspectMask = aspect,
+            .baseMipLevel = base_level,
+            .levelCount = level_count,
+            .baseArrayLayer = base_layer,
+            .layerCount = layer_count,
+        },
+    };
+    vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &b);
+    return 1;
+}
+
 static int vk_submit_and_wait(VkCommandBuffer cmd, const char *what) {
     VkResult r = vkEndCommandBuffer(cmd);
     if (!vk_ok(r, "vkEndCommandBuffer")) return 0;
@@ -628,15 +795,302 @@ static int vk_submit_and_wait(VkCommandBuffer cmd, const char *what) {
     return 1;
 }
 
+/* Submission fences.  Every backend submission above is synchronous, so a
+ * fence can only become signaled once the queue has actually drained.  We
+ * still wait on the queue in signal()/wait() so a future async submit path
+ * cannot report completion early. */
+struct GfxFence {
+    int signaled;
+};
+
+GfxFence *gfx_backend_fence_create(void) {
+    GfxFence *f = calloc(1, sizeof *f);
+    if (!f) return NULL;
+    return f;
+}
+
+void gfx_backend_fence_signal(GfxFence *fence) {
+    if (!fence) return;
+    pthread_mutex_lock(&g_lock);
+    int done = 1;
+    if (g.ready && g.queue) {
+        VkResult r = vkQueueWaitIdle(g.queue);
+        if (r != VK_SUCCESS) {
+            vk_log("ERROR fence signal: vkQueueWaitIdle=%d", (int)r);
+            done = 0;
+        }
+    }
+    if (done) fence->signaled = 1;
+    pthread_mutex_unlock(&g_lock);
+}
+
+int gfx_backend_fence_wait(GfxFence *fence, uint64_t timeout_ns) {
+    if (!fence) return 0;
+    pthread_mutex_lock(&g_lock);
+    if (fence->signaled) {
+        pthread_mutex_unlock(&g_lock);
+        return 1;
+    }
+    int done = 0;
+    if (!g.ready || !g.queue) {
+        /* No GPU work was ever submitted; the fence is trivially idle. */
+        done = 1;
+    } else if (timeout_ns > 0) {
+        VkResult r = vkQueueWaitIdle(g.queue);
+        if (r == VK_SUCCESS) done = 1;
+        else vk_log("ERROR fence wait: vkQueueWaitIdle=%d", (int)r);
+    }
+    if (done) fence->signaled = 1;
+    pthread_mutex_unlock(&g_lock);
+    return done;
+}
+
+void gfx_backend_fence_destroy(GfxFence *fence) {
+    free(fence);
+}
+
+int gfx_backend_queue_idle(void) {
+    pthread_mutex_lock(&g_lock);
+    int idle = 1;
+    if (g.ready && g.dev && g.queue) {
+        VkResult r = vkQueueWaitIdle(g.queue);
+        idle = r == VK_SUCCESS;
+        if (!idle) vk_log("ERROR queue_idle: vkQueueWaitIdle=%d", (int)r);
+    }
+    pthread_mutex_unlock(&g_lock);
+    return idle;
+}
+
+static int vk_create_host_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                                 VkBuffer *buf, VkDeviceMemory *mem) {
+    if (!size) size = 1;
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    if (!vk_ok(vkCreateBuffer(g.dev, &bci, NULL, buf), "vkCreateBuffer(host)")) return 0;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(g.dev, *buf, &req);
+    uint32_t mt = 0;
+    if (!vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &mt)) {
+        vk_log("ERROR no host-visible memory type");
+        vkDestroyBuffer(g.dev, *buf, NULL);
+        *buf = VK_NULL_HANDLE;
+        return 0;
+    }
+    VkMemoryAllocateInfo mai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size,
+        .memoryTypeIndex = mt,
+    };
+    if (!vk_ok(vkAllocateMemory(g.dev, &mai, NULL, mem), "vkAllocateMemory(host)")) {
+        vkDestroyBuffer(g.dev, *buf, NULL);
+        *buf = VK_NULL_HANDLE;
+        return 0;
+    }
+    if (!vk_ok(vkBindBufferMemory(g.dev, *buf, *mem, 0), "vkBindBufferMemory(host)")) {
+        vkFreeMemory(g.dev, *mem, NULL);
+        vkDestroyBuffer(g.dev, *buf, NULL);
+        *buf = VK_NULL_HANDLE;
+        *mem = VK_NULL_HANDLE;
+        return 0;
+    }
+    return 1;
+}
+
+static int vk_create_device_image(VkImageType type, VkFormat fmt, uint32_t w, uint32_t h,
+                                  uint32_t d, uint32_t mips, uint32_t layers,
+                                  VkSampleCountFlagBits samples, VkImageUsageFlags usage,
+                                  VkImageCreateFlags flags, VkImage *image,
+                                  VkDeviceMemory *mem) {
+    VkImageCreateInfo ici = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .flags = flags,
+        .imageType = type,
+        .format = fmt,
+        .extent = { w, h, d },
+        .mipLevels = mips,
+        .arrayLayers = layers,
+        .samples = samples,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    if (!vk_ok(vkCreateImage(g.dev, &ici, NULL, image), "vkCreateImage")) return 0;
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(g.dev, *image, &req);
+    uint32_t mt = 0;
+    if (!vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &mt) &&
+        !vk_mem_type(req.memoryTypeBits, 0, &mt)) {
+        vk_log("ERROR no image memory type");
+        vkDestroyImage(g.dev, *image, NULL);
+        *image = VK_NULL_HANDLE;
+        return 0;
+    }
+    VkMemoryAllocateInfo mai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size,
+        .memoryTypeIndex = mt,
+    };
+    if (!vk_ok(vkAllocateMemory(g.dev, &mai, NULL, mem), "vkAllocateMemory(image)")) {
+        vkDestroyImage(g.dev, *image, NULL);
+        *image = VK_NULL_HANDLE;
+        return 0;
+    }
+    if (!vk_ok(vkBindImageMemory(g.dev, *image, *mem, 0), "vkBindImageMemory")) {
+        vkFreeMemory(g.dev, *mem, NULL);
+        vkDestroyImage(g.dev, *image, NULL);
+        *image = VK_NULL_HANDLE;
+        *mem = VK_NULL_HANDLE;
+        return 0;
+    }
+    return 1;
+}
+
+static GfxOffscreenTarget *vk_offscreen_create_layout_locked(uint32_t width, uint32_t height,
+                                                             const GfxRenderTargetLayout *layout) {
+    if (!layout || layout->color_count < 1 || layout->color_count > GFX_MAX_COLOR_TARGETS) {
+        vk_log("ERROR offscreen layout: color_count=%u", layout ? layout->color_count : 0);
+        return NULL;
+    }
+    if (!width || !height || width > 16384 || height > 16384) {
+        vk_log("ERROR offscreen size %ux%u", width, height);
+        return NULL;
+    }
+    for (uint32_t i = 0; i < layout->color_count; i++) {
+        VkFormat fmt = (VkFormat)layout->color_formats[i];
+        VkFormatInfo info = vk_format_info(fmt);
+        if (fmt == VK_FORMAT_UNDEFINED || !info.bpp) {
+            vk_log("ERROR offscreen attachment %u: unsupported format %d", i, (int)fmt);
+            return NULL;
+        }
+        if (!vk_format_is_color_target(fmt) || info.bpp < 1 || info.bpp > 16) {
+            vk_log("ERROR offscreen attachment %u: %s is not a color format", i, info.name);
+            return NULL;
+        }
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(g.phys, fmt, &fp);
+        VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                                    VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                    VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        if ((fp.optimalTilingFeatures & need) != need) {
+            vk_log("ERROR offscreen attachment %u: %s lacks color/transfer feature (optimal=%#x)",
+                   i, info.name, fp.optimalTilingFeatures);
+            return NULL;
+        }
+    }
+    VkFormat depth_fmt = (VkFormat)layout->depth_format;
+    if (layout->depth_format) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(g.phys, depth_fmt, &fp);
+        if (!vk_format_is_depth(depth_fmt) ||
+            !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+            vk_log("ERROR offscreen depth format %d (%s) is not a depth attachment",
+                   (int)depth_fmt, vk_format_name(depth_fmt));
+            return NULL;
+        }
+    }
+
+    GfxOffscreenTarget *t = calloc(1, sizeof *t);
+    if (!t) return NULL;
+    t->rt_layout = *layout;
+    t->width = width;
+    t->height = height;
+    t->layout_state = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    for (uint32_t i = 0; i < layout->color_count; i++) {
+        VkFormat fmt = (VkFormat)layout->color_formats[i];
+        VkFormatInfo info = vk_format_info(fmt);
+        size_t bytes = (size_t)width * height * info.bpp;
+        t->color_format[i] = fmt;
+        t->color_bpp[i] = info.bpp;
+        t->color_size[i] = bytes;
+        t->color_pixels[i] = calloc(1, bytes ? bytes : 1);
+        if (!t->color_pixels[i]) goto fail;
+        if (!vk_create_device_image(VK_IMAGE_TYPE_2D, fmt, width, height, 1, 1, 1,
+                                    VK_SAMPLE_COUNT_1_BIT,
+                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                    0, &t->color_image[i], &t->color_mem[i]))
+            goto fail;
+        VkImageViewCreateInfo vci = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = t->color_image[i],
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = fmt,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0, .levelCount = 1,
+                .baseArrayLayer = 0, .layerCount = 1,
+            },
+        };
+        if (!vk_ok(vkCreateImageView(g.dev, &vci, NULL, &t->color_view[i]),
+                   "vkCreateImageView(offscreen color)"))
+            goto fail;
+        if (!vk_create_host_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                   &t->color_readback[i], &t->color_readback_mem[i]))
+            goto fail;
+    }
+
+    if (layout->depth_format) {
+        t->depth_format = depth_fmt;
+        if (!vk_create_device_image(VK_IMAGE_TYPE_2D, depth_fmt, width, height, 1, 1, 1,
+                                    VK_SAMPLE_COUNT_1_BIT,
+                                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                                    0, &t->depth_image, &t->depth_mem))
+            goto fail;
+        VkImageViewCreateInfo dvci = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = t->depth_image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = depth_fmt,
+            .subresourceRange = {
+                .aspectMask = vk_format_is_depth(depth_fmt)
+                                  ? (VkImageAspectFlags)(vk_format_copy_aspect(depth_fmt) &
+                                                         (VK_IMAGE_ASPECT_DEPTH_BIT |
+                                                          VK_IMAGE_ASPECT_STENCIL_BIT))
+                                  : VK_IMAGE_ASPECT_DEPTH_BIT,
+                .baseMipLevel = 0, .levelCount = 1,
+                .baseArrayLayer = 0, .layerCount = 1,
+            },
+        };
+        if (!vk_ok(vkCreateImageView(g.dev, &dvci, NULL, &t->depth_view),
+                   "vkCreateImageView(offscreen depth)"))
+            goto fail;
+    }
+    return t;
+
+fail:
+    gfx_backend_offscreen_destroy(t);
+    return NULL;
+}
+
+GfxOffscreenTarget *gfx_backend_offscreen_create_layout(uint32_t width, uint32_t height,
+                                                        const GfxRenderTargetLayout *layout) {
+    pthread_mutex_lock(&g_lock);
+    if (!vk_init_locked()) { pthread_mutex_unlock(&g_lock); return NULL; }
+    GfxOffscreenTarget *t = vk_offscreen_create_layout_locked(width, height, layout);
+    if (t) {
+        vk_log("offscreen %ux%u color_count=%u layouts=%s,%s depth=%s image=%p",
+               width, height, t->rt_layout.color_count,
+               vk_format_name(t->color_format[0]),
+               t->rt_layout.color_count > 1 ? vk_format_name(t->color_format[1]) : "-",
+               t->depth_view ? vk_format_name(t->depth_format) : "none",
+               (void *)t->color_image[0]);
+    }
+    pthread_mutex_unlock(&g_lock);
+    return t;
+}
+
 GfxOffscreenTarget *gfx_backend_offscreen_create(uint32_t width, uint32_t height,
                                                   uint32_t nvn_format) {
     pthread_mutex_lock(&g_lock);
     if (!vk_init_locked()) { pthread_mutex_unlock(&g_lock); return NULL; }
-    if (!width || !height || width > 16384 || height > 16384) {
-        vk_log("ERROR offscreen size %ux%u", width, height);
-        pthread_mutex_unlock(&g_lock);
-        return NULL;
-    }
     VkFormat fmt = (VkFormat)gfx_backend_vk_format_for_nvn(nvn_format);
     VkFormatInfo info = vk_format_info(fmt);
     if (fmt == VK_FORMAT_UNDEFINED || !info.bpp) {
@@ -649,131 +1103,17 @@ GfxOffscreenTarget *gfx_backend_offscreen_create(uint32_t width, uint32_t height
         pthread_mutex_unlock(&g_lock);
         return NULL;
     }
-    VkFormatProperties fp;
-    vkGetPhysicalDeviceFormatProperties(g.phys, fmt, &fp);
-    VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
-                               VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
-                               VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-    if ((fp.optimalTilingFeatures & need) != need) {
-        vk_log("ERROR format %s lacks color/transfer feature (optimal=%#x)", info.name,
-               fp.optimalTilingFeatures);
-        pthread_mutex_unlock(&g_lock);
-        return NULL;
-    }
-
-    GfxOffscreenTarget *t = calloc(1, sizeof *t);
-    if (!t) { pthread_mutex_unlock(&g_lock); return NULL; }
-    t->format = fmt;
-    t->width = width;
-    t->height = height;
-    t->bpp = info.bpp;
-    t->layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    t->pixels_size = (size_t)width * height * t->bpp;
-    t->pixels = calloc(1, t->pixels_size ? t->pixels_size : 1);
-    if (!t->pixels) goto fail;
-
-    VkImageCreateInfo ici = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .imageType = VK_IMAGE_TYPE_2D,
-        .format = fmt,
-        .extent = { width, height, 1 },
-        .mipLevels = 1,
-        .arrayLayers = 1,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                 VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-    };
-    if (!vk_ok(vkCreateImage(g.dev, &ici, NULL, &t->image), "vkCreateImage(offscreen)")) goto fail;
-    VkMemoryRequirements req;
-    vkGetImageMemoryRequirements(g.dev, t->image, &req);
-    uint32_t mt = 0;
-    if (!vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &mt) &&
-        !vk_mem_type(req.memoryTypeBits, 0, &mt)) {
-        vk_log("ERROR no image memory type");
-        goto fail;
-    }
-    VkMemoryAllocateInfo mai = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = req.size,
-        .memoryTypeIndex = mt,
-    };
-    if (!vk_ok(vkAllocateMemory(g.dev, &mai, NULL, &t->image_mem), "vkAllocateMemory(image)")) goto fail;
-    if (!vk_ok(vkBindImageMemory(g.dev, t->image, t->image_mem, 0), "vkBindImageMemory")) goto fail;
-    VkImageViewCreateInfo vci = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image = t->image,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format = fmt,
-        .subresourceRange = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel = 0,
-            .levelCount = 1,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
-        },
-    };
-    if (!vk_ok(vkCreateImageView(g.dev, &vci, NULL, &t->view), "vkCreateImageView")) goto fail;
-
-    t->depth_format = g.depth_format;
-    VkImageCreateInfo dci = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .imageType = VK_IMAGE_TYPE_2D,
-        .format = t->depth_format,
-        .extent = { width, height, 1 },
-        .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-    };
-    if (!vk_ok(vkCreateImage(g.dev, &dci, NULL, &t->depth_image), "vkCreateImage(depth)")) goto fail;
-    vkGetImageMemoryRequirements(g.dev, t->depth_image, &req);
-    if (!vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &mt) &&
-        !vk_mem_type(req.memoryTypeBits, 0, &mt)) goto fail;
-    mai.allocationSize = req.size;
-    mai.memoryTypeIndex = mt;
-    if (!vk_ok(vkAllocateMemory(g.dev, &mai, NULL, &t->depth_mem), "vkAllocateMemory(depth)")) goto fail;
-    if (!vk_ok(vkBindImageMemory(g.dev, t->depth_image, t->depth_mem, 0), "vkBindImageMemory(depth)")) goto fail;
-    VkImageViewCreateInfo dvci = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image = t->depth_image, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = t->depth_format,
-        .subresourceRange = {
-            .aspectMask = t->depth_format == VK_FORMAT_D24_UNORM_S8_UINT
-                              ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
-                              : VK_IMAGE_ASPECT_DEPTH_BIT,
-            .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 } };
-    if (!vk_ok(vkCreateImageView(g.dev, &dvci, NULL, &t->depth_view), "vkCreateImageView(depth)")) goto fail;
-
-    VkBufferCreateInfo bci = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = t->pixels_size,
-        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-    };
-    if (!vk_ok(vkCreateBuffer(g.dev, &bci, NULL, &t->readback), "vkCreateBuffer(readback)")) goto fail;
-    vkGetBufferMemoryRequirements(g.dev, t->readback, &req);
-    if (!vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &mt)) {
-        vk_log("ERROR no host-visible readback memory type");
-        goto fail;
-    }
-    mai.allocationSize = req.size;
-    mai.memoryTypeIndex = mt;
-    if (!vk_ok(vkAllocateMemory(g.dev, &mai, NULL, &t->readback_mem), "vkAllocateMemory(readback)")) goto fail;
-    if (!vk_ok(vkBindBufferMemory(g.dev, t->readback, t->readback_mem, 0), "vkBindBufferMemory")) goto fail;
-
+    GfxRenderTargetLayout layout = { 0 };
+    layout.color_count = 1;
+    layout.color_formats[0] = (int)fmt;
+    layout.depth_format = (int)g.depth_format;
+    GfxOffscreenTarget *t = vk_offscreen_create_layout_locked(width, height, &layout);
+    if (t)
+        vk_log("offscreen %ux%u nvn=%#x vk=%s(%d) bpp=%u image=%p",
+               width, height, nvn_format, info.name, (int)fmt, info.bpp,
+               (void *)t->color_image[0]);
     pthread_mutex_unlock(&g_lock);
-    vk_log("offscreen %ux%u nvn=%#x vk=%s(%d) bpp=%u image=%p",
-           width, height, nvn_format, info.name, (int)fmt, t->bpp, (void *)t->image);
     return t;
-
-fail:
-    gfx_backend_offscreen_destroy(t);
-    pthread_mutex_unlock(&g_lock);
-    return NULL;
 }
 
 void gfx_backend_offscreen_destroy(GfxOffscreenTarget *t) {
@@ -781,16 +1121,20 @@ void gfx_backend_offscreen_destroy(GfxOffscreenTarget *t) {
     /* destroy is also called from the create failure path while g_lock is held;
      * keep it lock-free and only touch per-target objects. */
     if (g.dev) {
-        if (t->readback) vkDestroyBuffer(g.dev, t->readback, NULL);
-        if (t->readback_mem) vkFreeMemory(g.dev, t->readback_mem, NULL);
+        for (uint32_t i = 0; i < t->rt_layout.color_count; i++) {
+            if (t->color_readback[i]) vkDestroyBuffer(g.dev, t->color_readback[i], NULL);
+            if (t->color_readback_mem[i]) vkFreeMemory(g.dev, t->color_readback_mem[i], NULL);
+            if (t->color_view[i]) vkDestroyImageView(g.dev, t->color_view[i], NULL);
+            if (t->color_image[i]) vkDestroyImage(g.dev, t->color_image[i], NULL);
+            if (t->color_mem[i]) vkFreeMemory(g.dev, t->color_mem[i], NULL);
+            free(t->color_pixels[i]);
+        }
         if (t->depth_view) vkDestroyImageView(g.dev, t->depth_view, NULL);
         if (t->depth_image) vkDestroyImage(g.dev, t->depth_image, NULL);
         if (t->depth_mem) vkFreeMemory(g.dev, t->depth_mem, NULL);
-        if (t->view) vkDestroyImageView(g.dev, t->view, NULL);
-        if (t->image) vkDestroyImage(g.dev, t->image, NULL);
-        if (t->image_mem) vkFreeMemory(g.dev, t->image_mem, NULL);
+    } else {
+        for (uint32_t i = 0; i < t->rt_layout.color_count; i++) free(t->color_pixels[i]);
     }
-    free(t->pixels);
     free(t);
 }
 
@@ -806,85 +1150,109 @@ int gfx_backend_offscreen_clear(GfxOffscreenTarget *t, float r, float g_, float 
         pthread_mutex_unlock(&g_lock);
         return 0;
     }
-    if (t->layout != VK_IMAGE_LAYOUT_GENERAL) {
-        vk_image_barrier(cmd, t->image, t->layout, VK_IMAGE_LAYOUT_GENERAL, 0,
-                         VK_ACCESS_TRANSFER_WRITE_BIT,
-                         t->layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-                                                                : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT);
-    }
     VkClearColorValue color = { .float32 = { r, g_, b, a } };
     VkImageSubresourceRange range = {
         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
         .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1,
     };
-    vkCmdClearColorImage(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, &color, 1, &range);
-    VkBufferImageCopy region = {
-        .bufferOffset = 0,
-        .bufferRowLength = 0,
-        .bufferImageHeight = 0,
-        .imageSubresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                              .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 },
-        .imageOffset = { 0, 0, 0 },
-        .imageExtent = { t->width, t->height, 1 },
-    };
-    vkCmdCopyImageToBuffer(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, t->readback, 1, &region);
-    VkBufferMemoryBarrier bb = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = t->readback,
-        .offset = 0,
-        .size = VK_WHOLE_SIZE,
-    };
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-                         0, 0, NULL, 1, &bb, 0, NULL);
-    if (!vk_submit_and_wait(cmd, "clear")) { pthread_mutex_unlock(&g_lock); return 0; }
-    t->layout = VK_IMAGE_LAYOUT_GENERAL;
-
-    void *mapped = NULL;
-    if (!vk_ok(vkMapMemory(g.dev, t->readback_mem, 0, VK_WHOLE_SIZE, 0, &mapped),
-               "vkMapMemory(readback)")) {
-        pthread_mutex_unlock(&g_lock);
-        return 0;
+    for (uint32_t i = 0; i < t->rt_layout.color_count; i++) {
+        if (t->layout_state != VK_IMAGE_LAYOUT_GENERAL) {
+            vk_image_barrier_range(cmd, t->color_image[i], t->layout_state, VK_IMAGE_LAYOUT_GENERAL,
+                                   0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                   t->layout_state == VK_IMAGE_LAYOUT_UNDEFINED
+                                       ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                                       : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
+        }
+        vkCmdClearColorImage(cmd, t->color_image[i], VK_IMAGE_LAYOUT_GENERAL, &color, 1, &range);
+        VkBufferImageCopy region = {
+            .bufferOffset = 0,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                  .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 },
+            .imageOffset = { 0, 0, 0 },
+            .imageExtent = { t->width, t->height, 1 },
+        };
+        vkCmdCopyImageToBuffer(cmd, t->color_image[i], VK_IMAGE_LAYOUT_GENERAL,
+                               t->color_readback[i], 1, &region);
+        VkBufferMemoryBarrier bb = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = t->color_readback[i],
+            .offset = 0,
+            .size = VK_WHOLE_SIZE,
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                             0, 0, NULL, 1, &bb, 0, NULL);
     }
-    memcpy(t->pixels, mapped, t->pixels_size);
-    vkUnmapMemory(g.dev, t->readback_mem);
+    if (!vk_submit_and_wait(cmd, "clear")) { pthread_mutex_unlock(&g_lock); return 0; }
+    t->layout_state = VK_IMAGE_LAYOUT_GENERAL;
+
+    for (uint32_t i = 0; i < t->rt_layout.color_count; i++) {
+        void *mapped = NULL;
+        if (!vk_ok(vkMapMemory(g.dev, t->color_readback_mem[i], 0, VK_WHOLE_SIZE, 0, &mapped),
+                   "vkMapMemory(clear readback)")) {
+            pthread_mutex_unlock(&g_lock);
+            return 0;
+        }
+        memcpy(t->color_pixels[i], mapped, t->color_size[i]);
+        vkUnmapMemory(g.dev, t->color_readback_mem[i]);
+    }
     pthread_mutex_unlock(&g_lock);
     if (getenv("TOTK_ANDROID_TRACE_VK"))
-        vk_log("clear %ux%u color=(%.3f,%.3f,%.3f,%.3f) first=%02x%02x%02x%02x",
-               t->width, t->height, r, g_, b, a,
-               t->pixels[0], t->pixels[1], t->pixels[2], t->pixels[3]);
+        vk_log("clear %ux%u colors=%u color=(%.3f,%.3f,%.3f,%.3f) first=%02x%02x%02x%02x",
+               t->width, t->height, t->rt_layout.color_count, r, g_, b, a,
+               t->color_pixels[0][0], t->color_pixels[0][1],
+               t->color_pixels[0][2], t->color_pixels[0][3]);
+    return 1;
+}
+
+int gfx_backend_offscreen_read_pixel_index(const GfxOffscreenTarget *t, uint32_t index,
+                                           uint32_t x, uint32_t y, uint8_t out[4]) {
+    if (!t || !out || index >= t->rt_layout.color_count ||
+        x >= t->width || y >= t->height) return 0;
+    uint32_t bpp = t->color_bpp[index];
+    size_t off = ((size_t)y * t->width + x) * bpp;
+    if (off + bpp > t->color_size[index]) return 0;
+    memset(out, 0, 4);
+    memcpy(out, t->color_pixels[index] + off, bpp < 4 ? bpp : 4);
     return 1;
 }
 
 int gfx_backend_offscreen_read_pixel(GfxOffscreenTarget *t, uint32_t x, uint32_t y,
                                      uint8_t out[4]) {
-    if (!t || !out || x >= t->width || y >= t->height) return 0;
-    size_t off = ((size_t)y * t->width + x) * t->bpp;
-    if (off + 4 > t->pixels_size) return 0;
-    memcpy(out, t->pixels + off, 4);
-    return 1;
+    return gfx_backend_offscreen_read_pixel_index(t, 0, x, y, out);
+}
+
+uint32_t gfx_backend_offscreen_color_count(const GfxOffscreenTarget *t) {
+    return t ? t->rt_layout.color_count : 0;
+}
+
+const GfxRenderTargetLayout *gfx_backend_offscreen_layout(const GfxOffscreenTarget *t) {
+    return t ? &t->rt_layout : NULL;
 }
 
 int gfx_backend_offscreen_present(GfxOffscreenTarget *t) {
     if (!t) return 0;
     t->presents++;
-    vk_log("present #%u offscreen %ux%u %s", t->presents, t->width, t->height,
-           vk_format_name(t->format));
+    vk_log("present #%u offscreen %ux%u %s colors=%u", t->presents, t->width, t->height,
+           vk_format_name(t->color_format[0]), t->rt_layout.color_count);
     return 1;
 }
 
 uint32_t gfx_backend_offscreen_width(const GfxOffscreenTarget *t) { return t ? t->width : 0; }
 uint32_t gfx_backend_offscreen_height(const GfxOffscreenTarget *t) { return t ? t->height : 0; }
 const uint8_t *gfx_backend_offscreen_pixels(const GfxOffscreenTarget *t, size_t *size) {
-    if (size) *size = t ? t->pixels_size : 0;
-    return t ? t->pixels : NULL;
+    if (size) *size = t ? t->color_size[0] : 0;
+    return t ? t->color_pixels[0] : NULL;
 }
 const char *gfx_backend_offscreen_format_name(const GfxOffscreenTarget *t) {
-    return t ? vk_format_name(t->format) : "none";
+    return t ? vk_format_name(t->color_format[0]) : "none";
 }
 
 static int vk_choose_surface_format(VkSurfaceKHR surface, VkFormat *out_format,
@@ -1400,15 +1768,16 @@ int gfx_backend_triangle_draw(GfxTrianglePipeline *p, GfxOffscreenTarget *t,
                               float r, float g_, float b, float a) {
     if (!p || !t) return 0;
     pthread_mutex_lock(&g_lock);
-    if (!g.ready || t->format != p->format || t->bpp != 4) {
+    if (!g.ready || t->rt_layout.color_count < 1 ||
+        t->color_format[0] != p->format || t->color_bpp[0] != 4) {
         vk_log("ERROR triangle draw: format/bpp mismatch (pipeline=%d target=%d bpp=%u)",
-               (int)p->format, (int)t->format, t->bpp);
+               (int)p->format, (int)t->color_format[0], t->color_bpp[0]);
         pthread_mutex_unlock(&g_lock);
         return 0;
     }
-    if (!p->fb || p->fb_view != t->view || p->fb_w != t->width || p->fb_h != t->height) {
+    if (!p->fb || p->fb_view != t->color_view[0] || p->fb_w != t->width || p->fb_h != t->height) {
         if (p->fb) vkDestroyFramebuffer(g.dev, p->fb, NULL);
-        VkImageView view = t->view;
+        VkImageView view = t->color_view[0];
         VkFramebufferCreateInfo fci = {
             .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
             .renderPass = p->pass,
@@ -1423,7 +1792,7 @@ int gfx_backend_triangle_draw(GfxTrianglePipeline *p, GfxOffscreenTarget *t,
             pthread_mutex_unlock(&g_lock);
             return 0;
         }
-        p->fb_view = t->view;
+        p->fb_view = t->color_view[0];
         p->fb_w = t->width;
         p->fb_h = t->height;
     }
@@ -1461,14 +1830,15 @@ int gfx_backend_triangle_draw(GfxTrianglePipeline *p, GfxOffscreenTarget *t,
         .imageOffset = { 0, 0, 0 },
         .imageExtent = { t->width, t->height, 1 },
     };
-    vkCmdCopyImageToBuffer(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, t->readback, 1, &region);
+    vkCmdCopyImageToBuffer(cmd, t->color_image[0], VK_IMAGE_LAYOUT_GENERAL,
+                           t->color_readback[0], 1, &region);
     VkBufferMemoryBarrier bb = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = t->readback,
+        .buffer = t->color_readback[0],
         .offset = 0,
         .size = VK_WHOLE_SIZE,
     };
@@ -1478,15 +1848,15 @@ int gfx_backend_triangle_draw(GfxTrianglePipeline *p, GfxOffscreenTarget *t,
         pthread_mutex_unlock(&g_lock);
         return 0;
     }
-    t->layout = VK_IMAGE_LAYOUT_GENERAL;
+    t->layout_state = VK_IMAGE_LAYOUT_GENERAL;
     void *mapped = NULL;
-    if (!vk_ok(vkMapMemory(g.dev, t->readback_mem, 0, VK_WHOLE_SIZE, 0, &mapped),
+    if (!vk_ok(vkMapMemory(g.dev, t->color_readback_mem[0], 0, VK_WHOLE_SIZE, 0, &mapped),
                "vkMapMemory(triangle)")) {
         pthread_mutex_unlock(&g_lock);
         return 0;
     }
-    memcpy(t->pixels, mapped, t->pixels_size);
-    vkUnmapMemory(g.dev, t->readback_mem);
+    memcpy(t->color_pixels[0], mapped, t->color_size[0]);
+    vkUnmapMemory(g.dev, t->color_readback_mem[0]);
     pthread_mutex_unlock(&g_lock);
     return 1;
 }
@@ -1553,115 +1923,325 @@ struct GfxTexture {
     VkDeviceMemory mem;
     VkImageView view;
     VkSampler sampler;
-    uint32_t width, height;
+    uint32_t width, height, depth;
+    uint32_t mip_levels, array_layers, samples;
+    GfxTextureTarget target;
+    VkFormat format;
+    VkImageViewType view_type;
     VkImageLayout layout;
+    int readback_ok;
 };
 
-/* Callers must hold g_lock.  Kept separate from the public wrapper so the
- * reflected pipeline (which already holds the lock) can create its fallback
- * textures without deadlocking on the non-recursive g_lock. */
+static void vk_mip_extent(const GfxTextureDesc *d, uint32_t level,
+                          uint32_t *w, uint32_t *h, uint32_t *depth) {
+    *w = d->width >> level; if (!*w) *w = 1;
+    *h = d->height >> level; if (!*h) *h = 1;
+    *depth = d->target == GFX_TEXTURE_3D ? (d->depth >> level) : 1;
+    if (!*depth) *depth = 1;
+}
+
+/* Tightly packed size of one mip slice (all depth slices for a 3D image). */
+static size_t vk_texture_slice_size(const GfxTextureDesc *d, uint32_t level) {
+    uint32_t w, h, depth, bw, bh, bytes;
+    if (!vk_format_block((VkFormat)d->vk_format, &bw, &bh, &bytes)) return 0;
+    vk_mip_extent(d, level, &w, &h, &depth);
+    size_t bx = (w + bw - 1) / bw;
+    size_t by = (h + bh - 1) / bh;
+    return bx * by * bytes * depth;
+}
+
+static GfxTexture *texture_create_desc_locked(const GfxTextureDesc *desc,
+                                              const GfxTextureSubresource *subs,
+                                              uint32_t count) {
+    if (!desc || !desc->width || !desc->height || !desc->mip_levels || !desc->array_layers) {
+        vk_log("ERROR texture desc: width=%u height=%u mips=%u layers=%u",
+               desc ? desc->width : 0, desc ? desc->height : 0,
+               desc ? desc->mip_levels : 0, desc ? desc->array_layers : 0);
+        return NULL;
+    }
+    VkFormat fmt = (VkFormat)desc->vk_format;
+    VkFormatInfo info = vk_format_info(fmt);
+    uint32_t bw = 0, bh = 0, block_bytes = 0;
+    if (!vk_format_block(fmt, &bw, &bh, &block_bytes)) {
+        vk_log("ERROR texture desc: unsupported VkFormat %d", (int)fmt);
+        return NULL;
+    }
+    if (desc->mip_levels > 32 || desc->array_layers > 2048 || desc->depth > 2048) {
+        vk_log("ERROR texture desc: mips=%u layers=%u depth=%u", desc->mip_levels,
+               desc->array_layers, desc->depth);
+        return NULL;
+    }
+    VkSampleCountFlagBits samples = vk_sample_count(desc->samples ? desc->samples : 1);
+    if (!samples) {
+        vk_log("ERROR texture desc: unsupported sample count %u", desc->samples);
+        return NULL;
+    }
+
+    VkImageType image_type = VK_IMAGE_TYPE_2D;
+    VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D;
+    VkImageCreateFlags flags = 0;
+    uint32_t depth = 1;
+    switch (desc->target) {
+    case GFX_TEXTURE_2D:
+        if (desc->array_layers != 1 || desc->depth > 1) {
+            vk_log("ERROR texture desc: 2D texture with layers=%u depth=%u",
+                   desc->array_layers, desc->depth);
+            return NULL;
+        }
+        break;
+    case GFX_TEXTURE_3D:
+        if (desc->array_layers != 1 || desc->depth < 1) {
+            vk_log("ERROR texture desc: 3D texture with layers=%u depth=%u",
+                   desc->array_layers, desc->depth);
+            return NULL;
+        }
+        image_type = VK_IMAGE_TYPE_3D;
+        view_type = VK_IMAGE_VIEW_TYPE_3D;
+        depth = desc->depth;
+        break;
+    case GFX_TEXTURE_CUBE:
+        if (desc->array_layers != 6 || desc->width != desc->height || desc->depth > 1) {
+            vk_log("ERROR texture desc: cube layers=%u size=%ux%u depth=%u",
+                   desc->array_layers, desc->width, desc->height, desc->depth);
+            return NULL;
+        }
+        flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+        view_type = VK_IMAGE_VIEW_TYPE_CUBE;
+        break;
+    case GFX_TEXTURE_2D_ARRAY:
+        if (desc->depth > 1) {
+            vk_log("ERROR texture desc: 2D array depth=%u", desc->depth);
+            return NULL;
+        }
+        view_type = desc->array_layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                                           : VK_IMAGE_VIEW_TYPE_2D;
+        break;
+    case GFX_TEXTURE_CUBE_ARRAY:
+        if (desc->array_layers < 6 || (desc->array_layers % 6) ||
+            desc->width != desc->height || desc->depth > 1) {
+            vk_log("ERROR texture desc: cube array layers=%u size=%ux%u depth=%u",
+                   desc->array_layers, desc->width, desc->height, desc->depth);
+            return NULL;
+        }
+        flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+        view_type = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+        break;
+    default:
+        vk_log("ERROR texture desc: unknown target %u", desc->target);
+        return NULL;
+    }
+
+    if (samples != VK_SAMPLE_COUNT_1_BIT && count) {
+        vk_log("ERROR texture desc: MSAA texture (%u samples) cannot be uploaded directly",
+               desc->samples);
+        return NULL;
+    }
+    VkFormatFeatureFlags features = 0;
+    if (samples != VK_SAMPLE_COUNT_1_BIT) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(g.phys, fmt, &fp);
+        features = fp.optimalTilingFeatures;
+        if (!(features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+            vk_log("ERROR texture desc: %s cannot be sampled with %u samples (optimal=%#x)",
+                   info.name, desc->samples, features);
+            return NULL;
+        }
+    } else if (!vk_format_can_texture(fmt, &features)) {
+        vk_log("ERROR texture desc: %s lacks sampled/transfer features (optimal=%#x)",
+               info.name, features);
+        return NULL;
+    }
+
+    GfxTexture *t = calloc(1, sizeof *t);
+    if (!t) return NULL;
+    t->width = desc->width;
+    t->height = desc->height;
+    t->depth = depth;
+    t->mip_levels = desc->mip_levels;
+    t->array_layers = desc->array_layers;
+    t->samples = desc->samples ? desc->samples : 1;
+    t->target = (GfxTextureTarget)desc->target;
+    t->format = fmt;
+    t->view_type = view_type;
+    t->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    t->readback_ok = samples == VK_SAMPLE_COUNT_1_BIT &&
+                     (features & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) != 0;
+
+    VkImageUsageFlags usage;
+    if (samples == VK_SAMPLE_COUNT_1_BIT) {
+        usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (t->readback_ok) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    } else {
+        usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (vk_format_is_color_target(fmt)) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    }
+    if (!vk_create_device_image(image_type, fmt, desc->width, desc->height, depth,
+                                desc->mip_levels, desc->array_layers, samples,
+                                usage, flags, &t->image, &t->mem))
+        goto fail;
+    VkImageViewCreateInfo vci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = t->image,
+        .viewType = view_type,
+        .format = fmt,
+        .subresourceRange = {
+            .aspectMask = vk_format_view_aspect(fmt),
+            .baseMipLevel = 0,
+            .levelCount = desc->mip_levels,
+            .baseArrayLayer = 0,
+            .layerCount = image_type == VK_IMAGE_TYPE_3D ? 1 : desc->array_layers,
+        },
+    };
+    if (!vk_ok(vkCreateImageView(g.dev, &vci, NULL, &t->view), "vkCreateImageView(texture)"))
+        goto fail;
+    VkSamplerCreateInfo sci = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = desc->mip_levels > 1 ? VK_SAMPLER_MIPMAP_MODE_LINEAR
+                                           : VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .minLod = 0,
+        .maxLod = desc->mip_levels > 1 ? (float)(desc->mip_levels - 1) : 0,
+    };
+    if (!vk_ok(vkCreateSampler(g.dev, &sci, NULL, &t->sampler), "vkCreateSampler(texture)"))
+        goto fail;
+
+    if (count) {
+        size_t *offsets = calloc(count, sizeof *offsets);
+        if (!offsets) goto fail;
+        size_t total = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            const GfxTextureSubresource *s = &subs[i];
+            if (!s->data || s->level >= desc->mip_levels || s->layer >= desc->array_layers ||
+                (image_type == VK_IMAGE_TYPE_3D && s->layer != 0)) {
+                vk_log("ERROR texture subresource %u: level=%u/%u layer=%u/%u data=%p",
+                       i, s->level, desc->mip_levels, s->layer, desc->array_layers, s->data);
+                free(offsets);
+                goto fail;
+            }
+            size_t slice = vk_texture_slice_size(desc, s->level);
+            if (!slice || s->size < slice) {
+                vk_log("ERROR texture subresource %u: size=%zu < %zu", i, s->size, slice);
+                free(offsets);
+                goto fail;
+            }
+            size_t align = block_bytes ? block_bytes : 1;
+            while (align % 4) align += block_bytes ? block_bytes : 1;
+            offsets[i] = (total + align - 1) / align * align;
+            total = offsets[i] + slice;
+        }
+        VkBuffer staging = VK_NULL_HANDLE;
+        VkDeviceMemory stage_mem = VK_NULL_HANDLE;
+        if (!vk_create_host_buffer(total, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                   &staging, &stage_mem)) {
+            free(offsets);
+            goto fail;
+        }
+        void *mapped = NULL;
+        if (!vk_ok(vkMapMemory(g.dev, stage_mem, 0, VK_WHOLE_SIZE, 0, &mapped),
+                   "vkMapMemory(texture upload)")) {
+            free(offsets);
+            vkDestroyBuffer(g.dev, staging, NULL);
+            vkFreeMemory(g.dev, stage_mem, NULL);
+            goto fail;
+        }
+        for (uint32_t i = 0; i < count; i++)
+            memcpy((uint8_t *)mapped + offsets[i], subs[i].data,
+                   vk_texture_slice_size(desc, subs[i].level));
+        vkUnmapMemory(g.dev, stage_mem);
+
+        VkCommandBuffer cmd = g.cmd;
+        VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+        if (!vk_ok(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer(texture upload)")) {
+            free(offsets);
+            vkDestroyBuffer(g.dev, staging, NULL);
+            vkFreeMemory(g.dev, stage_mem, NULL);
+            goto fail;
+        }
+        VkBufferMemoryBarrier bmb = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = staging, .offset = 0, .size = VK_WHOLE_SIZE,
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, NULL, 1, &bmb, 0, NULL);
+        vk_image_barrier_range(cmd, t->image, VK_IMAGE_LAYOUT_UNDEFINED,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                               VK_ACCESS_TRANSFER_WRITE_BIT,
+                               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               vk_format_copy_aspect(fmt), 0, desc->mip_levels,
+                               0, image_type == VK_IMAGE_TYPE_3D ? 1 : desc->array_layers);
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t w, h, d;
+            vk_mip_extent(desc, subs[i].level, &w, &h, &d);
+            VkBufferImageCopy region = {
+                .bufferOffset = offsets[i],
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource = {
+                    .aspectMask = vk_format_copy_aspect(fmt),
+                    .mipLevel = subs[i].level,
+                    .baseArrayLayer = image_type == VK_IMAGE_TYPE_3D ? 0 : subs[i].layer,
+                    .layerCount = 1,
+                },
+                .imageOffset = { 0, 0, 0 },
+                .imageExtent = { w, h, d },
+            };
+            vkCmdCopyBufferToImage(cmd, staging, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   1, &region);
+        }
+        vk_image_barrier_range(cmd, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                               vk_format_copy_aspect(fmt), 0, desc->mip_levels,
+                               0, image_type == VK_IMAGE_TYPE_3D ? 1 : desc->array_layers);
+        int submitted = vk_submit_and_wait(cmd, "texture upload");
+        free(offsets);
+        vkDestroyBuffer(g.dev, staging, NULL);
+        vkFreeMemory(g.dev, stage_mem, NULL);
+        if (!submitted) goto fail;
+        t->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    vk_log("texture %ux%ux%u target=%u %s mips=%u layers=%u samples=%u image=%p",
+           desc->width, desc->height, depth, desc->target, info.name,
+           desc->mip_levels, desc->array_layers, t->samples, (void *)t->image);
+    return t;
+
+fail:
+    gfx_backend_texture_destroy(t);
+    return NULL;
+}
+
 static GfxTexture *texture_create_rgba8_locked(uint32_t width, uint32_t height,
                                                const uint8_t *pixels) {
     if (!width || !height || width > 8192 || height > 8192 || !pixels) return NULL;
     if (!vk_init_locked()) return NULL;
-    GfxTexture *t = calloc(1, sizeof *t);
-    if (!t) return NULL;
-    t->width = width; t->height = height;
-    size_t bytes = (size_t)width * height * 4;
-    VkImageCreateInfo ici = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .imageType = VK_IMAGE_TYPE_2D,
-        .format = VK_FORMAT_R8G8B8A8_UNORM,
-        .extent = { width, height, 1 },
-        .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    GfxTextureDesc desc = {
+        .target = GFX_TEXTURE_2D,
+        .vk_format = VK_FORMAT_R8G8B8A8_UNORM,
+        .width = width,
+        .height = height,
+        .depth = 1,
+        .mip_levels = 1,
+        .array_layers = 1,
+        .samples = 1,
     };
-    if (!vk_ok(vkCreateImage(g.dev, &ici, NULL, &t->image), "vkCreateImage(texture)")) goto fail;
-    VkMemoryRequirements req;
-    vkGetImageMemoryRequirements(g.dev, t->image, &req);
-    uint32_t mt = 0;
-    if (!vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &mt) &&
-        !vk_mem_type(req.memoryTypeBits, 0, &mt)) goto fail;
-    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-                                 .allocationSize = req.size, .memoryTypeIndex = mt };
-    if (!vk_ok(vkAllocateMemory(g.dev, &mai, NULL, &t->mem), "vkAllocateMemory(texture)")) goto fail;
-    if (!vk_ok(vkBindImageMemory(g.dev, t->image, t->mem, 0), "vkBindImageMemory(texture)")) goto fail;
-    VkImageViewCreateInfo vci = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image = t->image, .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format = VK_FORMAT_R8G8B8A8_UNORM,
-        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    GfxTextureSubresource sub = {
+        .level = 0,
+        .layer = 0,
+        .data = pixels,
+        .size = (size_t)width * height * 4,
     };
-    if (!vk_ok(vkCreateImageView(g.dev, &vci, NULL, &t->view), "vkCreateImageView(texture)")) goto fail;
-    VkSamplerCreateInfo sci = {
-        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
-        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .maxLod = 0,
-    };
-    if (!vk_ok(vkCreateSampler(g.dev, &sci, NULL, &t->sampler), "vkCreateSampler(texture)")) goto fail;
-
-    VkBuffer staging = VK_NULL_HANDLE;
-    VkDeviceMemory stage_mem = VK_NULL_HANDLE;
-    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                               .size = bytes, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                               .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
-    if (!vk_ok(vkCreateBuffer(g.dev, &bci, NULL, &staging), "vkCreateBuffer(texture staging)")) goto fail;
-    vkGetBufferMemoryRequirements(g.dev, staging, &req);
-    if (!vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &mt)) goto fail_stage;
-    mai.allocationSize = req.size; mai.memoryTypeIndex = mt;
-    if (!vk_ok(vkAllocateMemory(g.dev, &mai, NULL, &stage_mem), "vkAllocateMemory(texture staging)")) goto fail_stage;
-    if (!vk_ok(vkBindBufferMemory(g.dev, staging, stage_mem, 0), "vkBindBufferMemory(texture staging)")) goto fail_stage;
-    void *mapped = NULL;
-    if (!vk_ok(vkMapMemory(g.dev, stage_mem, 0, VK_WHOLE_SIZE, 0, &mapped), "vkMapMemory(texture)")) goto fail_stage;
-    memcpy(mapped, pixels, bytes);
-    vkUnmapMemory(g.dev, stage_mem);
-
-    VkCommandBuffer cmd = g.cmd;
-    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-    if (!vk_ok(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer(texture)")) goto fail_stage;
-    VkBufferMemoryBarrier bmb = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = staging, .offset = 0, .size = VK_WHOLE_SIZE,
-    };
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         0, 0, NULL, 1, &bmb, 0, NULL);
-    vk_image_barrier(cmd, t->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                     0, VK_ACCESS_TRANSFER_WRITE_BIT,
-                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-    VkBufferImageCopy region = {
-        .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
-        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .imageOffset = { 0, 0, 0 }, .imageExtent = { width, height, 1 },
-    };
-    vkCmdCopyBufferToImage(cmd, staging, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    vk_image_barrier(cmd, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-                     VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-    if (!vk_submit_and_wait(cmd, "texture upload")) goto fail_stage;
-    t->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    vkDestroyBuffer(g.dev, staging, NULL);
-    vkFreeMemory(g.dev, stage_mem, NULL);
-    vk_log("texture %ux%u RGBA8 image=%p", width, height, (void *)t->image);
-    return t;
-
-fail_stage:
-    if (staging) vkDestroyBuffer(g.dev, staging, NULL);
-    if (stage_mem) vkFreeMemory(g.dev, stage_mem, NULL);
-fail:
-    gfx_backend_texture_destroy(t);
-    return NULL;
+    return texture_create_desc_locked(&desc, &sub, 1);
 }
 
 GfxTexture *gfx_backend_texture_create_rgba8(uint32_t width, uint32_t height,
@@ -1670,6 +2250,133 @@ GfxTexture *gfx_backend_texture_create_rgba8(uint32_t width, uint32_t height,
     GfxTexture *t = texture_create_rgba8_locked(width, height, pixels);
     pthread_mutex_unlock(&g_lock);
     return t;
+}
+
+GfxTexture *gfx_backend_texture_create_desc(const GfxTextureDesc *desc,
+                                            const GfxTextureSubresource *subresources,
+                                            uint32_t count) {
+    if (!desc) return NULL;
+    pthread_mutex_lock(&g_lock);
+    if (!vk_init_locked()) { pthread_mutex_unlock(&g_lock); return NULL; }
+    GfxTexture *t = texture_create_desc_locked(desc, subresources, count);
+    pthread_mutex_unlock(&g_lock);
+    return t;
+}
+
+static int texture_read_pixels_locked(const GfxTexture *t, uint32_t level, uint32_t layer,
+                                      void *dst, size_t size) {
+    if (!t || !dst) return 0;
+    if (t->samples != 1) {
+        vk_log("ERROR texture read: %u-sample texture needs resolve", t->samples);
+        return 0;
+    }
+    if (!t->readback_ok) {
+        vk_log("ERROR texture read: %s was created without transfer-src support",
+               vk_format_name(t->format));
+        return 0;
+    }
+    if (level >= t->mip_levels || layer >= t->array_layers) {
+        vk_log("ERROR texture read: level=%u/%u layer=%u/%u", level, t->mip_levels,
+               layer, t->array_layers);
+        return 0;
+    }
+    GfxTextureDesc desc = {
+        .target = t->target,
+        .vk_format = t->format,
+        .width = t->width,
+        .height = t->height,
+        .depth = t->target == GFX_TEXTURE_3D ? t->depth : 1,
+        .mip_levels = t->mip_levels,
+        .array_layers = t->array_layers,
+        .samples = t->samples,
+    };
+    if (t->target == GFX_TEXTURE_3D && layer != 0) return 0;
+    size_t slice = vk_texture_slice_size(&desc, level);
+    if (!slice || size < slice) {
+        vk_log("ERROR texture read: dst size=%zu < %zu", size, slice);
+        return 0;
+    }
+    uint32_t w, h, d;
+    vk_mip_extent(&desc, level, &w, &h, &d);
+
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stage_mem = VK_NULL_HANDLE;
+    if (!vk_create_host_buffer(slice, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &staging, &stage_mem))
+        return 0;
+    VkCommandBuffer cmd = g.cmd;
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    if (!vk_ok(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer(texture read)")) {
+        vkDestroyBuffer(g.dev, staging, NULL);
+        vkFreeMemory(g.dev, stage_mem, NULL);
+        return 0;
+    }
+    VkImageAspectFlags aspect = vk_format_copy_aspect(t->format);
+    vk_image_barrier_range(cmd, t->image, t->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           0, VK_ACCESS_TRANSFER_READ_BIT,
+                           t->layout == VK_IMAGE_LAYOUT_UNDEFINED
+                               ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                               : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           aspect, level, 1, t->target == GFX_TEXTURE_3D ? 0 : layer, 1);
+    VkBufferImageCopy region = {
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = {
+            .aspectMask = aspect,
+            .mipLevel = level,
+            .baseArrayLayer = t->target == GFX_TEXTURE_3D ? 0 : layer,
+            .layerCount = 1,
+        },
+        .imageOffset = { 0, 0, 0 },
+        .imageExtent = { w, h, d },
+    };
+    vkCmdCopyImageToBuffer(cmd, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging, 1,
+                           &region);
+    vk_image_barrier_range(cmd, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                           VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                           aspect, level, 1, t->target == GFX_TEXTURE_3D ? 0 : layer, 1);
+    VkBufferMemoryBarrier bb = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = staging, .offset = 0, .size = VK_WHOLE_SIZE,
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 0, NULL, 1, &bb, 0, NULL);
+    int submitted = vk_submit_and_wait(cmd, "texture read");
+    if (submitted) ((GfxTexture *)t)->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    if (!submitted) {
+        vkDestroyBuffer(g.dev, staging, NULL);
+        vkFreeMemory(g.dev, stage_mem, NULL);
+        return 0;
+    }
+    void *mapped = NULL;
+    if (!vk_ok(vkMapMemory(g.dev, stage_mem, 0, VK_WHOLE_SIZE, 0, &mapped),
+               "vkMapMemory(texture read)")) {
+        vkDestroyBuffer(g.dev, staging, NULL);
+        vkFreeMemory(g.dev, stage_mem, NULL);
+        return 0;
+    }
+    memcpy(dst, mapped, slice);
+    vkUnmapMemory(g.dev, stage_mem);
+    vkDestroyBuffer(g.dev, staging, NULL);
+    vkFreeMemory(g.dev, stage_mem, NULL);
+    return 1;
+}
+
+int gfx_backend_texture_read_pixels(const GfxTexture *texture, uint32_t level, uint32_t layer,
+                                    void *dst, size_t size) {
+    pthread_mutex_lock(&g_lock);
+    int ok = texture_read_pixels_locked(texture, level, layer, dst, size);
+    pthread_mutex_unlock(&g_lock);
+    return ok;
 }
 
 void gfx_backend_texture_destroy(GfxTexture *t) {
@@ -1830,13 +2537,14 @@ int gfx_backend_textured_draw(GfxTexturedPipeline *p, GfxTexture *tex, GfxOffscr
                               float r, float g_, float b, float a) {
     if (!p || !tex || !t) return 0;
     pthread_mutex_lock(&g_lock);
-    if (!g.ready || t->format != p->format || t->bpp != 4) {
+    if (!g.ready || t->rt_layout.color_count < 1 ||
+        t->color_format[0] != p->format || t->color_bpp[0] != 4) {
         pthread_mutex_unlock(&g_lock);
         return 0;
     }
-    if (!p->fb || p->fb_view != t->view || p->fb_w != t->width || p->fb_h != t->height) {
+    if (!p->fb || p->fb_view != t->color_view[0] || p->fb_w != t->width || p->fb_h != t->height) {
         if (p->fb) vkDestroyFramebuffer(g.dev, p->fb, NULL);
-        VkImageView view = t->view;
+        VkImageView view = t->color_view[0];
         VkFramebufferCreateInfo fci = {
             .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
             .renderPass = p->pass, .attachmentCount = 1, .pAttachments = &view,
@@ -1846,7 +2554,7 @@ int gfx_backend_textured_draw(GfxTexturedPipeline *p, GfxTexture *tex, GfxOffscr
             pthread_mutex_unlock(&g_lock);
             return 0;
         }
-        p->fb_view = t->view; p->fb_w = t->width; p->fb_h = t->height;
+        p->fb_view = t->color_view[0]; p->fb_w = t->width; p->fb_h = t->height;
     }
     VkDescriptorImageInfo di = {
         .sampler = tex->sampler, .imageView = tex->view,
@@ -1886,28 +2594,29 @@ int gfx_backend_textured_draw(GfxTexturedPipeline *p, GfxTexture *tex, GfxOffscr
         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         .imageExtent = { t->width, t->height, 1 },
     };
-    vkCmdCopyImageToBuffer(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, t->readback, 1, &region);
+    vkCmdCopyImageToBuffer(cmd, t->color_image[0], VK_IMAGE_LAYOUT_GENERAL,
+                           t->color_readback[0], 1, &region);
     VkBufferMemoryBarrier bb = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = t->readback, .offset = 0, .size = VK_WHOLE_SIZE,
+        .buffer = t->color_readback[0], .offset = 0, .size = VK_WHOLE_SIZE,
     };
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                          0, 0, NULL, 1, &bb, 0, NULL);
     if (!vk_submit_and_wait(cmd, "textured triangle")) {
         pthread_mutex_unlock(&g_lock); return 0;
     }
-    t->layout = VK_IMAGE_LAYOUT_GENERAL;
+    t->layout_state = VK_IMAGE_LAYOUT_GENERAL;
     void *mapped = NULL;
-    if (!vk_ok(vkMapMemory(g.dev, t->readback_mem, 0, VK_WHOLE_SIZE, 0, &mapped),
+    if (!vk_ok(vkMapMemory(g.dev, t->color_readback_mem[0], 0, VK_WHOLE_SIZE, 0, &mapped),
                "vkMapMemory(tex)")) {
         pthread_mutex_unlock(&g_lock); return 0;
     }
-    memcpy(t->pixels, mapped, t->pixels_size);
-    vkUnmapMemory(g.dev, t->readback_mem);
+    memcpy(t->color_pixels[0], mapped, t->color_size[0]);
+    vkUnmapMemory(g.dev, t->color_readback_mem[0]);
     pthread_mutex_unlock(&g_lock);
     return 1;
 }
@@ -1926,9 +2635,12 @@ struct GfxReflectedPipeline {
     VkRenderPass pass;
     VkPipeline pipe;
     VkFormat format;
+    GfxRenderTargetLayout rt_layout;
     VkFramebuffer fb;
     uint32_t fb_w, fb_h;
     VkImageView fb_view;
+    VkImageView fb_views[GFX_MAX_COLOR_TARGETS + 1];
+    uint32_t fb_attach_count;
     GfxTexture *tex[GFX_REFLECT_MAX_BINDINGS];
     unsigned ntex;
     VkImage img[GFX_REFLECT_MAX_BINDINGS];
@@ -2284,18 +2996,24 @@ static int reflect_create_pipeline(GfxReflectedPipeline *p, const GfxPipelineSta
     VkPipelineMultisampleStateCreateInfo ms = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
-    VkPipelineColorBlendAttachmentState cba = {
-        .blendEnable = st && (st->blend_enable & 1) ? VK_TRUE : VK_FALSE,
-        .srcColorBlendFactor = st ? vk_nvn_blend_factor(st->blend_src_rgb) : VK_BLEND_FACTOR_ONE,
-        .dstColorBlendFactor = st ? vk_nvn_blend_factor(st->blend_dst_rgb) : VK_BLEND_FACTOR_ZERO,
-        .colorBlendOp = st ? vk_nvn_blend_op(st->blend_eq_rgb) : VK_BLEND_OP_ADD,
-        .srcAlphaBlendFactor = st ? vk_nvn_blend_factor(st->blend_src_a) : VK_BLEND_FACTOR_ONE,
-        .dstAlphaBlendFactor = st ? vk_nvn_blend_factor(st->blend_dst_a) : VK_BLEND_FACTOR_ZERO,
-        .alphaBlendOp = st ? vk_nvn_blend_op(st->blend_eq_a) : VK_BLEND_OP_ADD,
-        .colorWriteMask = st ? (st->color_write_mask & 0xf) : 0xf };
+    VkPipelineColorBlendAttachmentState cba[GFX_MAX_COLOR_TARGETS];
+    uint32_t ncolor = p->rt_layout.color_count;
+    if (!ncolor || ncolor > GFX_MAX_COLOR_TARGETS) ncolor = 1;
+    for (uint32_t i = 0; i < ncolor; i++) {
+        cba[i] = (VkPipelineColorBlendAttachmentState){
+            .blendEnable = st && (st->blend_enable & (1u << i)) ? VK_TRUE : VK_FALSE,
+            .srcColorBlendFactor = st ? vk_nvn_blend_factor(st->blend_src_rgb) : VK_BLEND_FACTOR_ONE,
+            .dstColorBlendFactor = st ? vk_nvn_blend_factor(st->blend_dst_rgb) : VK_BLEND_FACTOR_ZERO,
+            .colorBlendOp = st ? vk_nvn_blend_op(st->blend_eq_rgb) : VK_BLEND_OP_ADD,
+            .srcAlphaBlendFactor = st ? vk_nvn_blend_factor(st->blend_src_a) : VK_BLEND_FACTOR_ONE,
+            .dstAlphaBlendFactor = st ? vk_nvn_blend_factor(st->blend_dst_a) : VK_BLEND_FACTOR_ZERO,
+            .alphaBlendOp = st ? vk_nvn_blend_op(st->blend_eq_a) : VK_BLEND_OP_ADD,
+            .colorWriteMask = st ? (st->color_write_mask & 0xf) : 0xf,
+        };
+    }
     VkPipelineColorBlendStateCreateInfo cb = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .attachmentCount = 1, .pAttachments = &cba };
+        .attachmentCount = ncolor, .pAttachments = cba };
     VkPipelineDepthStencilStateCreateInfo dss = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
         .depthTestEnable = st && st->depth_test ? VK_TRUE : VK_FALSE,
@@ -2322,7 +3040,8 @@ static int reflect_create_pipeline(GfxReflectedPipeline *p, const GfxPipelineSta
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .stageCount = 2, .pStages = stages, .pVertexInputState = &vi,
         .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rast,
-        .pMultisampleState = &ms, .pColorBlendState = &cb, .pDepthStencilState = &dss,
+        .pMultisampleState = &ms, .pColorBlendState = &cb,
+        .pDepthStencilState = p->rt_layout.depth_format ? &dss : NULL,
         .pDynamicState = &ds, .layout = p->layout, .renderPass = p->pass };
     return vk_ok(vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &gpci, NULL, out),
                  "vkCreateGraphicsPipelines(reflected variant)");
@@ -2357,24 +3076,43 @@ GfxReflectedPipeline *gfx_backend_reflected_pipeline_create(const uint8_t *vs, s
                                                     vs_specs, nvs, ps_specs, nps, NULL);
 }
 
-GfxReflectedPipeline *gfx_backend_reflected_pipeline_create_ex(
+static GfxReflectedPipeline *reflect_pipeline_create_impl(
                                                             const uint8_t *vs, size_t vs_size,
                                                             const uint8_t *ps, size_t ps_size,
-                                                            int vk_format,
+                                                            const GfxRenderTargetLayout *layout,
                                                             const GfxBindingSpec *vs_specs, uint32_t nvs,
                                                             const GfxBindingSpec *ps_specs, uint32_t nps,
                                                             const GfxVertexLayout *input) {
     pthread_mutex_lock(&g_lock);
     if (!vk_init_locked()) { pthread_mutex_unlock(&g_lock); return NULL; }
-    VkFormat fmt = (VkFormat)vk_format;
-    GfxReflectedPipeline *p = calloc(1, sizeof *p);
-    if (fmt == VK_FORMAT_UNDEFINED) {
-        vk_log("ERROR reflected pipeline: undefined format");
+    if (!layout || layout->color_count < 1 || layout->color_count > GFX_MAX_COLOR_TARGETS) {
+        vk_log("ERROR reflected pipeline: color_count=%u", layout ? layout->color_count : 0);
         pthread_mutex_unlock(&g_lock);
         return NULL;
     }
+    for (uint32_t i = 0; i < layout->color_count; i++) {
+        VkFormat cf = (VkFormat)layout->color_formats[i];
+        if (cf == VK_FORMAT_UNDEFINED || !vk_format_is_color_target(cf) ||
+            !vk_format_info(cf).bpp) {
+            vk_log("ERROR reflected pipeline: attachment %u format %d is not color",
+                   i, (int)cf);
+            pthread_mutex_unlock(&g_lock);
+            return NULL;
+        }
+    }
+    if (layout->depth_format &&
+        (layout->depth_format == (int)VK_FORMAT_UNDEFINED ||
+         !vk_format_is_depth((VkFormat)layout->depth_format))) {
+        vk_log("ERROR reflected pipeline: depth format %d is not a depth format",
+               layout->depth_format);
+        pthread_mutex_unlock(&g_lock);
+        return NULL;
+    }
+    VkFormat fmt = (VkFormat)layout->color_formats[0];
+    GfxReflectedPipeline *p = calloc(1, sizeof *p);
     if (!p) { pthread_mutex_unlock(&g_lock); return NULL; }
     p->format = fmt;
+    p->rt_layout = *layout;
     if (input) p->input = *input;
     /* The pixel module is always in set 1.  Copy before patching so the
      * caller's SPIR-V (including the built-in test shader arrays) is not
@@ -2560,33 +3298,51 @@ cleanup_fail:
 
 descriptors_done:;
 
-    VkAttachmentDescription att[2] = {
-        { .format = fmt, .samples = VK_SAMPLE_COUNT_1_BIT,
-          .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-          .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-          .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_GENERAL },
-        { .format = g.depth_format, .samples = VK_SAMPLE_COUNT_1_BIT,
-          .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-          .stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE,
-          .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-          .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL },
-    };
-    VkAttachmentReference ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
-    VkAttachmentReference dref = { 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+    uint32_t ncolor = p->rt_layout.color_count;
+    int has_depth = p->rt_layout.depth_format != 0;
+    VkAttachmentDescription att[GFX_MAX_COLOR_TARGETS + 1];
+    VkAttachmentReference ref[GFX_MAX_COLOR_TARGETS];
+    memset(att, 0, sizeof att);
+    for (uint32_t i = 0; i < ncolor; i++) {
+        att[i] = (VkAttachmentDescription){
+            .format = (VkFormat)p->rt_layout.color_formats[i],
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .finalLayout = VK_IMAGE_LAYOUT_GENERAL,
+        };
+        ref[i] = (VkAttachmentReference){ i, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    }
+    VkAttachmentReference dref = { ncolor, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+    if (has_depth) {
+        att[ncolor] = (VkAttachmentDescription){
+            .format = (VkFormat)p->rt_layout.depth_format,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        };
+    }
     VkSubpassDescription sub = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                 .colorAttachmentCount = 1, .pColorAttachments = &ref,
-                                 .pDepthStencilAttachment = &dref };
+                                 .colorAttachmentCount = ncolor, .pColorAttachments = ref,
+                                 .pDepthStencilAttachment = has_depth ? &dref : NULL };
+    VkPipelineStageFlags dep_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkAccessFlags dep_access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    if (has_depth) {
+        dep_stage |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                     VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        dep_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    }
     VkSubpassDependency dep = { .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
-        .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-        .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT };
+        .srcStageMask = dep_stage, .dstStageMask = dep_stage,
+        .dstAccessMask = dep_access };
     VkRenderPassCreateInfo rpci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-        .attachmentCount = 2, .pAttachments = att, .subpassCount = 1, .pSubpasses = &sub,
+        .attachmentCount = ncolor + (has_depth ? 1u : 0u), .pAttachments = att,
+        .subpassCount = 1, .pSubpasses = &sub,
         .dependencyCount = 1, .pDependencies = &dep };
     if (!vk_ok(vkCreateRenderPass(g.dev, &rpci, NULL, &p->pass), "vkCreateRenderPass(reflected)")) goto fail;
     VkDescriptorSetLayout layouts[2] = { p->dsl[0], p->dsl[1] };
@@ -2612,12 +3368,43 @@ descriptors_done:;
     if (!reflect_create_pipeline(p, NULL, &p->pipe)) goto fail;
     vk_log("reflected step: vkCreateGraphicsPipelines end");
     pthread_mutex_unlock(&g_lock);
-    vk_log("reflected pipeline ready vs=%u ps=%u bindings format=%s", nvs, nps, vk_format_name(fmt));
+    vk_log("reflected pipeline ready vs=%u ps=%u bindings colors=%u depth=%s format=%s",
+           nvs, nps, p->rt_layout.color_count,
+           p->rt_layout.depth_format ? vk_format_name((VkFormat)p->rt_layout.depth_format) : "none",
+           vk_format_name(fmt));
     return p;
 fail:
     gfx_backend_reflected_pipeline_destroy(p);
     pthread_mutex_unlock(&g_lock);
     return NULL;
+}
+
+GfxReflectedPipeline *gfx_backend_reflected_pipeline_create_ex(
+                                                            const uint8_t *vs, size_t vs_size,
+                                                            const uint8_t *ps, size_t ps_size,
+                                                            int vk_format,
+                                                            const GfxBindingSpec *vs_specs, uint32_t nvs,
+                                                            const GfxBindingSpec *ps_specs, uint32_t nps,
+                                                            const GfxVertexLayout *input) {
+    GfxRenderTargetLayout layout = { 0 };
+    layout.color_count = 1;
+    layout.color_formats[0] = vk_format;
+    /* The legacy entry point always had a depth attachment. */
+    if (!gfx_backend_vulkan_init()) return NULL;
+    layout.depth_format = (int)g.depth_format;
+    return reflect_pipeline_create_impl(vs, vs_size, ps, ps_size, &layout,
+                                        vs_specs, nvs, ps_specs, nps, input);
+}
+
+GfxReflectedPipeline *gfx_backend_reflected_pipeline_create_layout(
+                                                            const uint8_t *vs, size_t vs_size,
+                                                            const uint8_t *ps, size_t ps_size,
+                                                            const GfxRenderTargetLayout *layout,
+                                                            const GfxBindingSpec *vs_specs, uint32_t nvs,
+                                                            const GfxBindingSpec *ps_specs, uint32_t nps,
+                                                            const GfxVertexLayout *input) {
+    return reflect_pipeline_create_impl(vs, vs_size, ps, ps_size, layout,
+                                        vs_specs, nvs, ps_specs, nps, input);
 }
 
 void gfx_backend_reflected_pipeline_destroy(GfxReflectedPipeline *p) {
@@ -3081,24 +3868,51 @@ int gfx_backend_reflected_execute(GfxReflectedPipeline *p, GfxOffscreenTarget *t
     return gfx_backend_reflected_execute_ex(p, t, cmds, count, default_clear, NULL, 0);
 }
 
+static int reflect_layout_matches_target(const GfxRenderTargetLayout *l,
+                                         const GfxOffscreenTarget *t) {
+    if (!l || !t || l->color_count != t->rt_layout.color_count) return 0;
+    for (uint32_t i = 0; i < l->color_count; i++)
+        if (l->color_formats[i] != (int)t->color_format[i]) return 0;
+    if (l->depth_format != (int)t->depth_format) return 0;
+    return 1;
+}
+
 int gfx_backend_reflected_execute_ex(GfxReflectedPipeline *p, GfxOffscreenTarget *t,
                                      const GfxCmd *cmds, uint32_t count,
                                      const float default_clear[4],
                                      const GfxVertexStream *streams, uint32_t nstreams) {
     if (!p || !t) return 0;
     pthread_mutex_lock(&g_lock);
-    if (!g.ready || t->format != p->format || t->bpp != 4) { pthread_mutex_unlock(&g_lock); return 0; }
-    if (!t->depth_view) { pthread_mutex_unlock(&g_lock); return 0; }
-    if (!p->fb || p->fb_view != t->view || p->fb_w != t->width || p->fb_h != t->height) {
+    if (!g.ready || !reflect_layout_matches_target(&p->rt_layout, t)) {
+        vk_log("ERROR reflected execute: target layout does not match pipeline "
+               "(colors=%u/%u depth=%d/%d)",
+               t->rt_layout.color_count, p->rt_layout.color_count,
+               (int)t->depth_format, p->rt_layout.depth_format);
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    uint32_t ncolor = p->rt_layout.color_count;
+    int has_depth = p->rt_layout.depth_format != 0;
+    uint32_t attach_count = ncolor + (has_depth ? 1u : 0u);
+    VkImageView views[GFX_MAX_COLOR_TARGETS + 1];
+    for (uint32_t i = 0; i < ncolor; i++) views[i] = t->color_view[i];
+    if (has_depth) views[ncolor] = t->depth_view;
+    int fb_dirty = !p->fb || p->fb_w != t->width || p->fb_h != t->height ||
+                   p->fb_attach_count != attach_count;
+    for (uint32_t i = 0; !fb_dirty && i < attach_count; i++)
+        if (p->fb_views[i] != views[i]) fb_dirty = 1;
+    if (fb_dirty) {
         if (p->fb) vkDestroyFramebuffer(g.dev, p->fb, NULL);
-        VkImageView views[2] = { t->view, t->depth_view };
+        p->fb = VK_NULL_HANDLE;
         VkFramebufferCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-            .renderPass = p->pass, .attachmentCount = 2, .pAttachments = views,
+            .renderPass = p->pass, .attachmentCount = attach_count, .pAttachments = views,
             .width = t->width, .height = t->height, .layers = 1 };
         if (!vk_ok(vkCreateFramebuffer(g.dev, &fci, NULL, &p->fb), "vkCreateFramebuffer(reflected)")) {
             pthread_mutex_unlock(&g_lock); return 0;
         }
-        p->fb_view = t->view; p->fb_w = t->width; p->fb_h = t->height;
+        memcpy(p->fb_views, views, attach_count * sizeof views[0]);
+        p->fb_attach_count = attach_count;
+        p->fb_view = views[0]; p->fb_w = t->width; p->fb_h = t->height;
     }
 
     /* Pre-scan descriptor binds: one arena slice per change, and one set pair
@@ -3227,13 +4041,15 @@ int gfx_backend_reflected_execute_ex(GfxReflectedPipeline *p, GfxOffscreenTarget
         free(st);
         pthread_mutex_unlock(&g_lock); return 0;
     }
-    VkClearValue cv[2] = {
-        { .color = { .float32 = { clear[0], clear[1], clear[2], clear[3] } } },
-        { .depthStencil = { 1.0f, 0 } },
-    };
+    VkClearValue cv[GFX_MAX_COLOR_TARGETS + 1];
+    for (uint32_t i = 0; i < ncolor; i++)
+        cv[i] = (VkClearValue){ .color = { .float32 = { clear[0], clear[1], clear[2], clear[3] } } };
+    if (has_depth)
+        cv[ncolor] = (VkClearValue){ .depthStencil = { 1.0f, 0 } };
     VkRenderPassBeginInfo rp = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .renderPass = p->pass, .framebuffer = p->fb,
-        .renderArea = { { 0, 0 }, { t->width, t->height } }, .clearValueCount = 2, .pClearValues = cv };
+        .renderArea = { { 0, 0 }, { t->width, t->height } },
+        .clearValueCount = attach_count, .pClearValues = cv };
     vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pipe);
     {
@@ -3361,29 +4177,38 @@ int gfx_backend_reflected_execute_ex(GfxReflectedPipeline *p, GfxOffscreenTarget
         }
     }
     vkCmdEndRenderPass(cmd);
-    VkBufferImageCopy region = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-                                 .imageExtent = { t->width, t->height, 1 } };
-    vkCmdCopyImageToBuffer(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, t->readback, 1, &region);
-    VkBufferMemoryBarrier bb = { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = t->readback, .offset = 0, .size = VK_WHOLE_SIZE };
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-                         0, 0, NULL, 1, &bb, 0, NULL);
+    for (uint32_t i = 0; i < ncolor; i++) {
+        VkBufferImageCopy region = {
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .imageExtent = { t->width, t->height, 1 },
+        };
+        vkCmdCopyImageToBuffer(cmd, t->color_image[i], VK_IMAGE_LAYOUT_GENERAL,
+                               t->color_readback[i], 1, &region);
+        VkBufferMemoryBarrier bb = { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = t->color_readback[i], .offset = 0, .size = VK_WHOLE_SIZE };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                             0, 0, NULL, 1, &bb, 0, NULL);
+    }
     if (!vk_submit_and_wait(cmd, "reflected-execute")) {
         free(index_offsets);
         free(st);
         pthread_mutex_unlock(&g_lock); return 0;
     }
-    t->layout = VK_IMAGE_LAYOUT_GENERAL;
-    void *mapped = NULL;
-    if (!vk_ok(vkMapMemory(g.dev, t->readback_mem, 0, VK_WHOLE_SIZE, 0, &mapped), "vkMapMemory(reflected-execute)")) {
-        free(index_offsets);
-        free(st);
-        pthread_mutex_unlock(&g_lock); return 0;
+    t->layout_state = VK_IMAGE_LAYOUT_GENERAL;
+    for (uint32_t i = 0; i < ncolor; i++) {
+        void *mapped = NULL;
+        if (!vk_ok(vkMapMemory(g.dev, t->color_readback_mem[i], 0, VK_WHOLE_SIZE, 0, &mapped),
+                   "vkMapMemory(reflected-execute)")) {
+            free(index_offsets);
+            free(st);
+            pthread_mutex_unlock(&g_lock); return 0;
+        }
+        memcpy(t->color_pixels[i], mapped, t->color_size[i]);
+        vkUnmapMemory(g.dev, t->color_readback_mem[i]);
     }
-    memcpy(t->pixels, mapped, t->pixels_size);
-    vkUnmapMemory(g.dev, t->readback_mem);
     free(index_offsets);
     free(st);
     pthread_mutex_unlock(&g_lock);
@@ -3407,28 +4232,35 @@ GfxTexturedPipeline *gfx_backend_builtin_textured_pipeline(void) {
     return g_builtin_textured;
 }
 
-int gfx_backend_offscreen_write_ppm(const GfxOffscreenTarget *t, const char *path) {
-    if (!t || !path || t->bpp != 4 || !t->pixels) return 0;
+int gfx_backend_offscreen_write_ppm_index(const GfxOffscreenTarget *t, uint32_t index,
+                                          const char *path) {
+    if (!t || !path || index >= t->rt_layout.color_count ||
+        t->color_bpp[index] != 4 || !t->color_pixels[index]) return 0;
     FILE *f = fopen(path, "wb");
     if (!f) { vk_log("ERROR screenshot open %s", path); return 0; }
     fprintf(f, "P6\n%u %u\n255\n", t->width, t->height);
     size_t n = (size_t)t->width * t->height;
     for (size_t i = 0; i < n; i++) {
-        const uint8_t *p = t->pixels + i * 4;
+        const uint8_t *p = t->color_pixels[index] + i * 4;
         fwrite(p, 1, 3, f);
     }
     int ok = ferror(f) == 0;
     fclose(f);
-    if (ok) vk_log("screenshot %s (%ux%u, %zu bytes)", path, t->width, t->height, n * 3);
+    if (ok) vk_log("screenshot %s (%ux%u attachment=%u, %zu bytes)", path, t->width,
+                   t->height, index, n * 3);
     else vk_log("ERROR screenshot write %s", path);
     return ok;
 }
 
+int gfx_backend_offscreen_write_ppm(const GfxOffscreenTarget *t, const char *path) {
+    return gfx_backend_offscreen_write_ppm_index(t, 0, path);
+}
+
 uint64_t gfx_backend_offscreen_hash(const GfxOffscreenTarget *t) {
-    if (!t || !t->pixels) return 0;
+    if (!t || !t->color_pixels[0]) return 0;
     uint64_t h = 1469598103934665603ull;
-    for (size_t i = 0; i < t->pixels_size; i++) {
-        h ^= t->pixels[i];
+    for (size_t i = 0; i < t->color_size[0]; i++) {
+        h ^= t->color_pixels[0][i];
         h *= 1099511628211ull;
     }
     return h;
@@ -3463,6 +4295,319 @@ int gfx_backend_validate_spirv(const uint8_t *code, size_t size, const char *nam
            words[1] >> 16, (words[1] >> 8) & 0xff);
     vkDestroyShaderModule(g.dev, mod, NULL);
     return 1;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* First-frame backend selftests (game-data-free). */
+
+int gfx_backend_texture_formats_selftest(void);
+int gfx_backend_mrt_selftest(void);
+
+static int vk_selftest_read_match(GfxTexture *t, uint32_t level, uint32_t layer,
+                                  const uint8_t *expect, size_t n, const char *what) {
+    uint8_t *got = malloc(n ? n : 1);
+    if (!got) return 0;
+    int ok = gfx_backend_texture_read_pixels(t, level, layer, got, n);
+    if (!ok) {
+        vk_log("texture formats selftest: %s readback failed", what);
+        free(got);
+        return 0;
+    }
+    if (memcmp(got, expect, n)) {
+        size_t i = 0;
+        while (i + 1 < n && got[i] == expect[i]) i++;
+        vk_log("texture formats selftest: %s mismatch at byte %zu got=%02x want=%02x",
+               what, i, got[i], expect[i]);
+        ok = 0;
+    } else {
+        vk_log("texture formats selftest: %s OK (%zu bytes)", what, n);
+    }
+    free(got);
+    return ok;
+}
+
+int gfx_backend_texture_formats_selftest(void) {
+    if (!gfx_backend_vulkan_init()) {
+        vk_log("texture formats selftest: Vulkan unavailable");
+        return 0;
+    }
+    int ok = 1;
+
+    /* 2D array, two mip levels, two layers.  Level 1 has 2x2 texels. */
+    {
+        enum { W = 4, H = 4 };
+        uint8_t l0a[W * H * 4], l0b[W * H * 4], l1a[2 * 2 * 4], l1b[2 * 2 * 4];
+        for (int i = 0; i < W * H; i++) {
+            l0a[i * 4 + 0] = 0x10; l0a[i * 4 + 1] = 0x20;
+            l0a[i * 4 + 2] = 0x30; l0a[i * 4 + 3] = 0xff;
+            l0b[i * 4 + 0] = 0x40; l0b[i * 4 + 1] = 0x50;
+            l0b[i * 4 + 2] = 0x60; l0b[i * 4 + 3] = 0xff;
+        }
+        for (int i = 0; i < 2 * 2; i++) {
+            l1a[i * 4 + 0] = 0x70; l1a[i * 4 + 1] = 0x80;
+            l1a[i * 4 + 2] = 0x90; l1a[i * 4 + 3] = 0xff;
+            l1b[i * 4 + 0] = 0xa0; l1b[i * 4 + 1] = 0xb0;
+            l1b[i * 4 + 2] = 0xc0; l1b[i * 4 + 3] = 0xff;
+        }
+        GfxTextureDesc d = {
+            .target = GFX_TEXTURE_2D_ARRAY, .vk_format = VK_FORMAT_R8G8B8A8_UNORM,
+            .width = W, .height = H, .depth = 1, .mip_levels = 2, .array_layers = 2,
+            .samples = 1,
+        };
+        GfxTextureSubresource s[4] = {
+            { 0, 0, l0a, sizeof l0a }, { 0, 1, l0b, sizeof l0b },
+            { 1, 0, l1a, sizeof l1a }, { 1, 1, l1b, sizeof l1b },
+        };
+        GfxTexture *t = gfx_backend_texture_create_desc(&d, s, 4);
+        if (!t) {
+            vk_log("texture formats selftest: 2D array/mips create failed");
+            ok = 0;
+        } else {
+            ok &= vk_selftest_read_match(t, 1, 1, l1b, sizeof l1b, "2D array mip1 layer1");
+            ok &= vk_selftest_read_match(t, 0, 1, l0b, sizeof l0b, "2D array mip0 layer1");
+            gfx_backend_texture_destroy(t);
+        }
+    }
+
+    /* Cube: six 2x2 faces with distinct colours. */
+    {
+        enum { F = 6, N = 2 * 2 * 4 };
+        uint8_t faces[F][N];
+        for (int f = 0; f < F; f++)
+            for (int i = 0; i < 2 * 2; i++) {
+                faces[f][i * 4 + 0] = (uint8_t)(0x20 + f * 0x20);
+                faces[f][i * 4 + 1] = (uint8_t)(0x10 + f * 0x10);
+                faces[f][i * 4 + 2] = (uint8_t)(0xf0 - f * 0x10);
+                faces[f][i * 4 + 3] = 0xff;
+            }
+        GfxTextureDesc d = {
+            .target = GFX_TEXTURE_CUBE, .vk_format = VK_FORMAT_R8G8B8A8_UNORM,
+            .width = 2, .height = 2, .depth = 1, .mip_levels = 1, .array_layers = 6,
+            .samples = 1,
+        };
+        GfxTextureSubresource s[F];
+        for (int f = 0; f < F; f++)
+            s[f] = (GfxTextureSubresource){ 0, (uint32_t)f, faces[f], N };
+        GfxTexture *t = gfx_backend_texture_create_desc(&d, s, F);
+        if (!t) {
+            vk_log("texture formats selftest: cube create failed");
+            ok = 0;
+        } else {
+            ok &= vk_selftest_read_match(t, 0, 4, faces[4], N, "cube face4");
+            gfx_backend_texture_destroy(t);
+        }
+    }
+
+    /* 3D texture: two 2x2 slices, verify the first slice round-trips. */
+    {
+        uint8_t vol[2 * 2 * 2 * 4];
+        for (int z = 0; z < 2; z++)
+            for (int i = 0; i < 2 * 2; i++) {
+                int o = (z * 4 + i) * 4;
+                vol[o + 0] = z ? 0x30 : 0x80;
+                vol[o + 1] = z ? 0x60 : 0x40;
+                vol[o + 2] = z ? 0x90 : 0x20;
+                vol[o + 3] = 0xff;
+            }
+        GfxTextureDesc d = {
+            .target = GFX_TEXTURE_3D, .vk_format = VK_FORMAT_R8G8B8A8_UNORM,
+            .width = 2, .height = 2, .depth = 2, .mip_levels = 1, .array_layers = 1,
+            .samples = 1,
+        };
+        GfxTextureSubresource s = { 0, 0, vol, sizeof vol };
+        GfxTexture *t = gfx_backend_texture_create_desc(&d, &s, 1);
+        if (!t) {
+            vk_log("texture formats selftest: 3D create failed");
+            ok = 0;
+        } else {
+            ok &= vk_selftest_read_match(t, 0, 0, vol, sizeof vol, "3D volume");
+            gfx_backend_texture_destroy(t);
+        }
+    }
+
+    /* sRGB upload/readback must preserve the encoded bytes. */
+    {
+        uint8_t px[2 * 2 * 4];
+        for (int i = 0; i < 2 * 2; i++) {
+            px[i * 4 + 0] = 0x7f; px[i * 4 + 1] = 0x3a;
+            px[i * 4 + 2] = 0xc4; px[i * 4 + 3] = 0xff;
+        }
+        GfxTextureDesc d = {
+            .target = GFX_TEXTURE_2D, .vk_format = VK_FORMAT_R8G8B8A8_SRGB,
+            .width = 2, .height = 2, .depth = 1, .mip_levels = 1, .array_layers = 1,
+            .samples = 1,
+        };
+        GfxTextureSubresource s = { 0, 0, px, sizeof px };
+        GfxTexture *t = gfx_backend_texture_create_desc(&d, &s, 1);
+        if (!t) {
+            vk_log("texture formats selftest: sRGB create failed");
+            ok = 0;
+        } else {
+            ok &= vk_selftest_read_match(t, 0, 0, px, sizeof px, "RGBA8 sRGB");
+            gfx_backend_texture_destroy(t);
+        }
+    }
+
+    /* Extra uncompressed formats from the NVN/Ryujinx mapping tables. */
+    {
+        static const struct { VkFormat fmt; const char *name; } extra[] = {
+            { VK_FORMAT_R16G16B16A16_SFLOAT, "RGBA16F" },
+            { VK_FORMAT_R32G32B32A32_SFLOAT, "RGBA32F" },
+            { VK_FORMAT_B10G11R11_UFLOAT_PACK32, "R11G11B10F" },
+            { VK_FORMAT_D32_SFLOAT, "D32F" },
+        };
+        for (unsigned i = 0; i < sizeof extra / sizeof extra[0]; i++) {
+            VkFormatFeatureFlags ef = 0;
+            if (!vk_format_can_texture(extra[i].fmt, &ef) ||
+                !(ef & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT)) {
+                vk_log("texture formats selftest: %s unsupported, skipped", extra[i].name);
+                continue;
+            }
+            uint32_t bpp = (uint32_t)vk_format_info(extra[i].fmt).bpp;
+            uint8_t px[2 * 2 * 16];
+            if (!bpp || bpp > 16) continue;
+            size_t n = (size_t)2 * 2 * bpp;
+            for (size_t b = 0; b < n; b++) px[b] = (uint8_t)(0x23 * (b + 1));
+            GfxTextureDesc d = {
+                .target = GFX_TEXTURE_2D, .vk_format = (uint32_t)extra[i].fmt,
+                .width = 2, .height = 2, .depth = 1, .mip_levels = 1, .array_layers = 1,
+                .samples = 1,
+            };
+            GfxTextureSubresource s = { 0, 0, px, n };
+            GfxTexture *t = gfx_backend_texture_create_desc(&d, &s, 1);
+            if (!t) {
+                vk_log("texture formats selftest: %s create failed", extra[i].name);
+                ok = 0;
+                continue;
+            }
+            char label[32];
+            snprintf(label, sizeof label, "%s", extra[i].name);
+            ok &= vk_selftest_read_match(t, 0, 0, px, n, label);
+            gfx_backend_texture_destroy(t);
+        }
+    }
+
+    /* Block compressed formats the device actually advertises.  BC is not
+     * mandatory on Android/Adreno; skip (not fail) when unavailable. */
+    {
+        static const struct { VkFormat fmt; const char *name; } bc[] = {
+            { VK_FORMAT_BC1_RGBA_UNORM_BLOCK, "BC1" },
+            { VK_FORMAT_BC3_UNORM_BLOCK, "BC3" },
+            { VK_FORMAT_BC4_UNORM_BLOCK, "BC4" },
+            { VK_FORMAT_BC5_UNORM_BLOCK, "BC5" },
+            { VK_FORMAT_BC7_UNORM_BLOCK, "BC7" },
+        };
+        unsigned tested = 0, skipped = 0;
+        for (unsigned i = 0; i < sizeof bc / sizeof bc[0]; i++) {
+            VkFormatFeatureFlags bcf = 0;
+            if (!vk_format_can_texture(bc[i].fmt, &bcf) ||
+                !(bcf & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT)) {
+                skipped++;
+                continue;
+            }
+            uint8_t block[16];
+            uint32_t bytes = (uint32_t)vk_format_info(bc[i].fmt).bpp;
+            if (!bytes || bytes > sizeof block) { skipped++; continue; }
+            for (uint32_t b = 0; b < bytes; b++) block[b] = (uint8_t)(0x11 * (b + 1));
+            GfxTextureDesc d = {
+                .target = GFX_TEXTURE_2D, .vk_format = (uint32_t)bc[i].fmt,
+                .width = 4, .height = 4, .depth = 1, .mip_levels = 1, .array_layers = 1,
+                .samples = 1,
+            };
+            GfxTextureSubresource s = { 0, 0, block, bytes };
+            GfxTexture *t = gfx_backend_texture_create_desc(&d, &s, 1);
+            if (!t) {
+                vk_log("texture formats selftest: %s create failed", bc[i].name);
+                ok = 0;
+                continue;
+            }
+            char label[32];
+            snprintf(label, sizeof label, "%s block", bc[i].name);
+            ok &= vk_selftest_read_match(t, 0, 0, block, bytes, label);
+            tested++;
+            gfx_backend_texture_destroy(t);
+        }
+        vk_log("texture formats selftest: BC tested=%u skipped=%u", tested, skipped);
+    }
+
+    vk_log("texture formats selftest %s", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+int gfx_backend_mrt_selftest(void) {
+    if (!gfx_backend_vulkan_init()) {
+        vk_log("MRT selftest: Vulkan unavailable");
+        return 0;
+    }
+    GfxRenderTargetLayout layout = { 0 };
+    layout.color_count = 2;
+    layout.color_formats[0] = VK_FORMAT_R8G8B8A8_UNORM;
+    layout.color_formats[1] = VK_FORMAT_R8G8B8A8_UNORM;
+    layout.depth_format = (int)g.depth_format;
+    GfxOffscreenTarget *t = gfx_backend_offscreen_create_layout(128, 128, &layout);
+    if (!t) {
+        vk_log("MRT selftest: 2-color+depth target creation failed");
+        return 0;
+    }
+    GfxReflectedPipeline *p = gfx_backend_reflected_pipeline_create_layout(
+        (const uint8_t *)triangle_mrt_vert_spv, triangle_mrt_vert_spv_size,
+        (const uint8_t *)triangle_mrt_frag_spv, triangle_mrt_frag_spv_size,
+        &layout, NULL, 0, NULL, 0, NULL);
+    if (!p) {
+        vk_log("MRT selftest: pipeline creation failed");
+        gfx_backend_offscreen_destroy(t);
+        return 0;
+    }
+
+    const float clear[4] = { 0.05f, 0.08f, 0.12f, 1.0f };
+    GfxCmd cmds[3] = { 0 };
+    cmds[0].kind = GFX_CMD_CLEAR_COLOR;
+    memcpy(cmds[0].u.clear.rgba, clear, sizeof clear);
+    cmds[1].kind = GFX_CMD_CLEAR_DEPTH_STENCIL;
+    cmds[1].u.clear_depth.depth = 1.0f;
+    cmds[1].u.clear_depth.dmask = 1;
+    cmds[1].u.clear_depth.smask = 1;
+    cmds[2].kind = GFX_CMD_DRAW;
+    cmds[2].u.draw.primitive = 4;
+    cmds[2].u.draw.count = 3;
+    int drew = 0;
+    for (int i = 0; i < 10; i++) {
+        if (!gfx_backend_reflected_execute(p, t, cmds, 3, clear)) break;
+        drew++;
+    }
+    uint8_t c0[4] = { 0 }, c1[4] = { 0 };
+    gfx_backend_offscreen_read_pixel_index(t, 0, 64, 64, c0);
+    gfx_backend_offscreen_read_pixel_index(t, 1, 64, 64, c1);
+    int ok = drew && c0[0] > 200 && c0[1] > 40 && c0[1] < 90 && c0[2] < 40 &&
+             c1[0] < 60 && c1[1] > 180 && c1[2] > 20 && c1[2] < 80;
+    vk_log("MRT selftest %s draws=%d attach0=%02x%02x%02x%02x attach1=%02x%02x%02x%02x "
+           "depth=%s colors=%u",
+           ok ? "PASS" : "FAIL", drew, c0[0], c0[1], c0[2], c0[3],
+           c1[0], c1[1], c1[2], c1[3],
+           vk_format_name((VkFormat)layout.depth_format),
+           gfx_backend_offscreen_color_count(t));
+    const char *shot = getenv("TOTK_ANDROID_SCREENSHOT");
+    if (shot && *shot) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s-mrt0.ppm", shot);
+        gfx_backend_offscreen_write_ppm_index(t, 0, path);
+        snprintf(path, sizeof path, "%s-mrt1.ppm", shot);
+        gfx_backend_offscreen_write_ppm_index(t, 1, path);
+    }
+    GfxFence *fence = gfx_backend_fence_create();
+    int fence_ok = fence && !gfx_backend_fence_wait(fence, 0);
+    if (fence_ok) {
+        gfx_backend_fence_signal(fence);
+        fence_ok = gfx_backend_fence_wait(fence, 1000000);
+    }
+    fence_ok = fence_ok && gfx_backend_queue_idle();
+    vk_log("MRT selftest fence %s", fence_ok ? "OK" : "FAIL");
+    gfx_backend_fence_destroy(fence);
+    ok = ok && fence_ok;
+    gfx_backend_reflected_pipeline_destroy(p);
+    gfx_backend_offscreen_destroy(t);
+    return ok;
 }
 
 int gfx_backend_selftest(void) {
