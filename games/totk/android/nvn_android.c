@@ -137,6 +137,7 @@ enum {
     NVN_CMD_BIND_STATE,
     NVN_CMD_DRAW,
     NVN_CMD_DRAW_INDEXED,
+    NVN_CMD_UPDATE_UBO,
 };
 
 /* Packed NVN state objects (same layout as the macOS NVN layer). */
@@ -200,6 +201,9 @@ typedef struct {
         struct { nvn_render_state_t rs; } state;
         struct { uint32_t primitive, first, count, instances, base_instance; } draw;
         struct { uint32_t primitive, count, index_type, base_vertex; uint64_t indices; } draw_indexed;
+        /* Copy of nvnCommandBufferUpdateUniformBuffer's payload; written to
+         * dst at submit time, in recorded order (NVN semantics). */
+        struct { uint64_t dst; uint32_t size; uint8_t *data; } update;
     } u;
 } nvn_cmd_t;
 
@@ -271,10 +275,22 @@ static void nvn_fail(const char *what, const char *detail) {
 }
 static int nvn_trace(void) {
     static int on = -1;
-    if (on < 0) on = getenv("TOTK_ANDROID_TRACE_NVN") != NULL ||
-                   getenv("TOTK_ANDROID_TRACE_FRAME") != NULL;
+    if (on < 0) on = getenv("TOTK_ANDROID_TRACE_NVN") != NULL;
     return on;
 }
+/* Command-buffer lifetime trace for the first real frame: who recorded a
+ * handle, which handles a submit names, and which recorded buffers were
+ * dropped without ever being submitted.  Deliberately separate from the
+ * per-call TRACE_NVN firehose. */
+static int nvn_trace_frame(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("TOTK_ANDROID_TRACE_FRAME") != NULL;
+    return on;
+}
+extern int runtime_thread_probe(uint32_t handle, int *wkind, uint64_t *waddr,
+                                uint32_t wh[4], int *nwh, int *last_svc,
+                                uint64_t *last_lr, uint64_t *last_fp,
+                                uint64_t *nsvc, int *exited);
 /* Focused first-frame state trace: records the command-buffer sequence that
  * registers build a first draw from, without the full per-call NVN trace. */
 static int nvn_trace_first(void) {
@@ -860,10 +876,15 @@ static int nvn_gpu_drain(const char *what) {
     nvn_gpu_pending_work = 0;
     return 1;
 }
+static void nvn_frame_submit_trace(int n, const uint64_t *cmds);
+static void nvn_frame_ubo_trace(int n, const uint64_t *cmds);
+static void nvn_frame_report_orphans(void);
 static void nvnQueueSubmitCommands(queue_t *q, int n, const uint64_t *cmds) { nvn_api("nvnQueueSubmitCommands");
     if (!nvn_obj(q, NVN_MAGIC('Q', 'U', 'E', 'U'), "nvnQueueSubmitCommands")) return;
     if (!cmds && n) { nvn_fail("nvnQueueSubmitCommands", "null command handle array"); return; }
     q->submits += (uint64_t)n;
+    nvn_frame_submit_trace(n, cmds);
+    nvn_frame_ubo_trace(n, cmds);
     unsigned total = __atomic_add_fetch(&nvn_gpu_submits, (unsigned)n, __ATOMIC_RELAXED);
     if (total <= 8 || getenv("TOTK_ANDROID_TRACE_NVN"))
         fprintf(stderr, "[totk-nvn] GPU submit #%u queue=%p commands=%d (CPU-only host)\n",
@@ -884,6 +905,7 @@ static void nvnQueuePresentTexture(queue_t *q, win_t *w, int index) { nvn_api("n
     if (total <= 4)
         fprintf(stderr, "[totk-nvn] present #%u window=%p index=%d (host backend)\n",
                 total, (void *)w, index);
+    if ((total % 60) == 0) nvn_frame_report_orphans();
     nvn_gpu_pending_work = 1;
     if (w->native && !runtime_native_window_present(w->native))
         nvn_fail("nvnQueuePresentTexture", "native window present failed");
@@ -2120,6 +2142,64 @@ static void nvn_pool_forget(const void *pool) {
 static uint64_t nvn_cb_serial;
 static cb_t **g_cbs;
 static unsigned g_ncbs, g_cbs_cap;
+
+/* First-frame lifetime metadata kept out of cb_t (the guest object is only
+ * NVN_COMMAND_BUFFER_SIZE bytes).  NVN command handles die when the guest
+ * object is re-initialised, so remember the last few recorded-but-never-
+ * submitted buffers and report the owning thread at present time. */
+typedef struct {
+    const cb_t *cb;
+    uint64_t record_lr;
+    uint32_t record_thread, record_commands, submit_count;
+} cb_meta_t;
+#define NVN_CB_META_MAX 128
+static cb_meta_t g_cb_meta[NVN_CB_META_MAX];
+static pthread_mutex_t g_cb_meta_lock = PTHREAD_MUTEX_INITIALIZER;
+static cb_meta_t *nvn_cb_meta(const cb_t *c, int create) {
+    cb_meta_t *free_slot = NULL;
+    if (!c) return NULL;
+    pthread_mutex_lock(&g_cb_meta_lock);
+    for (unsigned i = 0; i < NVN_CB_META_MAX; i++) {
+        if (g_cb_meta[i].cb == c) { pthread_mutex_unlock(&g_cb_meta_lock); return &g_cb_meta[i]; }
+        if (!free_slot && !g_cb_meta[i].cb) free_slot = &g_cb_meta[i];
+    }
+    if (create && free_slot) {
+        memset(free_slot, 0, sizeof *free_slot);
+        free_slot->cb = c;
+        pthread_mutex_unlock(&g_cb_meta_lock);
+        return free_slot;
+    }
+    pthread_mutex_unlock(&g_cb_meta_lock);
+    return NULL;
+}
+#define NVN_ORPHAN_MAX 16
+static struct {
+    uint64_t handle;
+    const void *cb;
+    uint32_t thread, commands, draws, reported;
+    uint64_t lr;
+} g_orphans[NVN_ORPHAN_MAX];
+static unsigned g_orphan_count, g_orphan_next;
+static void nvn_orphan_add(const cb_t *c, const cb_meta_t *m) {
+    unsigned slot = g_orphan_next++ % NVN_ORPHAN_MAX;
+    g_orphans[slot].handle = c->handle;
+    g_orphans[slot].cb = c;
+    g_orphans[slot].thread = m ? m->record_thread : 0;
+    g_orphans[slot].commands = m ? m->record_commands : c->ncmds;
+    g_orphans[slot].draws = (uint32_t)c->draw_count;
+    g_orphans[slot].lr = m ? m->record_lr : 0;
+    g_orphans[slot].reported = 0;
+    if (g_orphan_count < NVN_ORPHAN_MAX) g_orphan_count++;
+    if (nvn_trace_frame())
+        fprintf(stderr, "[totk-frame] ORPHAN cb=%p handle=%#llx thread=%#x cmds=%u draws=%d lr=%#llx (reinitialised)\n",
+                (void *)c, (unsigned long long)c->handle, m ? m->record_thread : 0,
+                m ? m->record_commands : c->ncmds, c->draw_count, m ? (unsigned long long)m->record_lr : 0);
+}
+static int nvn_orphan_seen(uint64_t handle) {
+    for (unsigned i = 0; i < g_orphan_count; i++)
+        if (g_orphans[i].handle == handle) return 1;
+    return 0;
+}
 static unsigned nvn_nvn_draws;
 static unsigned nvn_record_count;   /* BeginRecording calls, for the first-frame trace */
 static unsigned nvn_vtx_trace, nvn_rt_trace, nvn_tex_trace, nvn_draw_trace, nvn_ubo_trace;
@@ -2424,15 +2504,29 @@ static void nvn_cb_desc_event(cb_t *c, uint32_t stage, uint32_t kind, uint32_t s
     cmd->u.desc.handle = handle;
 }
 
+static void nvn_cb_free_commands(cb_t *c) {
+    if (!c) return;
+    for (uint32_t i = 0; i < c->ncmds; i++)
+        if (c->cmds[i].kind == NVN_CMD_UPDATE_UBO) free(c->cmds[i].u.update.data);
+    free(c->cmds);
+    c->cmds = NULL;
+    c->ncmds = c->cmds_cap = 0;
+}
+
 static uint32_t nvnCommandBufferInitialize(cb_t *c, void *d) { nvn_api("nvnCommandBufferInitialize");
     if (!c) { nvn_fail("nvnCommandBufferInitialize", "null command buffer"); return 0; }
     /* Re-initialising the same guest object must drop the previous recording
      * and registry entry, not leak them or leave a stale handle resolvable. */
+    if (c->magic == NVN_MAGIC('C', 'M', 'D', 'B') && c->ncmds) {
+        cb_meta_t *m = nvn_cb_meta(c, 0);
+        if (!m || !m->submit_count) nvn_orphan_add(c, m);
+    }
+    { cb_meta_t *m = nvn_cb_meta(c, 0); if (m) { memset(m, 0, sizeof *m); m->cb = c; } }
     for (unsigned i = 0; i < g_ncbs; i++) {
         if (g_cbs[i] != c) continue;
         nvn_cb_untrack(c);
         if (c->magic == NVN_MAGIC('C', 'M', 'D', 'B')) {
-            free(c->cmds);
+            nvn_cb_free_commands(c);
             free(c->bind_state);
         }
         break;
@@ -2452,13 +2546,19 @@ static uint32_t nvnCommandBufferInitialize(cb_t *c, void *d) { nvn_api("nvnComma
 }
 static void nvnCommandBufferFinalize(cb_t *c) {
     if (!c) return;
+    if (c->magic == NVN_MAGIC('C', 'M', 'D', 'B') && c->ncmds) {
+        cb_meta_t *m = nvn_cb_meta(c, 0);
+        if (!m || !m->submit_count) nvn_orphan_add(c, m);
+        if (nvn_trace_frame())
+            fprintf(stderr, "[totk-frame] finalize cb=%p handle=%#llx thread=%#x cmds=%u draws=%d\n",
+                    (void *)c, (unsigned long long)c->handle, runtime_thread_current_handle(),
+                    c->ncmds, c->draw_count);
+    }
     nvn_cb_untrack(c);
     nvn_cb_target_forget(c);
-    free(c->cmds);
+    nvn_cb_free_commands(c);
     free(c->bind_state);
-    c->cmds = NULL;
     c->bind_state = NULL;
-    c->ncmds = c->cmds_cap = 0;
     c->prog = NULL;
     c->win = NULL;
     c->draw_first = c->draw_count = 0;
@@ -2491,6 +2591,22 @@ static size_t nvnCommandBufferGetCommandMemorySize(const cb_t *c) { return c ? c
 static size_t nvnCommandBufferGetCommandMemoryUsed(const cb_t *c) { return c ? c->cmd_used : 0; }
 static void nvnCommandBufferBeginRecording(cb_t *c) {
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferBeginRecording", "invalid command buffer"); return; }
+    /* The frame loop re-records a buffer that still holds an unsubmitted
+     * recording.  That handle is gone the moment ncmds is reset, so report it
+     * here as well as on Initialize. */
+    if (c->ncmds) {
+        cb_meta_t *m = nvn_cb_meta(c, 0);
+        if (!m || !m->submit_count) nvn_orphan_add(c, m);
+        if (nvn_trace_frame() && c->ncmds >= 32) {
+            uint32_t hist[16] = {0};
+            for (uint32_t i = 0; i < c->ncmds; i++) hist[c->cmds[i].kind & 15]++;
+            fprintf(stderr, "[totk-frame] begin-over cb=%p handle=%#llx thread=%#x cmds=%u draws=%d kinds=",
+                    (void *)c, (unsigned long long)c->handle, runtime_thread_current_handle(),
+                    c->ncmds, c->draw_count);
+            for (int i = 0; i < 16; i++) if (hist[i]) fprintf(stderr, " %d:%u", i, hist[i]);
+            fputc('\n', stderr);
+        }
+    }
     nvn_record_count++;
     if (nvn_trace_first() && nvn_record_count <= 64)
         fprintf(stderr, "[totk-nvn] BeginRecording #%u cb=%p rec=%u prog=%p win=%p"
@@ -2515,6 +2631,90 @@ static uint64_t nvnCommandBufferEndRecording(cb_t *c) {
     c->recording = 0;
     uint64_t h = 0x100000000ull | (c->serial & 0xffffffffull);
     c->handle = h;
+    cb_meta_t *meta = nvn_cb_meta(c, 1);
+    uint32_t rec_thread = runtime_thread_current_handle();
+    uint64_t rec_lr = 0;
+    if (meta) {
+        meta->record_thread = rec_thread;
+        meta->record_commands = c->ncmds;
+        meta->submit_count = 0;
+    }
+    if (nvn_trace_frame()) {
+        uint64_t svc_lr = 0, svc_fp = 0, nsvc = 0;
+        int svc = 0, wk = -1, nwh = 0, ex = 0; uint32_t whs[4] = {0}; uint64_t wa = 0;
+        runtime_thread_probe(rec_thread, &wk, &wa, whs, &nwh, &svc, &svc_lr, &svc_fp, &nsvc, &ex);
+        rec_lr = svc_lr;
+        if (meta) meta->record_lr = svc_lr;
+        fprintf(stderr, "[totk-frame] end cb=%p handle=%#llx thread=%#x cmds=%u draws=%d prog=%p win=%p lr=%#llx"
+                        " svc_lr=%#llx last_svc=%#x\n",
+                (void *)c, (unsigned long long)h, rec_thread, c->ncmds,
+                c->draw_count, c->prog, c->win, (unsigned long long)rec_lr,
+                (unsigned long long)svc_lr, svc);
+    }
+    if (nvn_trace_frame() && c->draw_count) {
+        static int window_dumps;
+        if (window_dumps++ < 2) {
+            fprintf(stderr, "[totk-frame] draw-cb handle=%#llx cmds=%u draws=%d:\n",
+                    (unsigned long long)h, c->ncmds, c->draw_count);
+            const nvn_draw_snap_t *ds = nvn_cb_last_draw(c);
+            if (ds && ds->have_state) {
+                const nvn_bind_state_t *db = &ds->state;
+                fprintf(stderr, "[totk-frame] draw-state va=%#x va0=%#x vs=%#llx vb=%#x"
+                                " vb0addr=%#llx vb0size=%zu depth_test=%d cull=%d blend=%#x"
+                                " chmask=%#x layout=%dx%d\n",
+                        db->va_mask, db->va[0], (unsigned long long)db->vs[0], db->vb_mask,
+                        (unsigned long long)db->vb[0].address, db->vb[0].size, db->rs.ds.dt, db->rs.poly.cull,
+                        db->rs.color.blend_en, db->rs.chmask.mask, ds->width, ds->height);
+                if (db->vb[0].address) {
+                    const float *v = (const float *)(uintptr_t)db->vb[0].address;
+                    fprintf(stderr, "[totk-frame] vb0 floats:");
+                    for (int k = 0; k < 16; k++) fprintf(stderr, " %.3f", v[k]);
+                    fputc('\n', stderr);
+                    const uint8_t *raw = (const uint8_t *)(uintptr_t)db->vb[0].address;
+                    fprintf(stderr, "[totk-frame] vb0 hex:");
+                    for (int k = 0; k < 64 && (size_t)k < db->vb[0].size; k++) fprintf(stderr, "%02x", raw[k]);
+                    fputc('\n', stderr);
+                    for (uint32_t ci = 0; ci < c->ncmds; ci++) {
+                        if (c->cmds[ci].kind != NVN_CMD_DRAW_INDEXED) continue;
+                        const uint8_t *ib = (const uint8_t *)(uintptr_t)c->cmds[ci].u.draw_indexed.indices;
+                        fprintf(stderr, "[totk-frame] index type=%u count=%u hex:",
+                                c->cmds[ci].u.draw_indexed.index_type,
+                                c->cmds[ci].u.draw_indexed.count);
+                        for (uint32_t k = 0; k < c->cmds[ci].u.draw_indexed.count && k < 16; k++) fprintf(stderr, " %02x", ib[k]);
+                        fputc('\n', stderr);
+                        break;
+                    }
+                }
+            }
+            for (uint32_t i = 0; i < c->ncmds; i++) {
+                const nvn_cmd_t *cc = &c->cmds[i];
+                fprintf(stderr, "  %u kind=%u", i, cc->kind);
+                if (cc->kind == NVN_CMD_DRAW || cc->kind == NVN_CMD_DRAW_INDEXED)
+                    fprintf(stderr, " prim=%u first=%u count=%u", cc->u.draw.primitive,
+                            cc->u.draw.first, cc->u.draw.count);
+                else if (cc->kind == NVN_CMD_SET_RENDER_TARGETS)
+                    fprintf(stderr, " n=%u rt0=%p depth=%p", cc->u.targets.count,
+                            cc->u.targets.tex[0], cc->u.targets.depth);
+                else if (cc->kind == NVN_CMD_SET_VIEWPORT || cc->kind == NVN_CMD_SET_SCISSOR)
+                    fprintf(stderr, " rect=%d,%d %dx%d", cc->u.rect.x, cc->u.rect.y,
+                            cc->u.rect.width, cc->u.rect.height);
+                else if (cc->kind == NVN_CMD_CLEAR_COLOR)
+                    fprintf(stderr, " i=%d rgba=%.2f,%.2f,%.2f,%.2f", cc->u.clear.index,
+                            cc->u.clear.rgba[0], cc->u.clear.rgba[1], cc->u.clear.rgba[2], cc->u.clear.rgba[3]);
+                else if (cc->kind == NVN_CMD_UPDATE_UBO)
+                    fprintf(stderr, " dst=%#llx n=%u", (unsigned long long)cc->u.update.dst, cc->u.update.size);
+                fputc('\n', stderr);
+            }
+        }
+    }
+    if (nvn_trace_frame() && c->ncmds >= 32) {
+        uint32_t hist[16] = {0};
+        for (uint32_t i = 0; i < c->ncmds; i++) hist[c->cmds[i].kind & 15]++;
+        fprintf(stderr, "[totk-frame] kinds handle=%#llx cmds=%u draws=%d:",
+                (unsigned long long)h, c->ncmds, c->draw_count);
+        for (int i = 0; i < 16; i++) if (hist[i]) fprintf(stderr, " %d:%u", i, hist[i]);
+        fputc('\n', stderr);
+    }
     if (nvn_trace_first() && (nvn_record_count <= 64 || (c->draw_count && nvn_draw_rec_trace++ < 8))) {
         const nvn_bind_state_t *b = c->bind_state;
         fprintf(stderr, "[totk-nvn] EndRecording #%u cb=%p bs=%p handle=%#llx cmds=%u draw=%d"
@@ -3050,6 +3250,65 @@ static cb_t *nvn_cb_by_handle(uint64_t h) {
     return NULL;
 }
 
+static void nvn_frame_ubo_trace(int n, const uint64_t *cmds) {
+    static unsigned reports;
+    if (!nvn_trace_frame() || !(reports < 8 || (reports % 300) == 0)) return;
+    reports++;
+    for (int i = 0; i < n; i++) {
+        cb_t *c = nvn_cb_by_handle(cmds[i]);
+        if (!c || !c->draw_count || !c->bind_state) continue;
+        const nvn_bind_state_t *b = c->bind_state;
+        for (int st = 0; st < 6; st++) for (int s = 0; s < 16; s++) {
+            if (!(b->ubo_mask[st] & (1u << s))) continue;
+            uint64_t addr = b->ubo[st][s].address;
+            size_t size = b->ubo[st][s].size;
+            uint32_t first[4] = {0};
+            if (addr && size >= sizeof first) memcpy(first, (const void *)(uintptr_t)addr, sizeof first);
+            int nz = 0; size_t nz_off = 0;
+            const uint8_t *p = (const uint8_t *)(uintptr_t)addr;
+            for (size_t k = 0; addr && k < size; k++) if (p[k]) { nz = 1; nz_off = k; break; }
+            fprintf(stderr, "[totk-frame] ubo cb=%p stage=%d slot=%d addr=%#llx size=%zu nonzero=%d off=%zu"
+                            " first=%08x %08x %08x %08x\n",
+                    (void *)c, st, s, (unsigned long long)addr, size, nz, nz_off,
+                    first[0], first[1], first[2], first[3]);
+        }
+    }
+}
+
+static void nvn_frame_submit_trace(int n, const uint64_t *cmds) {
+    if (!nvn_trace_frame()) return;
+    fprintf(stderr, "[totk-frame] submit thread=%#x n=%d handles=",
+            runtime_thread_current_handle(), n);
+    for (int i = 0; i < n; i++) {
+        cb_t *c = nvn_cb_by_handle(cmds[i]);
+        fprintf(stderr, " %#llx%s%s", (unsigned long long)cmds[i],
+                c ? "" : "(dead)", nvn_orphan_seen(cmds[i]) ? "(orphan)" : "");
+        if (c) { cb_meta_t *m = nvn_cb_meta(c, 1); if (m) m->submit_count++; }
+    }
+    fputc('\n', stderr);
+}
+
+/* Called from Present once in a while: if a recorded handle was dropped
+ * unsubmitted, show where its recording thread is now. */
+static void nvn_frame_report_orphans(void) {
+    if (!nvn_trace_frame()) return;
+    for (unsigned i = 0; i < g_orphan_count; i++) {
+        if (g_orphans[i].reported) continue;
+        g_orphans[i].reported = 1;
+        int wkind = -1, nwh = 0, last_svc = 0, exited = 0;
+        uint32_t wh[4] = {0};
+        uint64_t waddr = 0, lr = 0, fp = 0, nsvc = 0;
+        int ok = runtime_thread_probe(g_orphans[i].thread, &wkind, &waddr, wh, &nwh,
+                                      &last_svc, &lr, &fp, &nsvc, &exited);
+        fprintf(stderr, "[totk-frame] unsubmitted handle=%#llx cb=%p thread=%#x cmds=%u draws=%d lr=%#llx"
+                        " | owner %s wkind=%d waddr=%#llx wh=%#x,%#x last_svc=%#x lr=%#llx nsvc=%llu\n",
+                (unsigned long long)g_orphans[i].handle, g_orphans[i].cb, g_orphans[i].thread,
+                g_orphans[i].commands, g_orphans[i].draws, (unsigned long long)g_orphans[i].lr,
+                ok ? "live" : "gone", wkind, (unsigned long long)waddr,
+                wh[0], wh[1], last_svc, (unsigned long long)lr, (unsigned long long)nsvc);
+    }
+}
+
 /* Replay a recorded command buffer into another one (Call/CopyCommands).
  * Command records are appended in order; the source's final bind state is
  * merged so the draw that follows sees the resources the copied commands
@@ -3108,6 +3367,16 @@ static void nvnCommandBufferCallCommands(cb_t *c, int n, const uint64_t *handles
     nvn_api("nvnCommandBufferCallCommands");
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferCallCommands", "invalid command buffer"); return; }
     if (n < 0 || (!handles && n)) { nvn_fail("nvnCommandBufferCallCommands", "null handle array"); return; }
+    if (nvn_trace_frame()) {
+        fprintf(stderr, "[totk-frame] CallCommands dst=%p thread=%#x n=%d", (void *)c,
+                runtime_thread_current_handle(), n);
+        for (int i = 0; i < n; i++) {
+            cb_t *src = nvn_cb_by_handle(handles[i]);
+            fprintf(stderr, " %#llx%s%s", (unsigned long long)handles[i],
+                    src ? "" : "(dead)", src && src->ncmds ? "(cmds)" : "");
+        }
+        fputc('\n', stderr);
+    }
     for (int i = 0; i < n; i++) {
         cb_t *src = nvn_cb_by_handle(handles[i]);
         if (!src) {
@@ -3122,6 +3391,16 @@ static void nvnCommandBufferCopyCommands(cb_t *c, int n, const uint64_t *handles
     nvn_api("nvnCommandBufferCopyCommands");
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferCopyCommands", "invalid command buffer"); return; }
     if (n < 0 || (!handles && n)) { nvn_fail("nvnCommandBufferCopyCommands", "null handle array"); return; }
+    if (nvn_trace_frame()) {
+        fprintf(stderr, "[totk-frame] CopyCommands dst=%p thread=%#x n=%d", (void *)c,
+                runtime_thread_current_handle(), n);
+        for (int i = 0; i < n; i++) {
+            cb_t *src = nvn_cb_by_handle(handles[i]);
+            fprintf(stderr, " %#llx%s%s", (unsigned long long)handles[i],
+                    src ? "" : "(dead)", src && src->ncmds ? "(cmds)" : "");
+        }
+        fputc('\n', stderr);
+    }
     for (int i = 0; i < n; i++) {
         cb_t *src = nvn_cb_by_handle(handles[i]);
         if (!src) {
@@ -3202,6 +3481,38 @@ static void nvnCommandBufferSetSamplerPool(cb_t *c, const samp_pool_t *p) {
     if (nvn_trace() || (nvn_trace_first()))
         fprintf(stderr, "[totk-nvn] SetSamplerPool cb=%p pool=%p n=%d rec=%u\n",
                 (void *)c, (const void *)p, p ? (int)p->n : 0, c->recording);
+}
+/* NVN copies the payload into command memory when recording and writes it to
+ * the buffer when the command buffer runs, so the caller may reuse/change the
+ * source afterwards.  The CPU translator does not have GPU command memory, so
+ * keep a private copy in the command record and replay it at submit time. */
+static void nvnCommandBufferUpdateUniformBuffer(cb_t *c, uint64_t buffer, size_t buffer_size,
+                                                ptrdiff_t offset, size_t size, const void *data) {
+    nvn_api("nvnCommandBufferUpdateUniformBuffer");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferUpdateUniformBuffer", "invalid command buffer"); return; }
+    if (!buffer || !data || !size) return;
+    if (offset < 0 || (uint64_t)offset > buffer_size || size > buffer_size - (uint64_t)offset) {
+        nvn_fail("nvnCommandBufferUpdateUniformBuffer", "range outside buffer");
+        return;
+    }
+    nvn_cmd_t *cmd = nvn_cb_cmd(c, NVN_CMD_UPDATE_UBO);
+    if (!cmd) return;
+    uint8_t *copy = malloc(size);
+    if (!copy) { nvn_fail("nvnCommandBufferUpdateUniformBuffer", "out of memory"); c->ncmds--; return; }
+    memcpy(copy, data, size);
+    cmd->u.update.dst = buffer + (uint64_t)offset;
+    cmd->u.update.size = (uint32_t)size;
+    cmd->u.update.data = copy;
+    if (nvn_trace_frame()) {
+        static unsigned updates;
+        if (updates++ < 16) {
+            fprintf(stderr, "[totk-frame] UpdateUniformBuffer cb=%p dst=%#llx off=%lld size=%zu data=",
+                    (void *)c, (unsigned long long)cmd->u.update.dst, (long long)offset, size);
+            size_t words = size / 4; if (words > 16) words = 16;
+            for (size_t k = 0; k < words; k++) fprintf(stderr, " %08x", ((const uint32_t *)data)[k]);
+            fputc('\n', stderr);
+        }
+    }
 }
 static void nvnCommandBufferBindUniformBuffer(cb_t *c, int stage, int i, uint64_t address, size_t size) {
     nvn_api("nvnCommandBufferBindUniformBuffer");
@@ -3613,6 +3924,10 @@ static uint32_t nvn_program_set_shaders(prog_t *p, int n, const void *shaders,
                 fprintf(stderr, "[totk-nvn] shader cache hit #%u %s %s code=%u%s\n",
                         hit, runtime_shader_stage_name(id.stage), id.key, id.code_bytes,
                         mod.res_path[0] ? " +res.json" : "");
+            if (nvn_trace_frame() && hit <= 64)
+                fprintf(stderr, "[totk-frame] program=%p stage=%s key=%s res=%s\n",
+                        (void *)p, runtime_shader_stage_name(id.stage), id.key,
+                        mod.res_path[0] ? mod.res_path : "-");
         } else {
             nvn_dump_shader(&id, control, code);
             prog_stage_clear(s, id.stage);
@@ -4185,14 +4500,41 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
          * shader cbuf slot 3.) */
         if (nbound == 1 && nspec == 1) {
             int target = pspec->ubo_slot[stage][0];
+            /* The engine may bind one large support buffer (c0) and publish the
+             * draw's real constants with nvnCommandBufferUpdateUniformBuffer
+             * into a subrange of it; the shader's cbuf is that subrange.  Use
+             * the game's own most recent update that lies inside the bound
+             * range instead of handing the shader the buffer header. */
+            const void *bind_data = failed_data;
+            size_t bind_size = failed_size;
+            if (cb && failed_data) {
+                uint64_t base = (uint64_t)(uintptr_t)failed_data;
+                for (uint32_t i = cb->ncmds; i > 0; i--) {
+                    const nvn_cmd_t *uc = &cb->cmds[i - 1];
+                    if (uc->kind != NVN_CMD_UPDATE_UBO || !uc->u.update.size) continue;
+                    if (uc->u.update.dst >= base &&
+                        uc->u.update.dst + uc->u.update.size <= base + failed_size) {
+                        bind_data = (const void *)(uintptr_t)uc->u.update.dst;
+                        bind_size = uc->u.update.size;
+                        break;
+                    }
+                }
+            }
             if (target >= 0 && target != failed_slot &&
                 gfx_backend_reflected_bind_ubo_slot(rp, (uint32_t)stage, (uint32_t)target,
-                                                    failed_data, failed_size)) {
+                                                    bind_data, bind_size)) {
                 static unsigned logged;
-                if (logged++ < 8)
+                if (logged++ < 8) {
+                    char range[64] = "whole";
+                    if (bind_data != failed_data)
+                        snprintf(range, sizeof range, "+%zu", (size_t)((const uint8_t *)bind_data - (const uint8_t *)failed_data));
                     fprintf(stderr, "[totk-nvn] UBO stage=%d nvn index=%d -> shader cbuf"
-                                    " slot=%d (single-UBO program, size=%zu)\n",
-                            stage, failed_slot, target, failed_size);
+                                    " slot=%d (single-UBO program, base_size=%zu bind=%s/%zu"
+                                    " first=%08x %08x %08x %08x)\n",
+                            stage, failed_slot, target, failed_size, range, bind_size,
+                            ((const uint32_t *)bind_data)[0], ((const uint32_t *)bind_data)[1],
+                            ((const uint32_t *)bind_data)[2], ((const uint32_t *)bind_data)[3]);
+                }
             }
         }
         for (int i = 0; i < 16; i++) {
@@ -4478,6 +4820,17 @@ static void nvn_warm_recording(void *vc) {
                                       vertex_sig, variant);
 }
 
+/* Replay recorded uniform updates in command order.  Draws are translated
+ * after this, so every draw sees the final content of each range; the engine
+ * gives each draw its own ring range, so this matches the GPU order. */
+static void nvn_cb_apply_uniform_updates(cb_t *cb) {
+    if (!cb) return;
+    for (uint32_t i = 0; i < cb->ncmds; i++) {
+        nvn_cmd_t *c = &cb->cmds[i];
+        if (c->kind != NVN_CMD_UPDATE_UBO || !c->u.update.data || !c->u.update.dst) continue;
+        memcpy((void *)(uintptr_t)c->u.update.dst, c->u.update.data, c->u.update.size);
+    }
+}
 static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
     for (int i = 0; i < n; i++) {
         cb_t *cb = NULL;
@@ -4487,6 +4840,7 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             if (cand->handle == cmds[i]) { cb = cand; break; }
         }
         if (!cb || (!cb->draw_count && !cb->ncmds)) continue;
+        nvn_cb_apply_uniform_updates(cb);
         if (nvn_trace_first() && nvn_submit_trace++ < 4096) {
             const nvn_bind_state_t *sb = cb->bind_state;
             fprintf(stderr, "[totk-nvn] Submit#%u handle=%#llx cb=%p prog=%p draw=%d"
@@ -6582,6 +6936,7 @@ static const nvn_entry nvn_entries[] = {
     NVN_E(nvnCommandBufferSetStencilMask), NVN_E(nvnCommandBufferSetStencilValueMask),
     NVN_E(nvnCommandBufferSetTexturePool),
     NVN_E(nvnCommandBufferSetSamplerPool), NVN_E(nvnCommandBufferBindUniformBuffer),
+    NVN_E(nvnCommandBufferUpdateUniformBuffer),
     NVN_E(nvnCommandBufferBindUniformBuffers), NVN_E(nvnCommandBufferBindStorageBuffer),
     NVN_E(nvnCommandBufferBindStorageBuffers), NVN_E(nvnCommandBufferBindTexture),
     NVN_E(nvnCommandBufferBindTextures), NVN_E(nvnCommandBufferBindImage),
