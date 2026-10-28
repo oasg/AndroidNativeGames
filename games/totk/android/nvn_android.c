@@ -51,6 +51,7 @@ extern int runtime_native_window_clear_rgba(void *p, const float rgba[4]);
 extern int runtime_native_window_read_pixel(void *p, uint32_t x, uint32_t y, uint8_t out[4]);
 extern int runtime_native_window_screenshot(void *p, const char *path);
 static void nvn_process_submit_commands(const uint64_t *cmds, int n);
+static void nvn_warm_recording(void *cb);
 static int nvn_gpu_drain(const char *what);
 static void nvn_host_rt_clear(void);
 
@@ -2377,6 +2378,11 @@ static uint64_t nvnCommandBufferEndRecording(cb_t *c) {
     c->handle = h;
     if (nvn_trace()) fprintf(stderr, "[totk-nvn] CommandBufferEndRecording %p -> handle %#llx (%u cmds)\n",
                              (void *)c, (unsigned long long)h, c->ncmds);
+    /* Create the reflected pipeline on the recording thread.  The Adreno
+     * driver aborts a first vkCreateGraphicsPipelines from the submit thread
+     * for some real TOTK shader pairs; the same call on the game thread
+     * succeeds, and the submit path then reuses the cached pipeline. */
+    nvn_warm_recording(c);
     return h;
 }
 static void nvnCommandBufferBindProgram(cb_t *c, const prog_t *p, int stage_mask) {
@@ -3929,6 +3935,44 @@ static int nvn_window_mirror_target(win_t *w, GfxOffscreenTarget *target) {
             if (!gfx_backend_offscreen_read_pixel_index(target, 0, x, y, dst + ((size_t)y * ww + x) * 4))
                 return 0;
     return 1;
+}
+
+/* Recording-thread pipeline warm-up.  Mirrors the layout/vertex/variant key
+ * computed by nvn_process_submit_commands so the submit path finds a cached
+ * pipeline instead of creating one on the render thread. */
+static void nvn_warm_recording(void *vc) {
+    cb_t *cb = vc;
+    if (!cb || cb->magic != NVN_MAGIC('C', 'M', 'D', 'B') || !cb->prog || !cb->win)
+        return;
+    win_t *w = cb->win;
+    if (w->magic != NVN_MAGIC('W', 'I', 'N', 'D')) return;
+    prog_t *p = cb->prog;
+    if (p->magic != NVN_MAGIC('P', 'R', 'O', 'G')) return;
+    GfxRenderTargetLayout layout;
+    uint32_t rw = 0, rh = 0;
+    int have_layout = 0;
+    nvn_cb_target_t *cbt = nvn_cb_target(cb, 0);
+    if (cbt && cbt->valid) {
+        layout = cbt->layout;
+        rw = cbt->width;
+        rh = cbt->height;
+        have_layout = 1;
+    } else {
+        nvn_window_layout(w, &layout, &rw, &rh);
+        have_layout = layout.color_count > 0 && rw && rh;
+    }
+    if (!have_layout) return;
+    int window_pass = (!cbt || cbt->window_texture) &&
+                      nvn_layout_matches_window(w, &layout, rw, rh);
+    GfxVertexLayout input;
+    uint64_t vertex_sig = 0;
+    nvn_build_vertex_layout(cb, &input, &vertex_sig);
+    char variant[192];
+    nvn_variant_suffix(p, cb, variant, sizeof variant);
+    (void)nvn_program_cached_pipeline(p, nvn_window_format(w), &layout,
+                                      window_pass,
+                                      input.nattributes ? &input : NULL,
+                                      vertex_sig, variant);
 }
 
 static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
