@@ -310,6 +310,33 @@ static void query_memory(uint64_t out, uint64_t addr) {
 uint64_t runtime_svc(unsigned num, uint64_t *r, const char *module, uint64_t offset) {
     static int trace = -1;
     if (trace < 0) trace = getenv("TOTK_ANDROID_TRACE_SVC") != NULL;
+    /* Low-noise SVC histogram for boot stalls: tells whether a hot
+     * WaitSynchronization (0x18) is paired with ResetSignal/ClearEvent. */
+    static int stats = -1;
+    if (stats < 0) stats = getenv("TOTK_ANDROID_SVC_STATS") != NULL;
+    if (stats) {
+        static uint64_t total, c11, c12, c17, c18, c34, c35;
+        uint64_t n = __atomic_add_fetch(&total, 1, __ATOMIC_RELAXED);
+        if (num == 0x11) __atomic_add_fetch(&c11, 1, __ATOMIC_RELAXED);
+        else if (num == 0x12) __atomic_add_fetch(&c12, 1, __ATOMIC_RELAXED);
+        else if (num == 0x17) __atomic_add_fetch(&c17, 1, __ATOMIC_RELAXED);
+        else if (num == 0x18) __atomic_add_fetch(&c18, 1, __ATOMIC_RELAXED);
+        else if (num == 0x34) __atomic_add_fetch(&c34, 1, __ATOMIC_RELAXED);
+        else if (num == 0x35) __atomic_add_fetch(&c35, 1, __ATOMIC_RELAXED);
+        if (n % 1000000 == 0) {
+            uint32_t h0 = 0;
+            if (num == 0x18 && r[1] && r[2] >= 1) memcpy(&h0, (const void *)(uintptr_t)r[1], 4);
+            fprintf(stderr, "[totk-svc] total=%llu 0x11=%llu 0x12=%llu 0x17=%llu 0x18=%llu 0x34=%llu 0x35=%llu h=%#x n=%llu to=%lld\n",
+                    (unsigned long long)n, (unsigned long long)__atomic_load_n(&c11, __ATOMIC_RELAXED),
+                    (unsigned long long)__atomic_load_n(&c12, __ATOMIC_RELAXED),
+                    (unsigned long long)__atomic_load_n(&c17, __ATOMIC_RELAXED),
+                    (unsigned long long)__atomic_load_n(&c18, __ATOMIC_RELAXED),
+                    (unsigned long long)__atomic_load_n(&c34, __ATOMIC_RELAXED),
+                    (unsigned long long)__atomic_load_n(&c35, __ATOMIC_RELAXED),
+                    h0, num == 0x18 ? (unsigned long long)r[2] : 0,
+                    num == 0x18 ? (long long)r[3] : 0);
+        }
+    }
     if (trace)
         fprintf(stderr, "[totk-android] SVC %#x at %s+%#llx x0=%#llx x1=%#llx x2=%#llx\n",
                 num, module, (unsigned long long)offset,

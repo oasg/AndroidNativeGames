@@ -371,9 +371,15 @@ typedef struct { uint32_t magic, n; pool_t *pool; int64_t off; } samp_pool_t;
  * guest-sized (0x20 bytes), so the id -> object map lives on the host. */
 typedef struct { const tex_pool_t *pool; int id; const tex_t *tex; } tex_pool_map_t;
 typedef struct { const samp_pool_t *pool; int id; const samp_t *samp; } samp_pool_map_t;
-static tex_pool_map_t g_tex_pool_map[256];
+/* The boot scene registers more than a thousand textures (810 by the first
+ * NVN submit in the 1.0.0 boot path) plus samplers, so the old 256-entry
+ * tables silently dropped registrations and every later BindTexture resolved
+ * to NULL.  Keep enough room for a full scene and report overflow instead of
+ * hiding it. */
+#define NVN_POOL_MAP_MAX 16384
+static tex_pool_map_t g_tex_pool_map[NVN_POOL_MAP_MAX];
 static unsigned g_tex_pool_map_count;
-static samp_pool_map_t g_samp_pool_map[256];
+static samp_pool_map_t g_samp_pool_map[NVN_POOL_MAP_MAX];
 static unsigned g_samp_pool_map_count;
 
 typedef struct {
@@ -1629,8 +1635,13 @@ static void nvn_tex_pool_add(const tex_pool_t *p, int id, const tex_t *t) {
             g_tex_pool_map[i].tex = t;
             return;
         }
-    if (g_tex_pool_map_count < sizeof g_tex_pool_map / sizeof g_tex_pool_map[0])
+    if (g_tex_pool_map_count < sizeof g_tex_pool_map / sizeof g_tex_pool_map[0]) {
         g_tex_pool_map[g_tex_pool_map_count++] = (tex_pool_map_t){ p, id, t };
+    } else {
+        static int warned;
+        if (!warned++) fprintf(stderr, "[totk-nvn] ERROR texture pool map full (%u registrations); later binds resolve NULL\n",
+                               g_tex_pool_map_count);
+    }
 }
 static const tex_t *nvn_tex_pool_lookup(const tex_pool_t *p, int id) {
     for (unsigned i = 0; i < g_tex_pool_map_count; i++)
@@ -1650,8 +1661,13 @@ static void nvn_samp_pool_add(const samp_pool_t *p, int id, const samp_t *s) {
             g_samp_pool_map[i].samp = s;
             return;
         }
-    if (g_samp_pool_map_count < sizeof g_samp_pool_map / sizeof g_samp_pool_map[0])
+    if (g_samp_pool_map_count < sizeof g_samp_pool_map / sizeof g_samp_pool_map[0]) {
         g_samp_pool_map[g_samp_pool_map_count++] = (samp_pool_map_t){ p, id, s };
+    } else {
+        static int warned;
+        if (!warned++) fprintf(stderr, "[totk-nvn] ERROR sampler pool map full (%u registrations); later binds resolve NULL\n",
+                               g_samp_pool_map_count);
+    }
 }
 static const samp_t *nvn_samp_pool_lookup(const samp_pool_t *p, int id) {
     for (unsigned i = 0; i < g_samp_pool_map_count; i++)
@@ -2119,6 +2135,19 @@ static void nvnCommandBufferClearDepthStencil(cb_t *c, float depth, uint32_t dma
     }
 }
 
+/* First-frame diagnostics: one line per bound target/binding with the NVN
+ * descriptor fields needed to describe the frame (format, kind, size, layers,
+ * mips, samples).  Only runs with TOTK_ANDROID_TRACE_NVN. */
+static void nvn_trace_tex(const char *what, const tex_t *t) {
+    if (!t || t->magic != NVN_MAGIC('T', 'E', 'X', 0)) {
+        fprintf(stderr, "[totk-nvn] %s texture=NULL\n", what);
+        return;
+    }
+    fprintf(stderr, "[totk-nvn] %s texture=%p target=%d format=%#x %ux%ux%u layers=%u mips=%u samples=%d\n",
+            what, (const void *)t, t->d.target, t->d.format, t->d.width, t->d.height,
+            t->d.depth ? t->d.depth : 1u, t->has_layout ? t->L.layers : 1u,
+            t->d.levels, t->d.samples);
+}
 static void nvnCommandBufferSetRenderTargets(cb_t *c, int n, const void *const *t,
                                              const void *const *views,
                                              const void *depth, const void *depth_view) {
@@ -2136,9 +2165,16 @@ static void nvnCommandBufferSetRenderTargets(cb_t *c, int n, const void *const *
         win_t *w = nvn_window_for_texture(t[0]);
         if (w) c->win = w;
     }
-    if (nvn_trace() && n)
-        fprintf(stderr, "[totk-nvn] SetRenderTargets count=%d color0=%p window=%p\n",
-                n, t[0], (void *)c->win);
+    if (nvn_trace() && n) {
+        fprintf(stderr, "[totk-nvn] SetRenderTargets count=%d color0=%p window=%p depth=%p\n",
+                n, t[0], (void *)c->win, depth);
+        for (int i = 0; i < n; i++) {
+            char what[32];
+            snprintf(what, sizeof what, "color%d", i);
+            nvn_trace_tex(what, (const tex_t *)t[i]);
+        }
+        if (depth) nvn_trace_tex("depth", (const tex_t *)depth);
+    }
 }
 static void nvnCommandBufferClearColor(cb_t *c, int i, const float *v, int mask) {
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferClearColor", "invalid command buffer"); return; }
@@ -2295,12 +2331,14 @@ static void nvnCommandBufferSetTexturePool(cb_t *c, const tex_pool_t *p) {
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferSetTexturePool", "invalid command buffer"); return; }
     if (p && p->magic != NVN_MAGIC('T', 'P', 'O', 'L')) { nvn_fail("nvnCommandBufferSetTexturePool", "invalid texture pool"); return; }
     c->tex_pool = p;
+    if (nvn_trace()) fprintf(stderr, "[totk-nvn] SetTexturePool cb=%p pool=%p n=%d\n", (void *)c, (const void *)p, p ? (int)p->n : 0);
 }
 static void nvnCommandBufferSetSamplerPool(cb_t *c, const samp_pool_t *p) {
     nvn_api("nvnCommandBufferSetSamplerPool");
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferSetSamplerPool", "invalid command buffer"); return; }
     if (p && p->magic != NVN_MAGIC('S', 'P', 'O', 'L')) { nvn_fail("nvnCommandBufferSetSamplerPool", "invalid sampler pool"); return; }
     c->samp_pool = p;
+    if (nvn_trace()) fprintf(stderr, "[totk-nvn] SetSamplerPool cb=%p pool=%p n=%d\n", (void *)c, (const void *)p, p ? (int)p->n : 0);
 }
 static void nvnCommandBufferBindUniformBuffer(cb_t *c, int stage, int i, uint64_t address, size_t size) {
     nvn_api("nvnCommandBufferBindUniformBuffer");
@@ -2381,8 +2419,10 @@ static void nvnCommandBufferBindTexture(cb_t *c, int stage, int i, uint64_t hand
         int tid = (int)(handle & 0xfffff), sid = (int)((handle >> 20) & 0xfff);
         const tex_t *t = c->tex_pool ? nvn_tex_pool_lookup(c->tex_pool, tid) : NULL;
         const samp_t *s = c->samp_pool ? nvn_samp_pool_lookup(c->samp_pool, sid) : NULL;
-        fprintf(stderr, "[totk-nvn] BindTexture stage=%d index=%d handle=%#llx tex=%d(%p) samp=%d(%p)\n",
+        fprintf(stderr, "[totk-nvn] BindTexture cb=%p tpool=%p spool=%p stage=%d index=%d handle=%#llx tex=%d(%p) samp=%d(%p)\n",
+                (void *)c, (const void *)c->tex_pool, (const void *)c->samp_pool,
                 stage, i, (unsigned long long)handle, tid, (const void *)t, sid, (const void *)s);
+        if (t) nvn_trace_tex("  bind", t);
     }
 }
 static void nvnCommandBufferBindTextures(cb_t *c, int stage, int first, int n, const uint64_t *handles) {
