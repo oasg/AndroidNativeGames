@@ -26,6 +26,10 @@ def main():
                    default=pathlib.Path(__file__).with_name('triangle_attr.frag'))
     p.add_argument('--depth-vert', type=pathlib.Path,
                    default=pathlib.Path(__file__).with_name('triangle_z.vert'))
+    p.add_argument('--mrt-vert', type=pathlib.Path,
+                   default=pathlib.Path(__file__).with_name('triangle_mrt.vert'))
+    p.add_argument('--mrt-frag', type=pathlib.Path,
+                   default=pathlib.Path(__file__).with_name('triangle_mrt.frag'))
     a = p.parse_args()
     host = ('darwin' if sys.platform == 'darwin' else 'linux') + '-x86_64'
     glslc = a.ndk/'shader-tools'/host/'glslc'
@@ -38,11 +42,13 @@ def main():
     ufs = tmp/'reflect_ubo.frag.spv'
     avs, afs = tmp/'triangle_attr.vert.spv', tmp/'triangle_attr.frag.spv'
     dvs = tmp/'triangle_z.vert.spv'
+    mvs, mfs = tmp/'triangle_mrt.vert.spv', tmp/'triangle_mrt.frag.spv'
     attrs = [('vert', a.attr_vert, avs), ('frag', a.attr_frag, afs),
              ('vert', a.depth_vert, dvs)]
     for stage, src, dst in [('vert', a.vert, vs), ('frag', a.frag, fs),
                             ('vert', a.tex_vert, tvs), ('frag', a.tex_frag, tfs),
-                            ('frag', a.reflect_ubo_frag, ufs)] + attrs:
+                            ('frag', a.reflect_ubo_frag, ufs),
+                            ('vert', a.mrt_vert, mvs), ('frag', a.mrt_frag, mfs)] + attrs:
         subprocess.run([str(glslc), '--target-env=vulkan1.0', '-O', f'-fshader-stage={stage}',
                         str(src), '-o', str(dst)], check=True)
     def arr(name, path):
@@ -65,7 +71,9 @@ def main():
                      + arr('reflect_ubo_frag_spv', ufs) + '\n'
                      + arr('triangle_attr_vert_spv', avs) + '\n'
                      + arr('triangle_attr_frag_spv', afs) + '\n'
-                     + arr('triangle_z_vert_spv', dvs) + '\n')
+                     + arr('triangle_z_vert_spv', dvs) + '\n'
+                     + arr('triangle_mrt_vert_spv', mvs) + '\n'
+                     + arr('triangle_mrt_frag_spv', mfs) + '\n')
     print(f'wrote {a.out} ({vs.stat().st_size}+{fs.stat().st_size}+{ufs.stat().st_size} bytes)')
 
 if __name__ == '__main__':
