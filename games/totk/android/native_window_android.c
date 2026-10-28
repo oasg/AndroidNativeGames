@@ -29,6 +29,8 @@ typedef struct HostNativeWindow {
     void *android;          /* ANativeWindow*, set by the app shell */
     int surface_ok;         /* VkSwapchainKHR created for `android` */
     void *gfx_target;       /* GfxOffscreenTarget* or NULL for the software path */
+    unsigned presents;      /* successful surface/offscreen presents */
+    unsigned surface_presents; /* presents that went through the swapchain */
     float clear[4];
     uint8_t *buffer;
     size_t buffer_size;
@@ -40,6 +42,10 @@ typedef struct HostNativeWindow {
 static HostNativeWindow *g_host_windows[64];
 static unsigned g_host_window_count;
 static pthread_mutex_t g_host_window_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* App-shell owned host window used when the caller only has a Surface.  The
+ * game path normally passes the HostNativeWindow it got from VI. */
+static HostNativeWindow *g_shell_window;
 
 int runtime_native_window_valid(const void *p) {
     if (!p) return 0;
@@ -122,6 +128,7 @@ void runtime_native_window_destroy(void *p) {
     host_window_unregister(w);
     if (w->gfx_target) gfx_backend_offscreen_destroy(w->gfx_target);
     if (w->surface_ok) gfx_backend_detach_android_surface();
+    if (g_shell_window == w) g_shell_window = NULL;
     free(w->buffer);
     w->magic = 0;
     free(w);
@@ -139,20 +146,89 @@ int runtime_native_window_info(const void *p, uint32_t *width, uint32_t *height,
     return 1;
 }
 
-void runtime_native_window_attach_android(void *p, void *android) {
-    HostNativeWindow *w = p;
-    if (!w || w->magic != HOST_NW_MAGIC) return;
-    w->android = android;
-    w->offscreen = android == NULL;
-    w->surface_ok = 0;
-    if (android) {
-        if (gfx_backend_attach_android_surface(android, w->width, w->height, w->format))
-            w->surface_ok = 1;
-        else
-            fprintf(stderr, "[totk-vi] ERROR Android surface attach failed; keeping offscreen target\n");
-    } else {
-        gfx_backend_detach_android_surface();
+/* Attach the app shell's ANativeWindow to a host native window.
+ *
+ * `native_window` is an ANativeWindow* acquired from a Java Surface (or an
+ * android_app window).  `host_window` is the HostNativeWindow* returned by
+ * runtime_native_window_create(); when it is NULL a shell-owned window of
+ * width x height is created and can be fetched with
+ * runtime_native_window_shell_window().  `width`/`height` describe the surface
+ * and are only used as the swapchain extent fallback; the host window keeps
+ * its own offscreen size so the offscreen readback path is unaffected.
+ *
+ * Passing native_window == NULL detaches the surface: the host window keeps
+ * its Vulkan offscreen target and present() falls back to it. */
+void runtime_native_window_attach_android(void *native_window, void *host_window,
+                                          uint32_t width, uint32_t height,
+                                          uint32_t nvn_format) {
+    HostNativeWindow *w = host_window;
+    if (!w || w->magic != HOST_NW_MAGIC) {
+        if (!native_window) {
+            /* Detach with no host window: still release the global surface so
+             * a dead Activity cannot leave a stale VkSurfaceKHR behind. */
+            gfx_backend_detach_android_surface();
+            return;
+        }
+        if (g_shell_window) {
+            runtime_native_window_destroy(g_shell_window);
+            g_shell_window = NULL;
+        }
+        w = runtime_native_window_create(width ? width : 1280, height ? height : 720,
+                                         nvn_format ? nvn_format : 0x25, 0x53484c4cu /* "SHLL" */);
+        if (!w) {
+            fprintf(stderr, "[totk-vi] ERROR Android surface attach: no host native window\n");
+            return;
+        }
+        g_shell_window = w;
     }
+    if (!native_window) {
+        w->android = NULL;
+        w->offscreen = 1;
+        w->surface_ok = 0;
+        gfx_backend_detach_android_surface();
+        fprintf(stderr, "[totk-vi] Android surface detached host=%p; offscreen target retained\n",
+                (void *)w);
+        return;
+    }
+    w->android = native_window;
+    w->offscreen = 0;
+    w->surface_ok = 0;
+    uint32_t sw = width ? width : w->width;
+    uint32_t sh = height ? height : w->height;
+    if (sw != w->width || sh != w->height)
+        fprintf(stderr, "[totk-vi] surface %ux%u differs from host window %ux%u; "
+                        "offscreen target stays %ux%u\n",
+                sw, sh, w->width, w->height, w->width, w->height);
+    if (gfx_backend_attach_android_surface(native_window, sw, sh,
+                                           nvn_format ? nvn_format : w->format)) {
+        w->surface_ok = 1;
+        fprintf(stderr, "[totk-vi] Android surface attached anw=%p host=%p surface=%ux%u "
+                        "format=%#x\n",
+                native_window, (void *)w, sw, sh, nvn_format ? nvn_format : w->format);
+    } else {
+        w->android = NULL;
+        w->offscreen = 1;
+        fprintf(stderr, "[totk-vi] ERROR Android surface attach failed; keeping offscreen target\n");
+    }
+}
+
+/* Host window implicitly created by the attach call above (NULL if the caller
+ * supplied its own). */
+void *runtime_native_window_shell_window(void) { return g_shell_window; }
+
+int runtime_native_window_surface_ready(const void *p) {
+    const HostNativeWindow *w = p;
+    return w && w->magic == HOST_NW_MAGIC && w->surface_ok;
+}
+
+unsigned runtime_native_window_present_count(const void *p) {
+    const HostNativeWindow *w = p;
+    return w && w->magic == HOST_NW_MAGIC ? w->presents : 0;
+}
+
+unsigned runtime_native_window_surface_present_count(const void *p) {
+    const HostNativeWindow *w = p;
+    return w && w->magic == HOST_NW_MAGIC ? w->surface_presents : 0;
 }
 
 void *runtime_native_window_android(const void *p) {
@@ -188,10 +264,20 @@ int runtime_native_window_clear(void *p, uint32_t rgba) {
 int runtime_native_window_present(void *p) {
     HostNativeWindow *w = p;
     if (!w || w->magic != HOST_NW_MAGIC) return 0;
-    if (w->surface_ok && gfx_backend_surface_ready())
-        return gfx_backend_surface_present(w->clear[0], w->clear[1], w->clear[2], w->clear[3]);
-    if (w->gfx_target) return gfx_backend_offscreen_present(w->gfx_target);
+    if (w->surface_ok && gfx_backend_surface_ready()) {
+        if (!gfx_backend_surface_present(w->clear[0], w->clear[1], w->clear[2], w->clear[3]))
+            return 0;
+        w->presents++;
+        w->surface_presents++;
+        return 1;
+    }
+    if (w->gfx_target) {
+        if (!gfx_backend_offscreen_present(w->gfx_target)) return 0;
+        w->presents++;
+        return 1;
+    }
     fprintf(stderr, "[totk-vi] present software %ux%u\n", w->width, w->height);
+    w->presents++;
     return 1;
 }
 
