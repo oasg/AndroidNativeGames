@@ -26,6 +26,13 @@ static const char *romfs_root(void) {
     const char *root = getenv("TOTK_ANDROID_ROMFS");
     return root && *root ? root : NULL;
 }
+/* Optional second read-only root.  The on-device debug extraction is split:
+ * the full 5.5 GiB tree lacks a few boot assets that only exist in the older
+ * partial overlay, so a lane can point at both without mutating either tree. */
+static const char *romfs_overlay_root(void) {
+    const char *root = getenv("TOTK_ANDROID_ROMFS_OVERLAY");
+    return root && *root ? root : NULL;
+}
 static const char *romfs_mount(void) {
     const char *name = getenv("TOTK_ANDROID_ROMFS_MOUNT");
     return name && *name ? name : "rom";
@@ -39,15 +46,16 @@ int runtime_romfs_handle(uint64_t h) {
     return h >= HANDLE_BASE && h < HANDLE_BASE + NH;
 }
 
-static unsigned resolve(const char *path, char *out, size_t cap) {
-    const char *root = romfs_root();
-    if (!root) return NOT_FOUND;
+/* Validate the guest-visible path once, then build a host path under any
+ * sandbox root.  Traversal components are rejected before either root sees
+ * the path, so the overlay has the same confinement as the primary tree. */
+static unsigned relative(const char *path, const char **out_rest) {
+    if (!romfs_root()) return NOT_FOUND;
     if (!runtime_romfs_owns(path)) return INVALID;
     size_t n = strlen(romfs_mount());
     const char *rest = path + n;
     if (rest[0] != ':' || rest[1] != '/') return INVALID;
     rest += 2;
-    /* Reject parent traversal; the RomFS is a sandbox root. */
     for (const char *p = rest; *p;) {
         const char *e = strchr(p, '/');
         size_t len = e ? (size_t)(e - p) : strlen(p);
@@ -55,10 +63,26 @@ static unsigned resolve(const char *path, char *out, size_t cap) {
         if (memchr(p, '\\', len)) return INVALID;
         p = e ? e + 1 : p + len;
     }
+    *out_rest = rest;
+    return 0;
+}
+static unsigned build(const char *root, const char *rest, char *out, size_t cap) {
     size_t rn = strlen(root);
     while (rn && root[rn - 1] == '/') rn--;
     int k = snprintf(out, cap, "%.*s/%s", (int)rn, root, rest);
     return k < 0 || (size_t)k >= cap ? INVALID : 0;
+}
+static unsigned resolve(const char *path, char *out, size_t cap) {
+    const char *rest = NULL;
+    unsigned r = relative(path, &rest);
+    return r ? r : build(romfs_root(), rest, out, cap);
+}
+static unsigned resolve_overlay(const char *path, char *out, size_t cap) {
+    const char *root = romfs_overlay_root();
+    if (!root) return NOT_FOUND;
+    const char *rest = NULL;
+    unsigned r = relative(path, &rest);
+    return r ? r : build(root, rest, out, cap);
 }
 
 unsigned runtime_romfs_open(uint64_t *out, const char *path, int mode) {
@@ -67,6 +91,12 @@ unsigned runtime_romfs_open(uint64_t *out, const char *path, int mode) {
     unsigned r = resolve(path, p, sizeof p);
     if (r) return r;
     int fd = open(p, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0 && (errno == ENOENT || errno == ENOTDIR) && romfs_overlay_root() &&
+        resolve_overlay(path, p, sizeof p) == 0) {
+        fd = open(p, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd >= 0 && getenv("TOTK_ANDROID_FS_TRACE"))
+            fprintf(stderr, "[totk-romfs] open %s: overlay %s\n", path, p);
+    }
     if (fd < 0) {
         if (getenv("TOTK_ANDROID_FS_TRACE"))
             fprintf(stderr, "[totk-romfs] open %s: %s\n", path,
@@ -123,7 +153,9 @@ unsigned runtime_romfs_entry_type(int *out, const char *path) {
     unsigned r = resolve(path, p, sizeof p);
     if (r) return r;
     struct stat st;
-    if (stat(p, &st)) return NOT_FOUND;
+    if (stat(p, &st) && (!romfs_overlay_root() ||
+                         resolve_overlay(path, p, sizeof p) != 0 || stat(p, &st)))
+        return NOT_FOUND;
     *out = S_ISDIR(st.st_mode) ? 0 : 1;
     return 0;
 }
