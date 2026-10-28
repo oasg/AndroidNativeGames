@@ -3099,6 +3099,14 @@ static GfxReflectedPipeline *reflect_pipeline_create_impl(
             pthread_mutex_unlock(&g_lock);
             return NULL;
         }
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(g.phys, cf, &fp);
+        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {
+            vk_log("ERROR reflected pipeline: attachment %u format %s lacks color-attachment",
+                   i, vk_format_name(cf));
+            pthread_mutex_unlock(&g_lock);
+            return NULL;
+        }
     }
     if (layout->depth_format &&
         (layout->depth_format == (int)VK_FORMAT_UNDEFINED ||
@@ -3107,6 +3115,16 @@ static GfxReflectedPipeline *reflect_pipeline_create_impl(
                layout->depth_format);
         pthread_mutex_unlock(&g_lock);
         return NULL;
+    }
+    if (layout->depth_format) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(g.phys, (VkFormat)layout->depth_format, &fp);
+        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+            vk_log("ERROR reflected pipeline: depth format %s lacks depth-attachment",
+                   vk_format_name((VkFormat)layout->depth_format));
+            pthread_mutex_unlock(&g_lock);
+            return NULL;
+        }
     }
     VkFormat fmt = (VkFormat)layout->color_formats[0];
     GfxReflectedPipeline *p = calloc(1, sizeof *p);
