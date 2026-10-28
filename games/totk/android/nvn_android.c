@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <limits.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -50,6 +51,8 @@ extern int runtime_native_window_clear_rgba(void *p, const float rgba[4]);
 extern int runtime_native_window_read_pixel(void *p, uint32_t x, uint32_t y, uint8_t out[4]);
 extern int runtime_native_window_screenshot(void *p, const char *path);
 static void nvn_process_submit_commands(const uint64_t *cmds, int n);
+static int nvn_gpu_drain(const char *what);
+static void nvn_host_rt_clear(void);
 
 #define NVN_MAGIC(a, b, c, d) \
     ((uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24)
@@ -181,7 +184,13 @@ typedef struct {
         struct { float rgba[4]; int index; uint32_t mask; } clear;
         struct { float depth; uint32_t dmask; int stencil; uint32_t smask; } clear_ds;
         struct { int32_t x, y, width, height; } rect;
-        struct { int count; void *rt0; } targets;
+        /* Complete NVN render-target set: every color target survives to the
+         * submit path, plus the depth target. */
+        struct {
+            uint32_t count;
+            void *tex[GFX_MAX_COLOR_TARGETS];
+            void *depth;
+        } targets;
         struct { uint32_t stage, kind, slot; uint64_t address; size_t size; uint64_t handle; } desc;
         struct { nvn_render_state_t rs; } state;
         struct { uint32_t primitive, first, count, instances, base_instance; } draw;
@@ -345,6 +354,45 @@ typedef struct {
     uint64_t serial;
 } tex_t;
 
+/* Live NVN texture objects.  The window path needs the guest texture's
+ * dimensions/format, but a guest-provided pointer must never be dereferenced
+ * unless nvnTextureInitialize produced it: the registry gives us a safe
+ * lookup (some callers pass small integers as placeholder textures). */
+static tex_t **g_tex_objs;
+static unsigned g_tex_obj_count, g_tex_obj_cap;
+static pthread_mutex_t g_tex_obj_lock = PTHREAD_MUTEX_INITIALIZER;
+static void nvn_tex_registry_add(tex_t *t) {
+    pthread_mutex_lock(&g_tex_obj_lock);
+    for (unsigned i = 0; i < g_tex_obj_count; i++) if (g_tex_objs[i] == t) { pthread_mutex_unlock(&g_tex_obj_lock); return; }
+    if (g_tex_obj_count == g_tex_obj_cap) {
+        unsigned cap = g_tex_obj_cap ? g_tex_obj_cap * 2 : 128;
+        tex_t **n = realloc(g_tex_objs, (size_t)cap * sizeof *n);
+        if (!n) { pthread_mutex_unlock(&g_tex_obj_lock); return; }
+        g_tex_objs = n;
+        g_tex_obj_cap = cap;
+    }
+    g_tex_objs[g_tex_obj_count++] = t;
+    pthread_mutex_unlock(&g_tex_obj_lock);
+}
+static void nvn_tex_registry_del(tex_t *t) {
+    pthread_mutex_lock(&g_tex_obj_lock);
+    for (unsigned i = 0; i < g_tex_obj_count; i++) {
+        if (g_tex_objs[i] != t) continue;
+        g_tex_objs[i] = g_tex_objs[--g_tex_obj_count];
+        break;
+    }
+    pthread_mutex_unlock(&g_tex_obj_lock);
+}
+static const tex_t *nvn_tex_registry_find(const void *p) {
+    const tex_t *found = NULL;
+    if (!p) return NULL;
+    pthread_mutex_lock(&g_tex_obj_lock);
+    for (unsigned i = 0; i < g_tex_obj_count; i++)
+        if (g_tex_objs[i] == p) { found = g_tex_objs[i]; break; }
+    pthread_mutex_unlock(&g_tex_obj_lock);
+    return found;
+}
+
 typedef struct {
     uint32_t magic, n;
     pool_t *pool;
@@ -390,7 +438,16 @@ typedef struct {
     uint64_t serial;
 } prog_t;
 
-typedef struct { uint32_t magic, fenced; uint64_t fence; } sync_t;
+typedef struct {
+    uint32_t magic, state;    /* 0 pending, 1 signaled (GPU completion seen) */
+    void *fence;              /* GfxFence* from the backend contract */
+    uint64_t fence_generation;
+    uint64_t submit_generation;
+    int32_t condition;        /* NVNsyncCondition recorded by QueueFenceSync */
+    uint32_t pad;
+} sync_t;
+static uint32_t nvnSyncInitialize(sync_t *s, const nvn_dev_t *d);
+static void nvnSyncFinalize(sync_t *s);
 typedef struct { pool_t *pool; int64_t off; } ev_builder_t;
 typedef struct { uint32_t magic, pad; volatile uint32_t *val; pool_t *pool; int64_t off; } ev_t;
 
@@ -613,7 +670,7 @@ static uint32_t nvnDeviceInitialize(nvn_dev_t *d, const dev_builder_t *b) { nvn_
     fprintf(stderr, "[totk-nvn] device initialized flags=%#x (CPU-only, no GPU submit)\n", d->flags);
     return 1;
 }
-static void nvnDeviceFinalize(nvn_dev_t *d) { if (d) d->magic = 0; }
+static void nvnDeviceFinalize(nvn_dev_t *d) { if (d) { nvn_host_rt_clear(); d->magic = 0; } }
 static void nvnDeviceSetDebugLabel(nvn_dev_t *d, const char *label) { (void)d; (void)label; }
 static void nvnDeviceGetInteger(const nvn_dev_t *d, int what, int *out) { nvn_api("nvnDeviceGetInteger");
     if (!d || !nvn_obj(d, NVN_MAGIC('D', 'E', 'V', 0), "nvnDeviceGetInteger") || !out) return;
@@ -733,6 +790,24 @@ static uint32_t nvnQueueInitialize(queue_t *q, const queue_builder_t *b) { nvn_a
 static void nvnQueueFinalize(queue_t *q) { if (q) q->magic = 0; }
 static void nvnQueueSetDebugLabel(queue_t *q, const char *l) { (void)q; (void)l; }
 static unsigned nvn_gpu_submits, nvn_gpu_presents;
+
+/* Explicit CPU/GPU ordering.  The backend submits and waits synchronously, so
+ * the moment a submit/present returns the GPU has finished; nvn_gpu_drain
+ * makes that a checked precondition instead of an accident, and every CPU
+ * reader (buffer/pool map, fence wait) goes through it. */
+static int nvn_gpu_pending_work;
+static int nvn_gpu_drain(const char *what) {
+    if (!nvn_gpu_pending_work) return 1;
+    if (!gfx_backend_vulkan_available()) { nvn_gpu_pending_work = 0; return 1; }
+    if (!gfx_backend_queue_idle()) {
+        char d[96];
+        snprintf(d, sizeof d, "%s: GPU work did not reach idle", what);
+        nvn_fail(what, d);
+        return 0;
+    }
+    nvn_gpu_pending_work = 0;
+    return 1;
+}
 static void nvnQueueSubmitCommands(queue_t *q, int n, const uint64_t *cmds) { nvn_api("nvnQueueSubmitCommands");
     if (!nvn_obj(q, NVN_MAGIC('Q', 'U', 'E', 'U'), "nvnQueueSubmitCommands")) return;
     if (!cmds && n) { nvn_fail("nvnQueueSubmitCommands", "null command handle array"); return; }
@@ -741,10 +816,13 @@ static void nvnQueueSubmitCommands(queue_t *q, int n, const uint64_t *cmds) { nv
     if (total <= 8 || getenv("TOTK_ANDROID_TRACE_NVN"))
         fprintf(stderr, "[totk-nvn] GPU submit #%u queue=%p commands=%d (CPU-only host)\n",
                 total, (void *)q, n);
+    nvn_gpu_pending_work = 1;
     nvn_process_submit_commands(cmds, n);
+    if (!nvn_gpu_drain("nvnQueueSubmitCommands"))
+        fprintf(stderr, "[totk-nvn] ERROR submit returned before GPU completion\n");
 }
 static void nvnQueueFlush(queue_t *q) { (void)q; }
-static void nvnQueueFinish(queue_t *q) { (void)q; }
+static void nvnQueueFinish(queue_t *q) { (void)q; (void)nvn_gpu_drain("nvnQueueFinish"); }
 static void nvnQueuePresentTexture(queue_t *q, win_t *w, int index) { nvn_api("nvnQueuePresentTexture");
     if (!nvn_obj(q, NVN_MAGIC('Q', 'U', 'E', 'U'), "nvnQueuePresentTexture")) return;
     if (!nvn_obj(w, NVN_MAGIC('W', 'I', 'N', 'D'), "nvnQueuePresentTexture(window)")) return;
@@ -754,6 +832,7 @@ static void nvnQueuePresentTexture(queue_t *q, win_t *w, int index) { nvn_api("n
     if (total <= 4)
         fprintf(stderr, "[totk-nvn] present #%u window=%p index=%d (host backend)\n",
                 total, (void *)w, index);
+    nvn_gpu_pending_work = 1;
     if (w->native && !runtime_native_window_present(w->native))
         nvn_fail("nvnQueuePresentTexture", "native window present failed");
 }
@@ -767,13 +846,22 @@ static void nvnQueueResetMemoryUsageCounts(queue_t *q) {
     if (q) q->cmd_used = q->comp_used = q->ctl_used = 0;
 }
 static int nvnQueueFenceSync(queue_t *q, sync_t *s, int condition, int flags);
-static int nvnQueueWaitSync(queue_t *q, const sync_t *s) {
-    (void)q; return s && s->magic == NVN_MAGIC('S', 'Y', 'N', 'C');
+static int nvnSyncWait(const sync_t *s, uint64_t timeout);
+static int nvnQueueWaitSync(queue_t *q, const sync_t *s) { nvn_api("nvnQueueWaitSync");
+    if (!nvn_obj(q, NVN_MAGIC('Q', 'U', 'E', 'U'), "nvnQueueWaitSync")) return 0;
+    if (!s || s->magic != NVN_MAGIC('S', 'Y', 'N', 'C')) {
+        nvn_fail("nvnQueueWaitSync", "invalid sync");
+        return 0;
+    }
+    int r = nvnSyncWait(s, ~0ull);
+    return r == NVN_SYNC_WAIT_CONDITION_SATISFIED || r == NVN_SYNC_WAIT_ALREADY_SIGNALED;
 }
 static int nvnQueueAcquireTexture(queue_t *q, win_t *w, int *index) {
     if (!nvn_obj(q, NVN_MAGIC('Q', 'U', 'E', 'U'), "nvnQueueAcquireTexture")) return 1;
     if (!nvn_obj(w, NVN_MAGIC('W', 'I', 'N', 'D'), "nvnQueueAcquireTexture(window)")) return 1;
     if (!index) { nvn_fail("nvnQueueAcquireTexture", "null index"); return 1; }
+    /* The texture is renderable only after the queued GPU work is done. */
+    if (!nvn_gpu_drain("nvnQueueAcquireTexture")) return 1;
     *index = w->ntex ? (w->next++ % w->ntex) : 0;
     return 0;
 }
@@ -843,6 +931,24 @@ static win_t *nvn_window_for_texture(const void *texture) {
     return NULL;
 }
 
+/* Guest window textures (nvnWindowBuilderSetTextures) are the authority for
+ * the window's host target size/format.  Only a builder without a usable NVN
+ * texture falls back to the VI-shaped 1920x1080 RGBA8 description. */
+static void nvn_window_guest_desc(const win_builder_t *b, uint32_t *width,
+                                  uint32_t *height, uint32_t *format) {
+    *width = *height = 0;
+    *format = 0;
+    if (!b) return;
+    for (int i = 0; i < b->ntex; i++) {
+        const tex_t *t = nvn_tex_registry_find(b->tex[i]);
+        if (!t || !t->d.width || !t->d.height) continue;
+        *width = t->d.width;
+        *height = t->d.height;
+        *format = (uint32_t)t->d.format;
+        return;
+    }
+}
+
 static uint32_t nvnWindowInitialize(win_t *w, const win_builder_t *b) { nvn_api("nvnWindowInitialize");
     if (!w || !b) { nvn_fail("nvnWindowInitialize", "null window/builder"); return 0; }
     if (b->ntex < 1 || b->ntex > 4) {
@@ -857,8 +963,18 @@ static uint32_t nvnWindowInitialize(win_t *w, const win_builder_t *b) { nvn_api(
      * window so the cached shader pipeline has a target instead of silently
      * dropping every draw. */
     if (!runtime_native_window_valid(w->native)) {
-        void *host = runtime_native_window_create(1920, 1080, 0x25, 0);
-        if (host) { w->native = host; w->owned_native = 1; }
+        uint32_t gw = 0, gh = 0, gf = 0;
+        nvn_window_guest_desc(b, &gw, &gh, &gf);
+        if (!gw || !gh) { gw = 1920; gh = 1080; }
+        if (!gf) gf = 0x25;   /* no guest texture: VI's default RGBA8 */
+        void *host = runtime_native_window_create(gw, gh, gf, 0);
+        if (host) {
+            w->native = host;
+            w->owned_native = 1;
+            if (nvn_trace())
+                fprintf(stderr, "[totk-nvn] WindowInitialize host target %ux%u format=%#x"
+                                " (guest texture driven)\n", gw, gh, gf);
+        }
     }
     w->ntex = b->ntex;
     w->interval = b->interval ? b->interval : 1;
@@ -884,8 +1000,18 @@ static int nvnWindowAcquireTexture(win_t *w, sync_t *s, int *index) { nvn_api("n
     if (!nvn_obj(w, NVN_MAGIC('W', 'I', 'N', 'D'), "nvnWindowAcquireTexture")) return 1;
     if (!index) { nvn_fail("nvnWindowAcquireTexture", "null index"); return 1; }
     *index = w->ntex ? (w->next++ % w->ntex) : 0;
-    if (s && nvn_obj(s, NVN_MAGIC('S', 'Y', 'N', 'C'), "nvnWindowAcquireTexture(sync)"))
-        s->fence++;
+    if (s && nvn_obj(s, NVN_MAGIC('S', 'Y', 'N', 'C'), "nvnWindowAcquireTexture(sync)")) {
+        /* The returned texture is usable only once earlier GPU work finished. */
+        if (!nvn_gpu_drain("nvnWindowAcquireTexture")) return 1;
+        if (!s->fence) s->fence = gfx_backend_fence_create();
+        if (s->fence) {
+            gfx_backend_fence_signal((GfxFence *)s->fence);
+            s->state = 1;
+            s->fence_generation++;
+        } else {
+            nvn_fail("nvnWindowAcquireTexture", "cannot create acquire fence");
+        }
+    }
     return 0;
 }
 static void *nvnWindowGetNativeWindow(const win_t *w) { nvn_api("nvnWindowGetNativeWindow");
@@ -1030,6 +1156,8 @@ static void *nvnMemoryPoolMap(const pool_t *p) { nvn_api("nvnMemoryPoolMap");
         nvn_fail("nvnMemoryPoolMap", "invalid pool object");
         return NULL;
     }
+    /* A CPU reader must observe every GPU write submitted before this call. */
+    if (!nvn_gpu_drain("nvnMemoryPoolMap")) return NULL;
     if (p->flags & NVN_POOL_CPU_NO_ACCESS) {
         /* NVN marks this pool CPU_NO_ACCESS for the guest, but the HLE keeps
          * all GPU resources in host memory and needs the mapping for shader,
@@ -1106,6 +1234,7 @@ static void *nvnBufferMap(const buf_t *b) { nvn_api("nvnBufferMap");
                     (long long)(b ? b->off : 0), (unsigned long long)(b ? b->size : 0));
         return NULL;
     }
+    if (!nvn_gpu_drain("nvnBufferMap")) return NULL;
     if (getenv("TOTK_ANDROID_TRACE_NVN"))
         fprintf(stderr, "[totk-nvn] BufferMap %p pool=%p mem=%p off=%lld size=%llu -> %p thread=%#x\n",
                 (const void *)b, (void *)b->pool, (void *)b->pool->mem,
@@ -1248,6 +1377,7 @@ static uint32_t nvnTextureInitialize(tex_t *t, const tex_builder_t *b) { nvn_api
         memcpy(t->mem, b->pkg_data, (size_t)size);
     }
     t->serial = (uint64_t)(uintptr_t)t;
+    nvn_tex_registry_add(t);
     return 1;
 }
 static int nvn_texture_store_bridge(tex_t *t, GfxTexture *g) {
@@ -1265,6 +1395,16 @@ static int nvn_texture_store_bridge(tex_t *t, GfxTexture *g) {
     gfx_backend_texture_destroy(g);
     return 0;
 }
+/* The guest is the source of truth: a CPU write/flush invalidates the host
+ * copy so the next bind re-uploads the updated storage. */
+static void nvn_texture_bridge_drop(const tex_t *t) {
+    for (unsigned i = 0; i < g_tex_bridge_count; i++) {
+        if (g_tex_bridges[i].tex != t) continue;
+        if (g_tex_bridges[i].gfx) gfx_backend_texture_destroy(g_tex_bridges[i].gfx);
+        g_tex_bridges[i] = g_tex_bridges[--g_tex_bridge_count];
+        return;
+    }
+}
 
 
 int runtime_nvn_texture_upload_rgba8(void *texture, const uint8_t *pixels,
@@ -1276,43 +1416,177 @@ int runtime_nvn_texture_upload_rgba8(void *texture, const uint8_t *pixels,
     return nvn_texture_store_bridge(t, g);
 }
 
-/* Guest storage -> linear -> Vulkan.  The level-0 layer-0 path is enough for the
- * 2B.3 texture milestone; nvn_deswizzle.c is the same Tegra GOB decoder used by
- * the macOS route.  Non-RGBA8 formats are explicit errors for now. */
+/* Guest storage -> linear -> Vulkan for every mip/layer of the shapes the
+ * first frame uses.  Guest storage stays the source of truth: the upload is
+ * lazy (first bind) and unsupported target/format combinations are explicit
+ * failures, never a silent RGBA8 substitute. */
 extern int runtime_guest_texture_deswizzle(const void *storage, void *linear, size_t pitch,
     int target, int format, int flags, int samples, uint32_t width, uint32_t height,
     uint32_t depth, uint32_t levels, uint32_t stride, int pkg_block_h);
 extern int runtime_guest_texture_swizzle(void *storage, const void *linear, size_t pitch,
     int target, int format, int flags, int samples, uint32_t width, uint32_t height,
     uint32_t depth, uint32_t levels, uint32_t stride, int pkg_block_h);
+extern int runtime_guest_texture_deswizzle_at(const void *storage, void *linear, size_t pitch,
+    int target, int format, int flags, int samples, uint32_t width, uint32_t height,
+    uint32_t depth, uint32_t levels, uint32_t stride, int pkg_block_h,
+    unsigned level, unsigned layer, unsigned z, unsigned z_count);
+extern int runtime_guest_texture_level_geom(int target, int format, int flags, int samples,
+    uint32_t width, uint32_t height, uint32_t depth, uint32_t levels, uint32_t stride,
+    int pkg_block_h, unsigned level, uint32_t *row_bytes, uint32_t *rows,
+    uint32_t *slices, uint32_t *bpb);
+
+static int nvn_texture_gfx_target(int target) {
+    switch (target) {
+    case NVN_TARGET_2D:
+    case NVN_TARGET_RECTANGLE: return GFX_TEXTURE_2D;
+    case NVN_TARGET_3D: return GFX_TEXTURE_3D;
+    case NVN_TARGET_CUBEMAP: return GFX_TEXTURE_CUBE;
+    case NVN_TARGET_2D_ARRAY: return GFX_TEXTURE_2D_ARRAY;
+    case NVN_TARGET_CUBEMAP_ARRAY: return GFX_TEXTURE_CUBE_ARRAY;
+    default: return -1;
+    }
+}
+
+static uint32_t nvn_texture_gfx_layers(const tex_desc *d) {
+    switch (d->target) {
+    case NVN_TARGET_2D:
+    case NVN_TARGET_RECTANGLE:
+    case NVN_TARGET_3D: return 1;
+    case NVN_TARGET_CUBEMAP: return 6;
+    case NVN_TARGET_2D_ARRAY:
+    case NVN_TARGET_CUBEMAP_ARRAY: return d->depth ? d->depth : 1;
+    default: return 0;
+    }
+}
 
 int runtime_nvn_texture_upload_guest(void *texture) {
     tex_t *t = texture;
-    if (!t || t->magic != NVN_MAGIC('T', 'E', 'X', 0) || !t->mem) return 0;
-    if (t->d.target != NVN_TARGET_2D || t->d.format != 0x25) {
-        fprintf(stderr, "[totk-nvn] ERROR guest texture upload supports 2D RGBA8 only (target=%d format=%#x)\n",
-                t->d.target, t->d.format);
+    if (!t || t->magic != NVN_MAGIC('T', 'E', 'X', 0)) return 0;
+    if (!t->mem) {
+        fprintf(stderr, "[totk-nvn] ERROR guest texture upload without storage (target=%d)\n",
+                t->d.target);
         return 0;
     }
-    if (!t->d.width || !t->d.height) return 0;
-    size_t pitch = (size_t)t->d.width * 4;
-    size_t bytes = pitch * t->d.height;
-    uint8_t *linear = calloc(1, bytes);
-    if (!linear) return 0;
-    if (runtime_guest_texture_deswizzle(t->mem, linear, pitch, t->d.target, t->d.format,
-                                        t->d.flags, t->d.samples, t->d.width, t->d.height,
-                                        t->d.depth, t->d.levels, t->d.stride,
-                                        t->d.pkg_block_h)) {
-        fprintf(stderr, "[totk-nvn] ERROR block-linear deswizzle failed\n");
-        free(linear);
+    int gtarget = nvn_texture_gfx_target(t->d.target);
+    if (gtarget < 0) {
+        static unsigned logged;
+        if (logged++ < 8)
+            fprintf(stderr, "[totk-nvn] ERROR guest texture target %d has no host equivalent\n",
+                    t->d.target);
         return 0;
     }
-    GfxTexture *g = gfx_backend_texture_create_rgba8(t->d.width, t->d.height, linear);
-    free(linear);
-    if (!g) {
-        fprintf(stderr, "[totk-nvn] ERROR texture upload create %ux%u\n", t->d.width, t->d.height);
+    if (t->d.samples > 1) {
+        static unsigned logged;
+        if (logged++ < 8)
+            fprintf(stderr, "[totk-nvn] ERROR guest texture target=%d samples=%d: MSAA upload unsupported\n",
+                    t->d.target, t->d.samples);
         return 0;
     }
+    int vkfmt = gfx_backend_vk_format_for_nvn((uint32_t)t->d.format);
+    if (!vkfmt) {
+        static unsigned logged;
+        if (logged++ < 8)
+            fprintf(stderr, "[totk-nvn] ERROR guest texture format %#x has no Vulkan mapping (target=%d)\n",
+                    t->d.format, t->d.target);
+        return 0;
+    }
+    uint32_t levels = t->d.levels ? t->d.levels : 1;
+    uint32_t layers = nvn_texture_gfx_layers(&t->d);
+    uint32_t w = t->d.width, h = t->d.height;
+    uint32_t depth = t->d.depth ? t->d.depth : 1;
+    if (!w || !h || !layers || levels > 16) {
+        fprintf(stderr, "[totk-nvn] ERROR guest texture shape %ux%ux%u levels=%u layers=%u\n",
+                w, h, depth, levels, layers);
+        return 0;
+    }
+    int is_3d = gtarget == GFX_TEXTURE_3D;
+
+    /* Count subresources first: one per (level, layer) for 2D/cube/array,
+     * one per (level, depth slice) for 3D. */
+    uint32_t total = 0;
+    for (uint32_t l = 0; l < levels; l++) {
+        uint32_t rb = 0, rows = 0, slices = 0, bpb = 0;
+        if (runtime_guest_texture_level_geom(t->d.target, t->d.format, t->d.flags,
+                                             t->d.samples, w, h, depth, levels,
+                                             t->d.stride, t->d.pkg_block_h,
+                                             l, &rb, &rows, &slices, &bpb) ||
+            !rb || !rows || !slices || !bpb) {
+            fprintf(stderr, "[totk-nvn] ERROR guest texture level %u geometry unsupported"
+                            " (target=%d format=%#x %ux%ux%u)\n",
+                    l, t->d.target, t->d.format, w, h, depth);
+            return 0;
+        }
+        total += is_3d ? slices : layers;
+    }
+    if (!total) return 0;
+
+    GfxTextureSubresource *subs = calloc(total, sizeof *subs);
+    uint8_t **blocks = calloc(total, sizeof *blocks);
+    if (!subs || !blocks) { free(subs); free(blocks); return 0; }
+
+    uint32_t nsub = 0;
+    int ok = 1;
+    for (uint32_t l = 0; l < levels && ok; l++) {
+        uint32_t rb = 0, rows = 0, slices = 0, bpb = 0;
+        if (runtime_guest_texture_level_geom(t->d.target, t->d.format, t->d.flags,
+                                             t->d.samples, w, h, depth, levels,
+                                             t->d.stride, t->d.pkg_block_h,
+                                             l, &rb, &rows, &slices, &bpb) ||
+            !rb || !rows || !slices || !bpb) {
+            ok = 0;
+            break;
+        }
+        size_t slice_bytes = (size_t)rb * rows;
+        uint32_t zcount = is_3d ? slices : 1;
+        uint32_t lcount = is_3d ? 1 : layers;
+        for (uint32_t layer = 0; layer < lcount && ok; layer++) {
+            for (uint32_t z = 0; z < zcount && ok; z++) {
+                uint8_t *buf = malloc(slice_bytes ? slice_bytes : 1);
+                if (!buf) { ok = 0; break; }
+                if (runtime_guest_texture_deswizzle_at(t->mem, buf, rb, t->d.target,
+                                                       t->d.format, t->d.flags, t->d.samples,
+                                                       w, h, depth, levels, t->d.stride,
+                                                       t->d.pkg_block_h, l, layer,
+                                                       is_3d ? z : 0, 1)) {
+                    fprintf(stderr, "[totk-nvn] ERROR deswizzle level=%u layer=%u z=%u"
+                                    " (target=%d format=%#x)\n",
+                            l, layer, z, t->d.target, t->d.format);
+                    free(buf);
+                    ok = 0;
+                    break;
+                }
+                blocks[nsub] = buf;
+                subs[nsub].level = l;
+                subs[nsub].layer = is_3d ? z : layer;
+                subs[nsub].data = buf;
+                subs[nsub].size = slice_bytes;
+                nsub++;
+            }
+        }
+    }
+
+    GfxTexture *g = NULL;
+    if (ok && nsub == total) {
+        GfxTextureDesc desc;
+        memset(&desc, 0, sizeof desc);
+        desc.target = (uint32_t)gtarget;
+        desc.vk_format = (uint32_t)vkfmt;
+        desc.width = w;
+        desc.height = h;
+        desc.depth = is_3d ? depth : 1;
+        desc.mip_levels = levels;
+        desc.array_layers = is_3d ? 1 : layers;
+        desc.samples = 1;
+        g = gfx_backend_texture_create_desc(&desc, subs, nsub);
+        if (!g)
+            fprintf(stderr, "[totk-nvn] ERROR texture create target=%d format=%#x %ux%ux%u"
+                            " levels=%u layers=%u\n",
+                    t->d.target, t->d.format, w, h, depth, levels, layers);
+    }
+    for (uint32_t i = 0; i < nsub; i++) free(blocks[i]);
+    free(blocks);
+    free(subs);
+    if (!g) return 0;
     int stored = nvn_texture_store_bridge(t, g);
     if (!stored) fprintf(stderr, "[totk-nvn] ERROR texture bridge full\n");
     return stored;
@@ -1359,6 +1633,7 @@ static GfxSampler *nvn_sampler_gfx(const samp_t *s) {
 
 static void nvnTextureFinalize(tex_t *t) {
     if (!t) return;
+    nvn_tex_registry_del(t);
     for (unsigned i = 0; i < g_tex_bridge_count; i++) {
         if (g_tex_bridges[i].tex == t) {
             if (g_tex_bridges[i].gfx) gfx_backend_texture_destroy(g_tex_bridges[i].gfx);
@@ -1446,10 +1721,12 @@ static void nvn_tex_copy(const tex_t *t, const void *view, const int *region,
 }
 static void nvnTextureWriteTexels(const tex_t *t, const void *v, const int *r, const void *src) { nvn_api("nvnTextureWriteTexels");
     nvn_tex_copy(t, v, r, NULL, src, 0, 0, 0);
+    nvn_texture_bridge_drop(t);
 }
 static void nvnTextureWriteTexelsStrided(const tex_t *t, const void *v, const int *r,
                                          const void *src, ptrdiff_t row, ptrdiff_t img) { nvn_api("nvnTextureWriteTexelsStrided");
     nvn_tex_copy(t, v, r, NULL, src, row, img, 0);
+    nvn_texture_bridge_drop(t);
 }
 static void nvnTextureReadTexels(const tex_t *t, const void *v, const int *r, void *dst) { nvn_api("nvnTextureReadTexels");
     nvn_tex_copy(t, v, r, dst, NULL, 0, 0, 1);
@@ -1747,6 +2024,184 @@ static cb_t **g_cbs;
 static unsigned g_ncbs, g_cbs_cap;
 static unsigned nvn_nvn_draws;
 
+/* --- Host render targets (MRT + depth) ------------------------------ */
+/* NVN binds a set of color targets plus depth; the host mirrors that with a
+ * GfxOffscreenTarget created for the complete layout.  Targets are cached by
+ * (size, layout) so a repeated frame reuses one image instead of churning
+ * Vulkan objects. */
+typedef struct {
+    uint32_t width, height;
+    GfxRenderTargetLayout layout;
+    GfxOffscreenTarget *gfx;
+} nvn_host_rt_t;
+static nvn_host_rt_t g_host_rts[16];
+static unsigned g_host_rt_count;
+static pthread_mutex_t g_host_rt_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t nvn_layout_sig(const GfxRenderTargetLayout *l) {
+    if (!l) return 0;
+    uint64_t h = 1469598103934665603ull;
+    uint64_t v = ((uint64_t)l->color_count << 32) | (uint32_t)l->depth_format;
+    h ^= v; h *= 1099511628211ull;
+    for (uint32_t i = 0; i < l->color_count && i < GFX_MAX_COLOR_TARGETS; i++) {
+        h ^= (uint64_t)(uint32_t)l->color_formats[i];
+        h *= 1099511628211ull;
+    }
+    return h ? h : 1;
+}
+static int nvn_layout_equal(const GfxRenderTargetLayout *a, const GfxRenderTargetLayout *b) {
+    if (!a || !b || a->color_count != b->color_count || a->depth_format != b->depth_format)
+        return 0;
+    for (uint32_t i = 0; i < a->color_count && i < GFX_MAX_COLOR_TARGETS; i++)
+        if (a->color_formats[i] != b->color_formats[i]) return 0;
+    return 1;
+}
+static int nvn_layout_valid(const GfxRenderTargetLayout *l) {
+    if (!l || l->color_count < 1 || l->color_count > GFX_MAX_COLOR_TARGETS) return 0;
+    for (uint32_t i = 0; i < l->color_count; i++)
+        if (!l->color_formats[i]) return 0;
+    return 1;
+}
+static GfxOffscreenTarget *nvn_host_rt_get(uint32_t width, uint32_t height,
+                                           const GfxRenderTargetLayout *layout) {
+    if (!width || !height || !nvn_layout_valid(layout)) return NULL;
+    pthread_mutex_lock(&g_host_rt_lock);
+    for (unsigned i = 0; i < g_host_rt_count; i++) {
+        if (g_host_rts[i].width != width || g_host_rts[i].height != height) continue;
+        if (!nvn_layout_equal(&g_host_rts[i].layout, layout)) continue;
+        GfxOffscreenTarget *gfx = g_host_rts[i].gfx;
+        pthread_mutex_unlock(&g_host_rt_lock);
+        return gfx;
+    }
+    if (g_host_rt_count >= sizeof g_host_rts / sizeof g_host_rts[0]) {
+        pthread_mutex_unlock(&g_host_rt_lock);
+        nvn_fail("nvnCommandBufferSetRenderTargets", "host render-target cache full");
+        return NULL;
+    }
+    GfxOffscreenTarget *gfx = gfx_backend_offscreen_create_layout(width, height, layout);
+    if (!gfx) {
+        pthread_mutex_unlock(&g_host_rt_lock);
+        return NULL;
+    }
+    g_host_rts[g_host_rt_count].width = width;
+    g_host_rts[g_host_rt_count].height = height;
+    g_host_rts[g_host_rt_count].layout = *layout;
+    g_host_rts[g_host_rt_count].gfx = gfx;
+    g_host_rt_count++;
+    if (g_host_rt_count <= 8 || nvn_trace())
+        fprintf(stderr, "[totk-nvn] host render target %ux%u colors=%u depth=%#x created\n",
+                width, height, layout->color_count, layout->depth_format);
+    pthread_mutex_unlock(&g_host_rt_lock);
+    return gfx;
+}
+static void nvn_host_rt_clear(void) {
+    pthread_mutex_lock(&g_host_rt_lock);
+    for (unsigned i = 0; i < g_host_rt_count; i++) {
+        if (g_host_rts[i].gfx) gfx_backend_offscreen_destroy(g_host_rts[i].gfx);
+        g_host_rts[i].gfx = NULL;
+    }
+    g_host_rt_count = 0;
+    pthread_mutex_unlock(&g_host_rt_lock);
+}
+
+/* Per-command-buffer resolved render-target state.  Kept out of cb_t so the
+ * guest's NVN_COMMAND_BUFFER_SIZE contract does not change. */
+typedef struct {
+    const cb_t *cb;
+    GfxRenderTargetLayout layout;
+    uint32_t width, height;
+    int valid;
+} nvn_cb_target_t;
+static nvn_cb_target_t g_cb_targets[64];
+static pthread_mutex_t g_cb_target_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static nvn_cb_target_t *nvn_cb_target(const cb_t *cb, int create) {
+    nvn_cb_target_t *free_slot = NULL;
+    if (!cb) return NULL;
+    pthread_mutex_lock(&g_cb_target_lock);
+    for (unsigned i = 0; i < sizeof g_cb_targets / sizeof g_cb_targets[0]; i++) {
+        if (g_cb_targets[i].cb == cb) { pthread_mutex_unlock(&g_cb_target_lock); return &g_cb_targets[i]; }
+        if (!free_slot && !g_cb_targets[i].cb) free_slot = &g_cb_targets[i];
+    }
+    if (create && free_slot) {
+        memset(free_slot, 0, sizeof *free_slot);
+        free_slot->cb = cb;
+        pthread_mutex_unlock(&g_cb_target_lock);
+        return free_slot;
+    }
+    pthread_mutex_unlock(&g_cb_target_lock);
+    return NULL;
+}
+static void nvn_cb_target_forget(const cb_t *cb) {
+    nvn_cb_target_t *slot = nvn_cb_target(cb, 0);
+    if (!slot) return;
+    pthread_mutex_lock(&g_cb_target_lock);
+    memset(slot, 0, sizeof *slot);
+    pthread_mutex_unlock(&g_cb_target_lock);
+}
+
+/* Resolve the NVN texture set to a host layout.  Every color target and the
+ * depth target contribute their guest dimensions/format; unsupported formats
+ * are explicit failures (the backend returns VK_FORMAT_UNDEFINED = 0). */
+static int nvn_rt_layout_from_targets(uint32_t n, void *const *tex, const void *depth,
+                                      GfxRenderTargetLayout *layout,
+                                      uint32_t *width, uint32_t *height,
+                                      const char **why) {
+    memset(layout, 0, sizeof *layout);
+    *width = *height = 0;
+    if (why) *why = NULL;
+    if (n < 1 || n > GFX_MAX_COLOR_TARGETS) {
+        if (why) *why = "color target count";
+        return 0;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        const tex_t *t = nvn_tex_registry_find(tex ? tex[i] : NULL);
+        if (!t) { if (why) *why = "color target is not an NVN texture"; return 0; }
+        int fmt = gfx_backend_vk_format_for_nvn((uint32_t)t->d.format);
+        if (!fmt) {
+            if (why) *why = "unsupported color target format";
+            return 0;
+        }
+        layout->color_formats[i] = fmt;
+        if (i == 0) { *width = t->d.width; *height = t->d.height; }
+        else if (t->d.width != *width || t->d.height != *height) {
+            static unsigned logged;
+            if (logged++ < 8)
+                fprintf(stderr, "[totk-nvn] WARNING color target %u is %ux%u, color0 is %ux%u\n",
+                        i, t->d.width, t->d.height, *width, *height);
+        }
+    }
+    layout->color_count = n;
+    if (depth) {
+        const tex_t *dt = nvn_tex_registry_find(depth);
+        if (!dt) { if (why) *why = "depth target is not an NVN texture"; return 0; }
+        int fmt = gfx_backend_vk_format_for_nvn((uint32_t)dt->d.format);
+        if (!fmt) { if (why) *why = "unsupported depth target format"; return 0; }
+        layout->depth_format = fmt;
+        if (!*width) { *width = dt->d.width; *height = dt->d.height; }
+    }
+    if (!*width || !*height) { if (why) *why = "render target has no dimensions"; return 0; }
+    return 1;
+}
+
+/* The window's host target layout comes from the guest window texture when the
+ * guest supplied one; only a bare window falls back to the VI description. */
+static void nvn_window_layout(const win_t *w, GfxRenderTargetLayout *layout,
+                              uint32_t *width, uint32_t *height) {
+    memset(layout, 0, sizeof *layout);
+    uint32_t ww = 0, wh = 0, wf = 0;
+    *width = *height = 0;
+    if (w && w->native && runtime_native_window_info(w->native, &ww, &wh, &wf, NULL, NULL)) {
+        *width = ww; *height = wh;
+    }
+    uint32_t fmt = gfx_backend_vk_format_for_nvn(wf ? wf : 0x25);
+    if (!fmt) fmt = gfx_backend_vk_format_for_nvn(0x25);
+    layout->color_count = 1;
+    layout->color_formats[0] = fmt;
+    layout->depth_format = 0;
+}
+
+
 static int nvn_cb_track(cb_t *c) {
     for (unsigned i = 0; i < g_ncbs; i++) if (g_cbs[i] == c) return 1;
     if (g_ncbs == g_cbs_cap) {
@@ -1828,6 +2283,7 @@ static uint32_t nvnCommandBufferInitialize(cb_t *c, void *d) { nvn_api("nvnComma
         break;
     }
     memset(c, 0, sizeof *c);
+    nvn_cb_target_forget(c);
     c->magic = NVN_MAGIC('C', 'M', 'D', 'B');
     c->dev = d;
     c->serial = ++nvn_cb_serial;
@@ -1842,6 +2298,7 @@ static uint32_t nvnCommandBufferInitialize(cb_t *c, void *d) { nvn_api("nvnComma
 static void nvnCommandBufferFinalize(cb_t *c) {
     if (!c) return;
     nvn_cb_untrack(c);
+    nvn_cb_target_forget(c);
     free(c->cmds);
     free(c->bind_state);
     c->cmds = NULL;
@@ -1885,6 +2342,7 @@ static void nvnCommandBufferBeginRecording(cb_t *c) {
     c->draw_first = 0;
     c->draw_count = 0;
     c->ncmds = 0;
+    nvn_cb_target_forget(c);
     /* A fresh recording starts with default (unbound) resource/vertex state;
      * keeping the previous recording's state would re-apply stale guest
      * pointers on the next submit.  Render state, however, starts from the NVN
@@ -2128,9 +2586,32 @@ static void nvnCommandBufferSetRenderTargets(cb_t *c, int n, const void *const *
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferSetRenderTargets", "invalid command buffer"); return; }
     nvn_bind_state_t *bs = nvn_cb_bind_state(c);
     if (bs) bs->depth_tex = depth;
-    if (n < 0 || n > 8 || (!t && n)) { nvn_fail("nvnCommandBufferSetRenderTargets", "invalid target count"); return; }
+    if (n < 0 || n > GFX_MAX_COLOR_TARGETS || (!t && n)) { nvn_fail("nvnCommandBufferSetRenderTargets", "invalid target count"); return; }
     nvn_cmd_t *cmd = nvn_cb_cmd(c, NVN_CMD_SET_RENDER_TARGETS);
-    if (cmd) { cmd->u.targets.count = n; cmd->u.targets.rt0 = n ? (void *)t[0] : NULL; }
+    if (cmd) {
+        cmd->u.targets.count = (uint32_t)n;
+        for (int i = 0; i < n; i++) cmd->u.targets.tex[i] = (void *)t[i];
+        cmd->u.targets.depth = (void *)depth;
+    }
+    /* Resolve the complete set now: every color target and the depth target
+     * keep their own guest format/dimensions for the layout and pipeline key. */
+    nvn_cb_target_t *cbt = nvn_cb_target(c, 1);
+    if (cbt) {
+        cbt->valid = 0;
+        cbt->width = cbt->height = 0;
+        memset(&cbt->layout, 0, sizeof cbt->layout);
+        if (n > 0) {
+            const char *why = NULL;
+            if (nvn_rt_layout_from_targets((uint32_t)n, (void *const *)t, depth,
+                                           &cbt->layout, &cbt->width, &cbt->height, &why)) {
+                cbt->valid = 1;
+            } else {
+                char d[128];
+                snprintf(d, sizeof d, "cannot resolve render targets: %s", why ? why : "unknown");
+                nvn_fail("nvnCommandBufferSetRenderTargets", d);
+            }
+        }
+    }
     /* NVN binds textures, not windows.  Resolve the window whose swapchain
      * texture is color target 0 so present/draw share one host target. */
     if (n > 0 && t && t[0]) {
@@ -2138,18 +2619,17 @@ static void nvnCommandBufferSetRenderTargets(cb_t *c, int n, const void *const *
         if (w) c->win = w;
     }
     if (nvn_trace() && n) {
-        const tex_t *t0 = t[0];
-        const tex_t *dt = depth;
-        if (t0)
-            fprintf(stderr, "[totk-nvn] SetRenderTargets count=%d color0=%p window=%p"
-                            " color0-target=%d format=%#x %ux%u samples=%u"
-                            " depth=%p depth-format=%#x %ux%u\n",
-                    n, t[0], (void *)c->win, t0->d.target, t0->d.format,
-                    t0->d.width, t0->d.height, t0->d.samples,
-                    depth, dt ? dt->d.format : 0, dt ? dt->d.width : 0, dt ? dt->d.height : 0);
-        else
-            fprintf(stderr, "[totk-nvn] SetRenderTargets count=%d color0=%p window=%p (not a tex_t)\n",
-                    n, t[0], (void *)c->win);
+        const tex_t *t0 = nvn_tex_registry_find(t[0]);
+        const tex_t *dt = nvn_tex_registry_find(depth);
+        fprintf(stderr, "[totk-nvn] SetRenderTargets count=%d window=%p", n, (void *)c->win);
+        for (int i = 0; i < n; i++) {
+            const tex_t *ti = nvn_tex_registry_find(t[i]);
+            fprintf(stderr, " color%d=%p(%s fmt=%#x %ux%u)", i, t[i], ti ? "tex" : "?",
+                    ti ? ti->d.format : 0, ti ? ti->d.width : 0, ti ? ti->d.height : 0);
+        }
+        fprintf(stderr, " depth=%p(tex=%d fmt=%#x %ux%u)\n", depth, dt != NULL,
+                dt ? dt->d.format : 0, dt ? dt->d.width : 0, dt ? dt->d.height : 0);
+        (void)t0;
     }
 }
 static void nvnCommandBufferClearColor(cb_t *c, int i, const float *v, int mask) {
@@ -2463,8 +2943,10 @@ typedef struct {
     char variant[192];
     uint64_t variant_sig;
     unsigned loaded;                 /* bit per stage with a loaded module */
-    GfxReflectedPipeline *pipeline;  /* lazy, keyed by (vs, ps, target format) */
+    GfxReflectedPipeline *pipeline;  /* lazy, keyed by (vs, ps, target layout) */
     int pipeline_format;
+    uint64_t layout_sig;             /* render-target layout in the cache key */
+    GfxRenderTargetLayout pipeline_layout;
     uint64_t vertex_sig;
 } prog_shader_state_t;
 
@@ -2494,6 +2976,7 @@ static void prog_stage_clear(prog_shader_state_t *s, unsigned stage) {
         gfx_backend_reflected_pipeline_destroy(s->pipeline);
         s->pipeline = NULL;
         s->pipeline_format = 0;
+        s->layout_sig = 0;
     }
 }
 
@@ -2850,6 +3333,7 @@ static void nvn_variant_suffix(prog_t *p, const cb_t *cb, char *out, size_t cap)
 }
 
 static GfxReflectedPipeline *nvn_program_cached_pipeline(prog_t *p, uint32_t nvn_format,
+                                                         const GfxRenderTargetLayout *layout,
                                                          const GfxVertexLayout *input,
                                                          uint64_t vertex_sig,
                                                          const char *variant) {
@@ -2859,19 +3343,21 @@ static GfxReflectedPipeline *nvn_program_cached_pipeline(prog_t *p, uint32_t nvn
         pthread_mutex_unlock(&g_prog_lock);
         return NULL;
     }
-    int fmt = gfx_backend_vk_format_for_nvn(nvn_format);
+    int fmt = (layout && layout->color_count) ? layout->color_formats[0] : 0;
+    if (!fmt) fmt = gfx_backend_vk_format_for_nvn(nvn_format);
     if (!fmt) {
         pthread_mutex_unlock(&g_prog_lock);
         return NULL;
     }
     uint64_t variant_sig = nvn_variant_sig(variant);
+    uint64_t layout_sig = nvn_layout_sig(layout);
     if (s->pipeline && s->pipeline_format == fmt && s->vertex_sig == vertex_sig &&
-        s->variant_sig == variant_sig) {
+        s->variant_sig == variant_sig && s->layout_sig == layout_sig) {
         GfxReflectedPipeline *ready = s->pipeline;
         pthread_mutex_unlock(&g_prog_lock);
         return ready;
     }
-    if (s->pipeline && s->variant_sig != variant_sig) {
+    if (s->pipeline && (s->variant_sig != variant_sig || s->layout_sig != layout_sig)) {
         gfx_backend_reflected_pipeline_destroy(s->pipeline);
         s->pipeline = NULL;
     }
@@ -2915,16 +3401,23 @@ static GfxReflectedPipeline *nvn_program_cached_pipeline(prog_t *p, uint32_t nvn
     unsigned created = __atomic_add_fetch(&g_pipelines_created, 1, __ATOMIC_RELAXED);
     if (created <= 32 || nvn_trace())
         fprintf(stderr, "[totk-nvn] program=%p create pipeline from cache #%u vs=%s(%u) ps=%s(%u)"
-                        " format=%#x attrs=%u streams=%u variant=%s\n",
+                        " format=%#x colors=%u depth=%#x attrs=%u streams=%u variant=%s\n",
                 (void *)p, created, s->key[0], nvs, s->key[1], nps, nvn_format,
+                layout ? layout->color_count : 0, layout ? layout->depth_format : 0,
                 input ? input->nattributes : 0, input ? input->nbindings : 0,
                 variant && *variant ? variant : "-");
-    s->pipeline = gfx_backend_reflected_pipeline_create_ex(
-        uspv[0], usize[0], uspv[1], usize[1], fmt, vss, nvs, pss, nps, input);
+    s->pipeline = layout
+        ? gfx_backend_reflected_pipeline_create_layout(uspv[0], usize[0], uspv[1], usize[1],
+                                                       layout, vss, nvs, pss, nps, input)
+        : gfx_backend_reflected_pipeline_create_ex(uspv[0], usize[0], uspv[1], usize[1],
+                                                   fmt, vss, nvs, pss, nps, input);
     if (s->pipeline) {
         s->pipeline_format = fmt;
         s->vertex_sig = vertex_sig;
         s->variant_sig = variant_sig;
+        s->layout_sig = layout_sig;
+        if (layout) s->pipeline_layout = *layout;
+        else memset(&s->pipeline_layout, 0, sizeof s->pipeline_layout);
     }
     GfxReflectedPipeline *ready = s->pipeline;
     pthread_mutex_unlock(&g_prog_lock);
@@ -3057,7 +3550,7 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp, cb_t *cb) 
             int tid = (int)(handle & 0xfffff);
             const tex_t *t = cb->tex_pool ? nvn_tex_pool_lookup(cb->tex_pool, tid) : NULL;
             if (!t) continue;
-            GfxTexture *g = nvn_texture_gfx(t);
+            GfxTexture *g = nvn_texture_gfx_ready(t);   /* lazy first-bind upload */
             if (g && !gfx_backend_reflected_bind_texture_slot(rp, (uint32_t)stage, (uint32_t)i, g) &&
                 nvn_trace())
                 fprintf(stderr, "[totk-nvn] texture stage=%d slot=%d handle=%#llx not in reflection\n",
@@ -3098,6 +3591,7 @@ static void nvn_state_to_gfx(const nvn_render_state_t *rs, GfxPipelineState *o) 
 }
 
 static uint32_t nvn_translate_commands(const cb_t *cb, GfxCmd *out, uint32_t max,
+                                       GfxOffscreenTarget *target,
                                        float clear[4], int *has_clear) {
     uint32_t n = 0;
     *has_clear = 0;
@@ -3110,7 +3604,17 @@ static uint32_t nvn_translate_commands(const cb_t *cb, GfxCmd *out, uint32_t max
         const nvn_cmd_t *c = &cb->cmds[i];
         switch (c->kind) {
         case NVN_CMD_CLEAR_COLOR:
-            if (c->u.clear.index != 0) break;   /* only the bound window target */
+            if (c->u.clear.index != 0) {
+                /* GfxCmd has one clear colour for the pass: the contract has no
+                 * per-attachment index, so every attachment is cleared with
+                 * attachment 0's value.  Different per-target colours need an
+                 * additive contract field (reported to the lead). */
+                static unsigned logged;
+                if (logged++ < 8)
+                    fprintf(stderr, "[totk-nvn] ClearColor target=%d folded into the pass clear"
+                                    " (GfxCmd.clear has no attachment index)\n", c->u.clear.index);
+                break;
+            }
             memcpy(clear, c->u.clear.rgba, 4 * sizeof(float));
             *has_clear = 1;
             out[n].kind = GFX_CMD_CLEAR_COLOR;
@@ -3193,11 +3697,67 @@ static uint32_t nvn_translate_commands(const cb_t *cb, GfxCmd *out, uint32_t max
             n++;
             break;
         case NVN_CMD_SET_RENDER_TARGETS:
+            /* The host target is already the execute argument; emit the
+             * explicit command when this pass has its own MRT image so the
+             * backend binds exactly the resolved layout. */
+            if (target) {
+                out[n].kind = GFX_CMD_SET_RENDER_TARGETS;
+                out[n].u.set_targets.target = target;
+                n++;
+            }
+            break;
         default:
             break;
         }
     }
     return n;
+}
+
+/* True when the command buffer's target set is exactly the window's single
+ * color target: draws and present then share the swapchain image instead of a
+ * separate MRT image. */
+static int nvn_layout_matches_window(const win_t *w, const GfxRenderTargetLayout *layout,
+                                     uint32_t width, uint32_t height) {
+    if (!layout || layout->color_count != 1 || layout->depth_format) return 0;
+    GfxRenderTargetLayout wl;
+    uint32_t ww = 0, wh = 0;
+    nvn_window_layout(w, &wl, &ww, &wh);
+    return ww == width && wh == height && wl.color_formats[0] == layout->color_formats[0];
+}
+
+/* Copy color attachment 0 of a host MRT image into the window's CPU mirror so
+ * the existing NativeWindow readback/present path keeps observing the frame. */
+static int nvn_window_mirror_target(win_t *w, GfxOffscreenTarget *target) {
+    uint32_t ww = 0, wh = 0;
+    void *buf = NULL;
+    size_t bsz = 0;
+    if (!w || !target || !runtime_native_window_info(w->native, &ww, &wh, NULL, &buf, NULL) ||
+        !buf || !runtime_native_window_info(w->native, NULL, NULL, NULL, NULL, &bsz))
+        return 0;
+    uint32_t tw = gfx_backend_offscreen_width(target);
+    uint32_t th = gfx_backend_offscreen_height(target);
+    if (!tw || !th) return 0;
+    if (tw != ww || th != wh) {
+        static unsigned logged;
+        if (logged++ < 4)
+            fprintf(stderr, "[totk-nvn] WARNING MRT target %ux%u cannot mirror %ux%u window\n",
+                    tw, th, ww, wh);
+        return 0;
+    }
+    size_t need = (size_t)ww * wh * 4;
+    if (need > bsz) return 0;
+    size_t src_size = 0;
+    const uint8_t *src = gfx_backend_offscreen_pixels(target, &src_size);
+    if (src && src_size >= need) {
+        memcpy(buf, src, need);
+        return 1;
+    }
+    uint8_t *dst = buf;
+    for (uint32_t y = 0; y < wh; y++)
+        for (uint32_t x = 0; x < ww; x++)
+            if (!gfx_backend_offscreen_read_pixel_index(target, 0, x, y, dst + ((size_t)y * ww + x) * 4))
+                return 0;
+    return 1;
 }
 
 static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
@@ -3218,6 +3778,34 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             continue;
         }
 
+        /* Resolve the pass target layout.  nvnCommandBufferSetRenderTargets
+         * records it; a command buffer that only set a window uses that
+         * window's single-target layout. */
+        GfxRenderTargetLayout layout;
+        uint32_t rw = 0, rh = 0;
+        int have_layout = 0;
+        nvn_cb_target_t *cbt = nvn_cb_target(cb, 0);
+        if (cbt && cbt->valid) {
+            layout = cbt->layout;
+            rw = cbt->width;
+            rh = cbt->height;
+            have_layout = 1;
+        } else {
+            nvn_window_layout(w, &layout, &rw, &rh);
+            have_layout = layout.color_count > 0 && rw && rh;
+        }
+        int window_pass = have_layout &&
+                          nvn_layout_matches_window(w, &layout, rw, rh);
+        if (!have_layout) window_pass = 1;   /* no layout info: keep the window path */
+        GfxOffscreenTarget *rt = NULL;
+        if (have_layout && !window_pass) {
+            rt = nvn_host_rt_get(rw, rh, &layout);
+            if (!rt) {
+                nvn_fail("nvnQueueSubmitCommands", "cannot create host render-target layout");
+                continue;
+            }
+        }
+
         GfxVertexLayout input;
         uint64_t vertex_sig = 0;
         nvn_build_vertex_layout(cb, &input, &vertex_sig);
@@ -3227,6 +3815,7 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             char variant[192];
             nvn_variant_suffix(p, cb, variant, sizeof variant);
             reflected = nvn_program_cached_pipeline(p, nvn_window_format(w),
+                                                    have_layout ? &layout : NULL,
                                                     input.nattributes ? &input : NULL,
                                                     vertex_sig, variant);
         }
@@ -3241,15 +3830,23 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             }
             float clear[4] = { 0.05f, 0.08f, 0.12f, 1.0f };
             int has_clear = 0;
-            uint32_t count = nvn_translate_commands(cb, translated, cap, clear, &has_clear);
+            uint32_t count = nvn_translate_commands(cb, translated, cap,
+                                                    window_pass ? NULL : rt,
+                                                    clear, &has_clear);
             nvn_apply_bind_state(p, reflected, cb);
             GfxVertexStream streams[16];
             uint32_t nstreams = nvn_build_vertex_streams(cb, streams, 16);
-            drew = runtime_native_window_execute_reflected_ex(w->native, reflected,
-                                                              translated, count,
-                                                              has_clear ? clear : NULL,
-                                                              streams, nstreams);
+            if (window_pass)
+                drew = runtime_native_window_execute_reflected_ex(w->native, reflected,
+                                                                  translated, count,
+                                                                  has_clear ? clear : NULL,
+                                                                  streams, nstreams);
+            else
+                drew = gfx_backend_reflected_execute_ex(reflected, rt, translated, count,
+                                                        has_clear ? clear : NULL,
+                                                        streams, nstreams);
             free(translated);
+            if (drew && !window_pass) nvn_window_mirror_target(w, rt);
         } else if (has_program && p->textured && p->gfx_textured_pipeline && p->gfx_texture) {
             drew = runtime_native_window_draw_textured_triangle(w->native, p->gfx_textured_pipeline,
                                                                 p->gfx_texture);
@@ -3262,8 +3859,12 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             float clear[4] = { 0.05f, 0.08f, 0.12f, 1.0f };
             int has_clear = 0;
             GfxCmd ignored[1];
-            (void)nvn_translate_commands(cb, ignored, 1, clear, &has_clear);
-            drew = runtime_native_window_clear_rgba(w->native, clear);
+            (void)nvn_translate_commands(cb, ignored, 1, NULL, clear, &has_clear);
+            if (!window_pass && rt)
+                drew = gfx_backend_offscreen_clear(rt, clear[0], clear[1], clear[2], clear[3]);
+            else
+                drew = runtime_native_window_clear_rgba(w->native, clear);
+            if (drew && !window_pass) nvn_window_mirror_target(w, rt);
             static unsigned fallback_logged;
             if (fallback_logged++ < 8)
                 fprintf(stderr, "[totk-nvn] no cached pipeline for program=%p: clear-only frame\n",
@@ -3275,9 +3876,10 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
         }
         unsigned total = __atomic_add_fetch(&nvn_nvn_draws, 1, __ATOMIC_RELAXED);
         if (total <= 32 || nvn_trace())
-            fprintf(stderr, "[totk-nvn] NVN draw #%u program=%p window=%p vertices=%d%s\n",
+            fprintf(stderr, "[totk-nvn] NVN draw #%u program=%p window=%p vertices=%d%s%s\n",
                     total, (void *)p, (void *)w, cb->draw_count,
-                    reflected ? " reflected" : " fallback");
+                    reflected ? " reflected" : " fallback",
+                    window_pass ? "" : " mrt");
     }
 }
 
@@ -4439,28 +5041,354 @@ int runtime_nvn_texture_bind_selftest(const char *screenshot, int frames) {
     return visible;
 }
 
+static int nvn_probe_px_near(const uint8_t a[4], const float c[4], int tol) {
+    for (int i = 0; i < 4; i++) {
+        int want = (int)(c[i] * 255.0f + 0.5f);
+        if (a[i] < want - tol || a[i] > want + tol) return 0;
+    }
+    return 1;
+}
+
+/* probe-nvn-mrt: two color attachments plus depth.  Clear, draw, then read
+ * both attachments back through the layout-aware readback API.  Also checks
+ * that the same program produces distinct pipelines for a 1-target and a
+ * 2-target layout (the MRT layout is part of the pipeline key). */
+int runtime_nvn_mrt_selftest(const char *screenshot, int frames) {
+    if (frames < 1) frames = 1;
+    if (frames > 16) frames = 16;
+    int color_fmt = gfx_backend_vk_format_for_nvn(0x25);   /* RGBA8 */
+    int depth_fmt = gfx_backend_vk_format_for_nvn(0x35);   /* D24S8 */
+    if (!color_fmt || !depth_fmt) {
+        fprintf(stderr, "[totk-nvn] mrt probe: format mapping unavailable\n");
+        return 0;
+    }
+    GfxRenderTargetLayout mrt;
+    memset(&mrt, 0, sizeof mrt);
+    mrt.color_count = 2;
+    mrt.color_formats[0] = color_fmt;
+    mrt.color_formats[1] = color_fmt;
+    mrt.depth_format = depth_fmt;
+    GfxRenderTargetLayout single;
+    memset(&single, 0, sizeof single);
+    single.color_count = 1;
+    single.color_formats[0] = color_fmt;
+
+    GfxOffscreenTarget *target = gfx_backend_offscreen_create_layout(320, 240, &mrt);
+    if (!target) {
+        fprintf(stderr, "[totk-nvn] mrt probe: offscreen layout creation failed\n");
+        return 0;
+    }
+    int ok = gfx_backend_offscreen_color_count(target) == 2;
+    const GfxRenderTargetLayout *got = gfx_backend_offscreen_layout(target);
+    ok &= got && got->color_count == 2 && got->depth_format == depth_fmt &&
+          got->color_formats[1] == color_fmt;
+
+    const uint8_t *vs = NULL, *ps = NULL;
+    size_t vs_size = 0, ps_size = 0;
+    gfx_backend_builtin_triangle_modules(&vs, &vs_size, &ps, &ps_size);
+    if (!vs || !ps) { gfx_backend_offscreen_destroy(target); return 0; }
+    GfxReflectedPipeline *mrt_pipe =
+        gfx_backend_reflected_pipeline_create_layout(vs, vs_size, ps, ps_size, &mrt,
+                                                     NULL, 0, NULL, 0, NULL);
+    GfxReflectedPipeline *single_pipe =
+        gfx_backend_reflected_pipeline_create_layout(vs, vs_size, ps, ps_size, &single,
+                                                     NULL, 0, NULL, 0, NULL);
+    if (!mrt_pipe || !single_pipe) {
+        fprintf(stderr, "[totk-nvn] mrt probe: pipeline creation failed (mrt=%p single=%p)\n",
+                (void *)mrt_pipe, (void *)single_pipe);
+        ok = 0;
+    } else {
+        int distinct = mrt_pipe != single_pipe;
+        fprintf(stderr, "[totk-nvn] mrt probe pipelines mrt=%p single=%p distinct=%d\n",
+                (void *)mrt_pipe, (void *)single_pipe, distinct);
+        ok &= distinct;
+    }
+    if (ok && mrt_pipe) {
+        const float clear[4] = { 0.10f, 0.20f, 0.40f, 1.0f };
+        for (int f = 0; f < frames; f++) {
+            GfxCmd cmds[8];
+            memset(cmds, 0, sizeof cmds);
+            uint32_t nc = 0;
+            cmds[nc].kind = GFX_CMD_CLEAR_COLOR;
+            memcpy(cmds[nc].u.clear.rgba, clear, sizeof clear);
+            cmds[nc].u.clear.mask = 0xf;
+            nc++;
+            cmds[nc].kind = GFX_CMD_CLEAR_DEPTH_STENCIL;
+            cmds[nc].u.clear_depth.depth = 1.0f;
+            cmds[nc].u.clear_depth.dmask = 1;
+            cmds[nc].u.clear_depth.stencil = 0;
+            cmds[nc].u.clear_depth.smask = 0xff;
+            nc++;
+            cmds[nc].kind = GFX_CMD_SET_RENDER_TARGETS;
+            cmds[nc].u.set_targets.target = target;
+            nc++;
+            cmds[nc].kind = GFX_CMD_SET_VIEWPORT;
+            cmds[nc].u.rect.x = 0; cmds[nc].u.rect.y = 0;
+            cmds[nc].u.rect.width = 320; cmds[nc].u.rect.height = 240;
+            nc++;
+            cmds[nc].kind = GFX_CMD_SET_SCISSOR;
+            cmds[nc].u.rect.x = 0; cmds[nc].u.rect.y = 0;
+            cmds[nc].u.rect.width = 320; cmds[nc].u.rect.height = 240;
+            nc++;
+            cmds[nc].kind = GFX_CMD_DRAW;
+            cmds[nc].u.draw.primitive = NVN_DRAW_TRIANGLES;
+            cmds[nc].u.draw.first = 0;
+            cmds[nc].u.draw.count = 3;
+            cmds[nc].u.draw.has_state = 0;
+            nc++;
+            if (!gfx_backend_reflected_execute_ex(mrt_pipe, target, cmds, nc, clear, NULL, 0)) {
+                fprintf(stderr, "[totk-nvn] mrt probe: execute failed\n");
+                ok = 0;
+                break;
+            }
+        }
+    }
+
+    uint8_t c0[4] = {0}, c1[4] = {0}, k0[4] = {0}, k1[4] = {0};
+    if (ok) {
+        ok &= gfx_backend_offscreen_read_pixel_index(target, 0, 160, 120, c0) != 0;
+        ok &= gfx_backend_offscreen_read_pixel_index(target, 1, 160, 120, c1) != 0;
+        ok &= gfx_backend_offscreen_read_pixel_index(target, 0, 4, 4, k0) != 0;
+        ok &= gfx_backend_offscreen_read_pixel_index(target, 1, 4, 4, k1) != 0;
+    }
+    /* Attachment 0 carries the triangle (bright red-ish); attachment 1 was only
+     * cleared, so it must hold the pass clear colour. */
+    int drawn = c0[0] > 180 && c0[1] < 120 && c0[2] < 120;
+    int cleared1 = nvn_probe_px_near(c1, (const float[4]){ 0.10f, 0.20f, 0.40f, 1.0f }, 6);
+    int cleared1_corner = nvn_probe_px_near(k1, (const float[4]){ 0.10f, 0.20f, 0.40f, 1.0f }, 6);
+    ok &= drawn && cleared1 && cleared1_corner;
+    fprintf(stderr, "[totk-nvn] mrt probe color0=%02x%02x%02x%02x color1=%02x%02x%02x%02x"
+                    " corner1=%02x%02x%02x%02x drawn=%d cleared1=%d\n",
+            c0[0], c0[1], c0[2], c0[3], c1[0], c1[1], c1[2], c1[3],
+            k1[0], k1[1], k1[2], k1[3], drawn, cleared1);
+
+    if (screenshot && *screenshot) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof path, "%s.c0.ppm", screenshot);
+        if (!gfx_backend_offscreen_write_ppm_index(target, 0, path)) ok = 0;
+        snprintf(path, sizeof path, "%s.c1.ppm", screenshot);
+        if (!gfx_backend_offscreen_write_ppm_index(target, 1, path)) ok = 0;
+    }
+    if (mrt_pipe) gfx_backend_reflected_pipeline_destroy(mrt_pipe);
+    if (single_pipe) gfx_backend_reflected_pipeline_destroy(single_pipe);
+    gfx_backend_offscreen_destroy(target);
+    fprintf(stderr, "[totk-nvn] mrt selftest %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+/* probe-nvn-fence: submit -> fence -> map/read ordering.  A fence may only be
+ * signaled after the queue reports completion, and a mapped buffer must see
+ * the storage only after that completion. */
+int runtime_nvn_fence_selftest(void) {
+    void *nw = runtime_native_window_create(320, 240, 0x25, 0xE1);
+    if (!nw) return 0;
+    nvn_dev_t d;
+    dev_builder_t db;
+    queue_t q;
+    queue_builder_t qb;
+    memset(&d, 0, sizeof d);
+    memset(&db, 0, sizeof db);
+    memset(&q, 0, sizeof q);
+    memset(&qb, 0, sizeof qb);
+    int ok = nvnDeviceInitialize(&d, &db) != 0;
+    qb.dev = &d; qb.flags = 1; qb.cmd_sz = 0x10000; qb.ctl_sz = 0x1000; qb.mem_sz = 0x2000;
+    ok &= nvnQueueInitialize(&q, &qb) != 0;
+
+    uint8_t *pool_mem = calloc(1, 0x10000);
+    pool_t pool;
+    pool_builder_t pb;
+    buf_t buf;
+    buf_builder_t bb;
+    memset(&pool, 0, sizeof pool);
+    memset(&pb, 0, sizeof pb);
+    memset(&buf, 0, sizeof buf);
+    memset(&bb, 0, sizeof bb);
+    if (pool_mem) {
+        pb.dev = &d; pb.mem = pool_mem; pb.size = 0x10000; pb.flags = 1;
+        ok &= nvnMemoryPoolInitialize(&pool, &pb) != 0;
+        bb.dev = &d; bb.pool = &pool; bb.off = 0; bb.size = 0x100;
+        ok &= nvnBufferInitialize(&buf, &bb) != 0;
+    } else {
+        ok = 0;
+    }
+    /* CPU writes before the submit are the data the post-map reader checks. */
+    static const uint8_t pattern[8] = { 0xde, 0xad, 0xbe, 0xef, 0x01, 0x23, 0x45, 0x67 };
+    if (ok) {
+        uint8_t *m = nvnBufferMap(&buf);
+        if (!m) ok = 0; else memcpy(m, pattern, sizeof pattern);
+    }
+
+    win_t w;
+    win_builder_t wb;
+    memset(&w, 0, sizeof w);
+    memset(&wb, 0, sizeof wb);
+    wb.dev = &d; wb.native = nw; wb.ntex = 1; wb.tex[0] = (void *)(uintptr_t)1;
+    if (ok) ok = nvnWindowInitialize(&w, &wb) != 0;
+    cb_t cb;
+    memset(&cb, 0, sizeof cb);
+    if (ok) ok = nvnCommandBufferInitialize(&cb, &d) != 0;
+
+    sync_t fence_sync;
+    memset(&fence_sync, 0, sizeof fence_sync);
+    if (ok) ok = nvnSyncInitialize(&fence_sync, &d) != 0;
+
+    /* Submit a real frame (clear through the host target). */
+    if (ok) {
+        cb.win = &w;
+        nvnCommandBufferBeginRecording(&cb);
+        const float clear[4] = { 0.15f, 0.35f, 0.55f, 1.0f };
+        nvnCommandBufferClearColor(&cb, 0, clear, 0xf);
+        uint64_t h = nvnCommandBufferEndRecording(&cb);
+        nvnQueueSubmitCommands(&q, 1, &h);
+        nvnQueuePresentTexture(&q, &w, 0);
+    }
+
+    int fence_ok = 0, wait_ok = 0, queue_wait_ok = 0;
+    if (ok) {
+        fence_ok = nvnQueueFenceSync(&q, &fence_sync, 0 /* NVN_SYNC_CONDITION_ALL_GPU_WORK */, 0) != 0;
+        int r = nvnSyncWait(&fence_sync, 1000000000ull);
+        wait_ok = r == NVN_SYNC_WAIT_CONDITION_SATISFIED || r == NVN_SYNC_WAIT_ALREADY_SIGNALED;
+        if (r == NVN_SYNC_WAIT_TIMEOUT_EXPIRED)
+            fprintf(stderr, "[totk-nvn] fence probe: SyncWait timed out\n");
+        queue_wait_ok = nvnQueueWaitSync(&q, &fence_sync) != 0;
+    }
+
+    int map_ok = 0, pattern_ok = 0;
+    if (ok) {
+        uint8_t *m = nvnBufferMap(&buf);
+        map_ok = m != NULL;
+        if (m) pattern_ok = memcmp(m, pattern, sizeof pattern) == 0;
+        uint8_t *pm = nvnMemoryPoolMap(&pool);
+        map_ok = map_ok && pm != NULL && pm == (uint8_t *)m;
+    }
+
+    int acquire_ok = 0, acquire_sync_ok = 0;
+    int index = -1;
+    if (ok) {
+        acquire_ok = nvnQueueAcquireTexture(&q, &w, &index) == 0 && index >= 0 && index < w.ntex;
+        sync_t acq;
+        memset(&acq, 0, sizeof acq);
+        if (nvnSyncInitialize(&acq, &d)) {
+            if (nvnWindowAcquireTexture(&w, &acq, &index) == 0) {
+                int r = nvnSyncWait(&acq, 1000000000ull);
+                acquire_sync_ok = r == NVN_SYNC_WAIT_CONDITION_SATISFIED ||
+                                  r == NVN_SYNC_WAIT_ALREADY_SIGNALED;
+            }
+            nvnSyncFinalize(&acq);
+        }
+    }
+    uint8_t px[4] = {0};
+    if (ok) runtime_native_window_read_pixel(nw, 160, 120, px);
+
+    /* A guest window texture (nvnWindowBuilderSetTextures) must drive the host
+     * target size/format instead of the 1920x1080 RGBA8 fallback. */
+    int window_layout_ok = 0;
+    if (ok) {
+        tex_builder_t tb;
+        tex_t wtex;
+        memset(&wtex, 0, sizeof wtex);
+        nvnTextureBuilderSetDefaults(&tb);
+        tb.dev = &d;
+        nvnTextureBuilderSetSize2D(&tb, 64, 64);
+        nvnTextureBuilderSetFormat(&tb, 0x25);
+        nvnTextureBuilderSetLevels(&tb, 1);
+        nvnTextureBuilderSetStorage(&tb, &pool, 0x100);
+        win_t gw;
+        win_builder_t wb2;
+        memset(&gw, 0, sizeof gw);
+        memset(&wb2, 0, sizeof wb2);
+        wb2.dev = &d;
+        wb2.native = NULL;              /* force the host to create the target */
+        wb2.ntex = 1;
+        wb2.tex[0] = &wtex;
+        if (nvnTextureInitialize(&wtex, &tb) && nvnWindowInitialize(&gw, &wb2)) {
+            uint32_t gwid = 0, ghei = 0, gfmt = 0;
+            if (runtime_native_window_info(nvnWindowGetNativeWindow(&gw),
+                                           &gwid, &ghei, &gfmt, NULL, NULL))
+                window_layout_ok = gwid == 64 && ghei == 64 && gfmt == 0x25;
+            nvnWindowFinalize(&gw);
+        }
+        nvnTextureFinalize(&wtex);
+    }
+
+    ok = ok && fence_ok && wait_ok && queue_wait_ok && map_ok && pattern_ok &&
+         acquire_ok && acquire_sync_ok && window_layout_ok;
+    fprintf(stderr, "[totk-nvn] fence probe submit=%llu fence=%d wait=%d queue-wait=%d"
+                    " map=%d pattern=%d acquire=%d acquire-sync=%d win-layout=%d"
+                    " center=%02x%02x%02x%02x ok=%d\n",
+            (unsigned long long)q.submits, fence_ok, wait_ok, queue_wait_ok, map_ok,
+            pattern_ok, acquire_ok, acquire_sync_ok, window_layout_ok,
+            px[0], px[1], px[2], px[3], ok);
+
+    nvnSyncFinalize(&fence_sync);
+    nvnCommandBufferFinalize(&cb);
+    nvnWindowFinalize(&w);
+    nvnMemoryPoolFinalize(&pool);
+    free(pool_mem);
+    runtime_native_window_destroy(nw);
+    return ok;
+}
+
 static uint32_t nvnSyncInitialize(sync_t *s, const nvn_dev_t *d) { nvn_api("nvnSyncInitialize");
     if (!s || !nvn_obj(d, NVN_MAGIC('D', 'E', 'V', 0), "nvnSyncInitialize(device)")) return 0;
     memset(s, 0, sizeof *s);
     s->magic = NVN_MAGIC('S', 'Y', 'N', 'C');
-    s->fenced = 0;
-    s->fence = 0;
     return 1;
 }
-static void nvnSyncFinalize(sync_t *s) { if (s) s->magic = 0; }
+static void nvnSyncFinalize(sync_t *s) {
+    if (!s) return;
+    if (s->fence) gfx_backend_fence_destroy((GfxFence *)s->fence);
+    s->fence = NULL;
+    s->magic = 0;
+}
 static void nvnSyncSetDebugLabel(sync_t *s, const char *l) { (void)s; (void)l; }
+
+/* Signal only after the queue reports completion: a fence is never reported
+ * signaled ahead of the GPU work submitted before it. */
+static int nvn_sync_complete(sync_t *s, const char *what) {
+    if (!s || !s->fence) return 0;
+    if (s->state) return 1;
+    if (!nvn_gpu_drain(what)) return 0;
+    gfx_backend_fence_signal((GfxFence *)s->fence);
+    s->state = 1;
+    if (nvn_trace())
+        fprintf(stderr, "[totk-nvn] %s signaled after GPU completion (sync=%p)\n", what, (void *)s);
+    return 1;
+}
+
 static int nvnQueueFenceSync(queue_t *q, sync_t *s, int condition, int flags) { nvn_api("nvnQueueFenceSync");
-    (void)condition; (void)flags;
+    (void)flags;
     if (!nvn_obj(q, NVN_MAGIC('Q', 'U', 'E', 'U'), "nvnQueueFenceSync(queue)")) return 0;
     if (!nvn_obj(s, NVN_MAGIC('S', 'Y', 'N', 'C'), "nvnQueueFenceSync(sync)")) return 0;
-    s->fenced = 1;
-    s->fence++;
-    return 1;
+    if (s->fence) {
+        gfx_backend_fence_destroy((GfxFence *)s->fence);
+        s->fence = NULL;
+    }
+    s->state = 0;
+    s->condition = condition;
+    s->submit_generation = nvn_gpu_submits;
+    s->fence = gfx_backend_fence_create();
+    if (!s->fence) {
+        nvn_fail("nvnQueueFenceSync", "backend fence creation failed");
+        return 0;
+    }
+    s->fence_generation++;
+    return nvn_sync_complete(s, "nvnQueueFenceSync");
 }
 static int nvnSyncWait(const sync_t *s, uint64_t timeout) {
-    (void)timeout;
-    if (!nvn_obj(s, NVN_MAGIC('S', 'Y', 'N', 'C'), "nvnSyncWait")) return NVN_SYNC_WAIT_FAILED;
-    return s->fenced ? NVN_SYNC_WAIT_CONDITION_SATISFIED : NVN_SYNC_WAIT_ALREADY_SIGNALED;
+    if (!s || s->magic != NVN_MAGIC('S', 'Y', 'N', 'C')) {
+        nvn_fail("nvnSyncWait", "invalid sync");
+        return NVN_SYNC_WAIT_FAILED;
+    }
+    if (s->state) return NVN_SYNC_WAIT_ALREADY_SIGNALED;
+    if (!s->fence) return NVN_SYNC_WAIT_ALREADY_SIGNALED;  /* never fenced */
+    int r = gfx_backend_fence_wait((GfxFence *)s->fence, timeout);
+    if (r > 0) {
+        ((sync_t *)s)->state = 1;   /* the guest owns the mutable sync object */
+        return NVN_SYNC_WAIT_CONDITION_SATISFIED;
+    }
+    if (r == 0) return NVN_SYNC_WAIT_TIMEOUT_EXPIRED;
+    return NVN_SYNC_WAIT_FAILED;
 }
 static uint32_t nvnSyncInitializeFromFencedGLSync(sync_t *s, const nvn_dev_t *d, const void *gl) {
     (void)gl;
