@@ -227,13 +227,26 @@ int runtime_native_window_draw_reflected_pipeline(void *p, void *pipeline) {
     return 1;
 }
 
+int runtime_native_window_execute_reflected_ex(void *p, void *pipeline,
+                                               const GfxCmd *cmds, uint32_t count,
+                                               const float default_clear[4],
+                                               const GfxVertexStream *streams, uint32_t nstreams);
+
 int runtime_native_window_execute_reflected(void *p, void *pipeline,
                                             const GfxCmd *cmds, uint32_t count,
                                             const float default_clear[4]) {
+    return runtime_native_window_execute_reflected_ex(p, pipeline, cmds, count, default_clear,
+                                                      NULL, 0);
+}
+
+int runtime_native_window_execute_reflected_ex(void *p, void *pipeline,
+                                               const GfxCmd *cmds, uint32_t count,
+                                               const float default_clear[4],
+                                               const GfxVertexStream *streams, uint32_t nstreams) {
     HostNativeWindow *w = p;
     if (!w || w->magic != HOST_NW_MAGIC || !w->gfx_target || !pipeline) return 0;
-    if (!gfx_backend_reflected_execute((GfxReflectedPipeline *)pipeline, w->gfx_target,
-                                       cmds, count, default_clear))
+    if (!gfx_backend_reflected_execute_ex((GfxReflectedPipeline *)pipeline, w->gfx_target,
+                                          cmds, count, default_clear, streams, nstreams))
         return 0;
     const uint8_t *src = gfx_backend_offscreen_pixels(w->gfx_target, NULL);
     if (src) memcpy(w->buffer, src, w->buffer_size);

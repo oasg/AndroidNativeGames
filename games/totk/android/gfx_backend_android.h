@@ -64,6 +64,12 @@ GfxTrianglePipeline *gfx_backend_builtin_triangle_pipeline(void);
  * cache probe can populate a synthetic cache entry without game data. */
 void gfx_backend_builtin_triangle_modules(const uint8_t **vs, size_t *vs_size,
                                           const uint8_t **ps, size_t *ps_size);
+void gfx_backend_builtin_texture_modules(const uint8_t **vs, size_t *vs_size,
+                                         const uint8_t **ps, size_t *ps_size);
+void gfx_backend_builtin_ubo_modules(const uint8_t **vs, size_t *vs_size,
+                                     const uint8_t **ps, size_t *ps_size);
+void gfx_backend_builtin_attr_modules(const uint8_t **vs, size_t *vs_size,
+                                      const uint8_t **ps, size_t *ps_size);
 
 typedef struct { uint32_t binding; uint32_t size; } GfxUboBinding;
 GfxTrianglePipeline *gfx_backend_triangle_pipeline_create_ubo(const uint8_t *vs, size_t vs_size,
@@ -109,6 +115,29 @@ typedef struct {
     uint32_t nvn_flags;       /* BufferUsageFlags / TextureUsageFlags */
     int      separate;        /* separate texture + sampler binding */
 } GfxBindingSpec;
+
+/* Vertex input derived from the NVN attribute/stream state.  Attribute
+ * locations are the NVN attribute indices; bindings are the NVN stream
+ * indices.  `format` is a VkFormat. */
+typedef struct {
+    uint32_t location;
+    uint32_t binding;
+    int format;
+    uint32_t offset;
+} GfxVertexAttribute;
+
+typedef struct {
+    uint32_t binding;
+    uint32_t stride;
+    uint32_t input_rate;      /* 0 vertex, 1 instance */
+} GfxVertexBinding;
+
+typedef struct {
+    uint32_t nbindings, nattributes;
+    GfxVertexBinding bindings[16];
+    GfxVertexAttribute attributes[16];
+} GfxVertexLayout;
+
 /* Offline reflection helpers shared by the probes and the NVN program bridge.
  * They are implemented in loader_android.c; `json_path` is the .res.json and
  * `spv_path` the translated module.  SPIR-V wins for descriptor type/count. */
@@ -122,6 +151,13 @@ GfxReflectedPipeline *gfx_backend_reflected_pipeline_create(const uint8_t *vs, s
                                                             int vk_format,
                                                             const GfxBindingSpec *vs_specs, uint32_t nvs,
                                                             const GfxBindingSpec *ps_specs, uint32_t nps);
+GfxReflectedPipeline *gfx_backend_reflected_pipeline_create_ex(
+                                                            const uint8_t *vs, size_t vs_size,
+                                                            const uint8_t *ps, size_t ps_size,
+                                                            int vk_format,
+                                                            const GfxBindingSpec *vs_specs, uint32_t nvs,
+                                                            const GfxBindingSpec *ps_specs, uint32_t nps,
+                                                            const GfxVertexLayout *input);
 void gfx_backend_reflected_pipeline_destroy(GfxReflectedPipeline *pipeline);
 int gfx_backend_reflected_draw(GfxReflectedPipeline *pipeline, GfxOffscreenTarget *target,
                                float r, float g, float b, float a);
@@ -135,7 +171,8 @@ typedef enum {
     GFX_CMD_CLEAR_COLOR = 1,
     GFX_CMD_SET_VIEWPORT,
     GFX_CMD_SET_SCISSOR,
-    GFX_CMD_DRAW
+    GFX_CMD_DRAW,
+    GFX_CMD_DRAW_INDEXED
 } GfxCmdKind;
 
 typedef struct {
@@ -144,12 +181,36 @@ typedef struct {
         struct { float rgba[4]; uint32_t mask; } clear;
         struct { int32_t x, y, width, height; } rect;
         struct { uint32_t primitive, first, count; } draw;
+        struct {
+            uint32_t primitive, count, index_type, base_vertex;
+            const void *indices;
+            size_t index_size;
+        } draw_indexed;
     } u;
 } GfxCmd;
+
+typedef struct {
+    uint32_t binding;
+    const void *data;
+    size_t size;
+} GfxVertexStream;
 
 int gfx_backend_reflected_execute(GfxReflectedPipeline *pipeline, GfxOffscreenTarget *target,
                                   const GfxCmd *cmds, uint32_t count,
                                   const float default_clear[4]);
+int gfx_backend_reflected_execute_ex(GfxReflectedPipeline *pipeline, GfxOffscreenTarget *target,
+                                     const GfxCmd *cmds, uint32_t count,
+                                     const float default_clear[4],
+                                     const GfxVertexStream *streams, uint32_t nstreams);
+
+/* Bind a resource by its NVN stage/slot rather than by the SPIR-V binding.
+ * The reflected pipeline maps the slot through the .res.json metadata. */
+int gfx_backend_reflected_bind_ubo_slot(GfxReflectedPipeline *pipeline, uint32_t stage,
+                                        uint32_t slot, const void *data, size_t size);
+int gfx_backend_reflected_bind_storage_slot(GfxReflectedPipeline *pipeline, uint32_t stage,
+                                            uint32_t slot, const void *data, size_t size);
+int gfx_backend_reflected_bind_texture_slot(GfxReflectedPipeline *pipeline, uint32_t stage,
+                                            uint32_t slot, const GfxTexture *texture);
 /* Replace the dummy resource of one reflected binding at runtime.  The binding
  * kind and count come from the pipeline's SPIR-V signature. */
 int gfx_backend_reflected_bind_texture(GfxReflectedPipeline *pipeline, uint32_t set,

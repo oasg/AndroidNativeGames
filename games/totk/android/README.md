@@ -80,6 +80,12 @@ gate + HLE-stack thunks + a minimal SVC layer.
   `tools/prepare_shader_cache.py` packs the offline spike output into that
   layout, and `probe-nvn-frame` covers cache hit, pipeline creation,
   clear/viewport/scissor/draw translation and the miss fallback.
+- Command-buffer resources: UBO/SSBO and texture binds are applied through the
+  NVN stage/slot (`nvn_slot` in `.res.json`), guest vertex buffers/attributes
+  become a Vulkan vertex layout, and `DrawElements` becomes
+  `vkCmdDrawIndexed` (u8 widened to u16).  `probe-nvn-state` binds a UBO
+  (`4080bfff`), a guest checker texture (`808080ff`) and an indexed
+  `{pos,uv}` vertex stream (`808040ff`).
 - `nn::hid::InitializeNpad` is a host no-pad backend for now (zero Npad/6-axis
   state, vibration stub). Keyboard/mouse/touch/debug-pad/gesture initialization
   are host no-device initializers too, because the HID shared-memory service is
@@ -133,6 +139,7 @@ adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-totk-vs
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-totk-reflect
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-nvn-frame
+adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-nvn-state
 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android probe-shader-cache
 TOTK_ANDROID_TRACE_SVC=1 adb shell /data/local/tmp/totk-android/totk-android /data/local/tmp/totk-android boot-sdk
 ```
@@ -335,6 +342,10 @@ Expected results on an arm64 Android device:
   resolves it through the pool maps and exercises
   `SetTexturePool`/`SetSamplerPool`/`BindTexture`/`BindImage`/
   `BindUniformBuffer`/`BindStorageBuffer`.
+- `probe-nvn-cb-lifetime`: keeps 96 live command buffers, submits them, then
+  finalizes one, re-submits its stale handle and reuses the storage.  It guards
+  the dynamic command-buffer registry and rejects stale `CMDB` objects instead
+  of handing a destroyed program/window to the Vulkan driver.
 - `probe-nvn-draw` with `TOTK_ANDROID_SPV_VS`/`TOTK_ANDROID_SPV_PS` loads a
   translated TOTK SPIR-V pair into the NVN program and executes the draw.  The
   sampled system/material pair is not a visible triangle (`visible:false`);
@@ -398,10 +409,11 @@ Expected results on an arm64 Android device:
    data extracted from the XCI), `Sound/Product.100.alto__AltoConfig.bgyml`,
    and runs the `audren:u` renderer with a silent Android mixer plus the host
    `nn::time` clock.  The SDK `lm` logger now initializes (command 0 is
-   `OpenLogger`), and the Water textures fixed the null builder stop.  The next
-   crash is `main+0xc49974` on a texture-worker thread after missing
-   `TexToGo/CmnTex_DriftSand_Alb` and event setting resources.  See
-   `docs/android-hle-phase2a.md`.
+   `OpenLogger`), and `TexToGo/miasma_altitude2.bntx.zs` fixed the null material
+   builder.  `nn::oe` volume/notification overrides are in place, and the game
+   reaches its **first real GPU submit**.  The next stop is
+   `main+0x7a8600` after `nvnQueueFenceSync`, where a renderer object's first
+   qword is null.  See `docs/android-hle-phase2a.md`.
 3. `nvdrv` is now a real service (`nvdrv_android.c`): Open/Close/Initialize/
    SetAruid/Ioctl3/MapSharedMem plus a guest-visible nvmap window at
    `0x500000000`.  `probe-nvdrv` exercises it.  The next nvdrv work is the

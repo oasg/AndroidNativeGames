@@ -387,18 +387,33 @@ the zeroed storage is `sdk+0xd80d70`.  The constructor at `sdk+0x356060` calls
 service now returns an `ILogger` (a moved session for a direct request, a
 domain object for a domain request), so `ShimLibraryGlobal` initializes.
 
-The first log/assert no longer crashes.  The next stop is the null texture
-builder that the log manager had been masking:
+The first log/assert no longer crashes.  The next stop was a null texture
+builder, and it was **data**, not a builder API bug: the material table entry
+for `SceneMaterial.ng_model7.15.x_0` failed because the base RomFS file
+`TexToGo/miasma_altitude2.bntx.zs` was absent.  Adding that one base-XCI file
+(the Water assets were also extracted for neighbouring materials) moves the
+stop past `main+0x84cb1c` and `main+0xc49974`.
+
+The next HLE gap was `nn::oe`:
+
+- `SetExpectedVolumeBalance` / `GetExpectedVolumeBalance` called
+  `nn::am::GetAudioController()`, which returns null in the host HLE;
+- `TryPopNotificationMessage` waited on a SystemEvent that the host
+  `nn::oe::Initialize` does not attach.
+
+Those main imports now have host overrides (unity volume, no notification).
+The game then reaches its **first real GPU submit**:
 
 ```text
-[crash] sig=11 pc=main+0x84cb1c lr=main+0x128225c fault=0x1c
-[crash] last NVN api: nvnTextureBuilderGetStorageSize
+[totk-nvn] GPU submit #1 queue=... commands=1 (CPU-only host)
+[crash] sig=11 pc=main+0x7a8600 lr=main+0x7a8434 fault=0x150
+[crash] last NVN api: nvnQueueFenceSync
 ```
 
-This is a missing texture resource, not a builder API bug.  Adding the
-`TexToGo/Water*` assets (test data from the XCI) moves the crash further to
-`main+0xc49974` on texture-worker thread `0x101f`, after more missing
-`TexToGo`/`Event` resources (`CmnTex_DriftSand_Alb`, event setting lists).
+At `main+0x7a8600` the renderer object's first qword is null before the
+`+0x150` virtual call.  This is after the first submit, not the log manager or
+a missing base RomFS file.  The remaining 56 "not found" paths are
+update-only/optional and none exist in base v0.
 
 `nvnMemoryPoolMap` still reports `pool is CPU_NO_ACCESS`; it remains a separate
 pool-flag item.

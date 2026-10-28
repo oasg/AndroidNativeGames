@@ -205,6 +205,8 @@ The next steps are, in order:
    `nvnProgramSetShaders*` loads the offline keyed cache and creates the
    reflected pipeline on first submit);
 3. 2B.4: command-buffer clear/draw recording and a first real frame, starting
-   with clear/viewport/scissor/draw and then vertex/descriptor resources;
+   with clear/viewport/scissor/draw and then vertex/descriptor resources
+   (done as a first slice: UBO/SSBO/texture binds, vertex streams/attributes
+   and indexed draws; `probe-nvn-state`);
 4. 2B.5: Android `SurfaceView`/JNI app shell with
    `runtime_native_window_attach_android`.

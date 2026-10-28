@@ -457,7 +457,36 @@ int gfx_backend_vk_format_for_nvn(uint32_t f) {
     case 0x4C: return VK_FORMAT_BC5_SNORM_BLOCK;
     case 0x4D: return VK_FORMAT_BC7_UNORM_BLOCK;
     case 0x4E: return VK_FORMAT_BC7_SRGB_BLOCK;
+    /* NVN "unconverted" vertex formats. */
+    case 0x51: return VK_FORMAT_R8_UINT;
+    case 0x52: return VK_FORMAT_R8_SINT;
+    case 0x53: return VK_FORMAT_R16_UINT;
+    case 0x54: return VK_FORMAT_R16_SINT;
+    case 0x55: return VK_FORMAT_R32_UINT;
+    case 0x56: return VK_FORMAT_R32_SINT;
+    case 0x57: return VK_FORMAT_R8G8_UINT;
+    case 0x58: return VK_FORMAT_R8G8_SINT;
+    case 0x59: return VK_FORMAT_R16G16_UINT;
+    case 0x5A: return VK_FORMAT_R16G16_SINT;
+    case 0x5B: return VK_FORMAT_R32G32_UINT;
+    case 0x5C: return VK_FORMAT_R32G32_SINT;
+    case 0x5D: return VK_FORMAT_R8G8B8_UINT;
+    case 0x5E: return VK_FORMAT_R8G8B8_SINT;
+    case 0x5F: return VK_FORMAT_R16G16B16_UINT;
+    case 0x60: return VK_FORMAT_R16G16B16_SINT;
+    case 0x61: return VK_FORMAT_R32G32B32_UINT;
+    case 0x62: return VK_FORMAT_R32G32B32_SINT;
+    case 0x63: return VK_FORMAT_R8G8B8A8_UINT;
+    case 0x64: return VK_FORMAT_R8G8B8A8_SINT;
+    case 0x65: return VK_FORMAT_R16G16B16A16_UINT;
+    case 0x66: return VK_FORMAT_R16G16B16A16_SINT;
+    case 0x67: return VK_FORMAT_R32G32B32A32_UINT;
+    case 0x68: return VK_FORMAT_R32G32B32A32_SINT;
+    case 0x69: return VK_FORMAT_A2B10G10R10_SNORM_PACK32;
     case 0x6D: return VK_FORMAT_R8G8B8A8_UNORM;
+    /* NVN_FORMAT_BGRX8/BGRA8, also usable as vertex formats. */
+    case 0x99: return VK_FORMAT_B8G8R8A8_UNORM;
+    case 0x9A: return VK_FORMAT_B8G8R8A8_UNORM;
     default: return VK_FORMAT_UNDEFINED;
     }
 }
@@ -1444,6 +1473,30 @@ void gfx_backend_builtin_triangle_modules(const uint8_t **vs, size_t *vs_size,
     if (ps_size) *ps_size = triangle_frag_spv_size;
 }
 
+void gfx_backend_builtin_texture_modules(const uint8_t **vs, size_t *vs_size,
+                                         const uint8_t **ps, size_t *ps_size) {
+    if (vs) *vs = (const uint8_t *)triangle_tex_vert_spv;
+    if (vs_size) *vs_size = triangle_tex_vert_spv_size;
+    if (ps) *ps = (const uint8_t *)triangle_tex_frag_spv;
+    if (ps_size) *ps_size = triangle_tex_frag_spv_size;
+}
+
+void gfx_backend_builtin_ubo_modules(const uint8_t **vs, size_t *vs_size,
+                                     const uint8_t **ps, size_t *ps_size) {
+    if (vs) *vs = (const uint8_t *)triangle_vert_spv;
+    if (vs_size) *vs_size = triangle_vert_spv_size;
+    if (ps) *ps = (const uint8_t *)reflect_ubo_frag_spv;
+    if (ps_size) *ps_size = reflect_ubo_frag_spv_size;
+}
+
+void gfx_backend_builtin_attr_modules(const uint8_t **vs, size_t *vs_size,
+                                      const uint8_t **ps, size_t *ps_size) {
+    if (vs) *vs = (const uint8_t *)triangle_attr_vert_spv;
+    if (vs_size) *vs_size = triangle_attr_vert_spv_size;
+    if (ps) *ps = (const uint8_t *)triangle_attr_frag_spv;
+    if (ps_size) *ps_size = triangle_attr_frag_spv_size;
+}
+
 
 struct GfxTexture {
     VkImage image;
@@ -1838,10 +1891,20 @@ struct GfxReflectedPipeline {
     unsigned nbuf_view;
     VkSampler sampler[GFX_REFLECT_MAX_BINDINGS];
     unsigned nsampler;
+    /* Transient guest-backed streams for the translated draw.  Vertex streams
+     * are indexed by NVN stream binding (0..15); the index buffer is one
+     * upload per indexed draw. */
+    VkBuffer vbuf[16];
+    VkDeviceMemory vbuf_mem[16];
+    size_t vbuf_cap[16];
+    VkBuffer index_buf;
+    VkDeviceMemory index_mem;
+    size_t index_cap;
     GfxBindingSpec spec[2][GFX_REFLECT_MAX_BINDINGS];
     uint32_t nspec[2];
     int32_t bind_buf[2][GFX_REFLECT_MAX_BINDINGS];
     VkDeviceSize buf_size[GFX_REFLECT_MAX_BINDINGS];
+    GfxVertexLayout input;
 };
 
 static int vk_make_buffer_usage(uint32_t size, VkBufferUsageFlags usage,
@@ -1973,6 +2036,17 @@ GfxReflectedPipeline *gfx_backend_reflected_pipeline_create(const uint8_t *vs, s
                                                             int vk_format,
                                                             const GfxBindingSpec *vs_specs, uint32_t nvs,
                                                             const GfxBindingSpec *ps_specs, uint32_t nps) {
+    return gfx_backend_reflected_pipeline_create_ex(vs, vs_size, ps, ps_size, vk_format,
+                                                    vs_specs, nvs, ps_specs, nps, NULL);
+}
+
+GfxReflectedPipeline *gfx_backend_reflected_pipeline_create_ex(
+                                                            const uint8_t *vs, size_t vs_size,
+                                                            const uint8_t *ps, size_t ps_size,
+                                                            int vk_format,
+                                                            const GfxBindingSpec *vs_specs, uint32_t nvs,
+                                                            const GfxBindingSpec *ps_specs, uint32_t nps,
+                                                            const GfxVertexLayout *input) {
     pthread_mutex_lock(&g_lock);
     if (!vk_init_locked()) { pthread_mutex_unlock(&g_lock); return NULL; }
     VkFormat fmt = (VkFormat)vk_format;
@@ -1984,6 +2058,7 @@ GfxReflectedPipeline *gfx_backend_reflected_pipeline_create(const uint8_t *vs, s
     }
     if (!p) { pthread_mutex_unlock(&g_lock); return NULL; }
     p->format = fmt;
+    if (input) p->input = *input;
     /* The pixel module is always in set 1.  Copy before patching so the
      * caller's SPIR-V (including the built-in test shader arrays) is not
      * modified; callers that already moved the set are unaffected. */
@@ -2176,7 +2251,29 @@ descriptors_done:;
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
           .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = p->ps, .pName = "main" },
     };
-    VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkVertexInputBindingDescription vib[16];
+    VkVertexInputAttributeDescription via[16];
+    uint32_t nb = 0, na = 0;
+    if (input) {
+        nb = input->nbindings < 16 ? input->nbindings : 16;
+        na = input->nattributes < 16 ? input->nattributes : 16;
+        for (uint32_t i = 0; i < nb; i++)
+            vib[i] = (VkVertexInputBindingDescription){
+                .binding = input->bindings[i].binding,
+                .stride = input->bindings[i].stride,
+                .inputRate = input->bindings[i].input_rate ? VK_VERTEX_INPUT_RATE_INSTANCE
+                                                           : VK_VERTEX_INPUT_RATE_VERTEX };
+        for (uint32_t i = 0; i < na; i++)
+            via[i] = (VkVertexInputAttributeDescription){
+                .location = input->attributes[i].location,
+                .binding = input->attributes[i].binding,
+                .format = (VkFormat)input->attributes[i].format,
+                .offset = input->attributes[i].offset };
+    }
+    VkPipelineVertexInputStateCreateInfo vi = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = nb, .pVertexBindingDescriptions = vib,
+        .vertexAttributeDescriptionCount = na, .pVertexAttributeDescriptions = via };
     VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
                                                   .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
     VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
@@ -2226,6 +2323,12 @@ void gfx_backend_reflected_pipeline_destroy(GfxReflectedPipeline *p) {
             if (p->buf[i]) vkDestroyBuffer(g.dev, p->buf[i], NULL);
             if (p->buf_mem[i]) vkFreeMemory(g.dev, p->buf_mem[i], NULL);
         }
+        for (unsigned i = 0; i < 16; i++) {
+            if (p->vbuf[i]) vkDestroyBuffer(g.dev, p->vbuf[i], NULL);
+            if (p->vbuf_mem[i]) vkFreeMemory(g.dev, p->vbuf_mem[i], NULL);
+        }
+        if (p->index_buf) vkDestroyBuffer(g.dev, p->index_buf, NULL);
+        if (p->index_mem) vkFreeMemory(g.dev, p->index_mem, NULL);
         if (p->fb) vkDestroyFramebuffer(g.dev, p->fb, NULL);
         if (p->pipe) vkDestroyPipeline(g.dev, p->pipe, NULL);
         if (p->layout) vkDestroyPipelineLayout(g.dev, p->layout, NULL);
@@ -2281,31 +2384,34 @@ int gfx_backend_reflected_bind_texture(GfxReflectedPipeline *p, uint32_t set,
     return 1;
 }
 
+static int reflect_write_buffer_locked(GfxReflectedPipeline *p, uint32_t set, uint32_t binding,
+                                       uint32_t offset, const void *data, size_t size, int storage) {
+    if (!p || !data || !size) return 0;
+    if (!g.ready) return 0;
+    int i = reflect_find_spec(p, set, binding);
+    if (i < 0) return 0;
+    const GfxBindingSpec *spec = &p->spec[set][i];
+    if ((storage && spec->kind != GFX_BIND_SSBO) ||
+        (!storage && spec->kind != GFX_BIND_UBO))
+        return 0;
+    int32_t idx = p->bind_buf[set][i];
+    if (idx < 0 || (uint64_t)offset + size > p->buf_size[idx]) return 0;
+    void *mapped = NULL;
+    if (!vk_ok(vkMapMemory(g.dev, p->buf_mem[idx], offset, size, 0, &mapped),
+               "vkMapMemory(reflected write)"))
+        return 0;
+    memcpy(mapped, data, size);
+    vkUnmapMemory(g.dev, p->buf_mem[idx]);
+    return 1;
+}
+
 static int reflect_write_buffer(GfxReflectedPipeline *p, uint32_t set, uint32_t binding,
                                 uint32_t offset, const void *data, size_t size, int storage) {
     if (!p || !data || !size) return 0;
     pthread_mutex_lock(&g_lock);
-    if (!g.ready) { pthread_mutex_unlock(&g_lock); return 0; }
-    int i = reflect_find_spec(p, set, binding);
-    if (i < 0) { pthread_mutex_unlock(&g_lock); return 0; }
-    const GfxBindingSpec *spec = &p->spec[set][i];
-    if ((storage && spec->kind != GFX_BIND_SSBO) ||
-        (!storage && spec->kind != GFX_BIND_UBO)) {
-        pthread_mutex_unlock(&g_lock); return 0;
-    }
-    int32_t idx = p->bind_buf[set][i];
-    if (idx < 0 || (uint64_t)offset + size > p->buf_size[idx]) {
-        pthread_mutex_unlock(&g_lock); return 0;
-    }
-    void *mapped = NULL;
-    if (!vk_ok(vkMapMemory(g.dev, p->buf_mem[idx], offset, size, 0, &mapped),
-               "vkMapMemory(reflected write)")) {
-        pthread_mutex_unlock(&g_lock); return 0;
-    }
-    memcpy(mapped, data, size);
-    vkUnmapMemory(g.dev, p->buf_mem[idx]);
+    int ok = reflect_write_buffer_locked(p, set, binding, offset, data, size, storage);
     pthread_mutex_unlock(&g_lock);
-    return 1;
+    return ok;
 }
 
 int gfx_backend_reflected_write_uniform(GfxReflectedPipeline *p, uint32_t set,
@@ -2318,6 +2424,90 @@ int gfx_backend_reflected_write_storage(GfxReflectedPipeline *p, uint32_t set,
                                         uint32_t binding, uint32_t offset,
                                         const void *data, size_t size) {
     return reflect_write_buffer(p, set, binding, offset, data, size, 1);
+}
+
+static int reflect_set_for_stage(uint32_t stage) {
+    return stage == 0 ? 0 : stage == 1 ? 1 : -1;
+}
+
+/* Find a reflected binding by the NVN stage/slot the guest bound.  The
+ * .res.json slot is authoritative; a missing slot (-1) falls back to the
+ * binding number used by the built-in test shaders. */
+static int reflect_find_slot_locked(GfxReflectedPipeline *p, int set, uint32_t slot,
+                                    int want_texture) {
+    if (set < 0 || set > 1) return -1;
+    int fallback = -1;
+    for (uint32_t i = 0; i < p->nspec[set]; i++) {
+        const GfxBindingSpec *s = &p->spec[set][i];
+        int texture_kind = s->kind == GFX_BIND_COMBINED_IMAGE_SAMPLER ||
+                           s->kind == GFX_BIND_SAMPLED_IMAGE;
+        if (want_texture ? !texture_kind : s->kind != GFX_BIND_UBO) continue;
+        if (s->nvn_slot == (int32_t)slot) return (int)i;
+        if (fallback < 0 && (s->nvn_slot < 0 || s->nvn_slot == 0) && s->binding == slot)
+            fallback = (int)i;
+    }
+    return fallback;
+}
+
+/* The guest binds the whole NVN range, which is often larger than the
+ * UBO/SSBO allocation the reflection derived from the shader.  Copy what fits
+ * and report the truncation instead of dropping the binding entirely. */
+static int reflect_write_slot_locked(GfxReflectedPipeline *p, int set, int i,
+                                     const void *data, size_t size, int storage) {
+    if (i < 0) return 0;
+    int32_t idx = p->bind_buf[set][i];
+    if (idx < 0) return 0;
+    size_t cap = (size_t)p->buf_size[idx];
+    if (size > cap) {
+        static unsigned truncated;
+        if (truncated++ < 8)
+            vk_log("reflected slot copy truncated binding=%u size=%zu cap=%zu",
+                   p->spec[set][i].binding, size, cap);
+        size = cap;
+    }
+    if (!size) return 0;
+    return reflect_write_buffer_locked(p, set, p->spec[set][i].binding, 0, data, size, storage);
+}
+
+int gfx_backend_reflected_bind_ubo_slot(GfxReflectedPipeline *p, uint32_t stage,
+                                        uint32_t slot, const void *data, size_t size) {
+    if (!p || !data || !size) return 0;
+    int set = reflect_set_for_stage(stage);
+    if (set < 0) return 0;
+    pthread_mutex_lock(&g_lock);
+    int i = reflect_find_slot_locked(p, set, slot, 0);
+    int ok = reflect_write_slot_locked(p, set, i, data, size, 0);
+    pthread_mutex_unlock(&g_lock);
+    return ok;
+}
+
+int gfx_backend_reflected_bind_storage_slot(GfxReflectedPipeline *p, uint32_t stage,
+                                            uint32_t slot, const void *data, size_t size) {
+    if (!p || !data || !size) return 0;
+    int set = reflect_set_for_stage(stage);
+    if (set < 0) return 0;
+    pthread_mutex_lock(&g_lock);
+    int found = -1;
+    for (uint32_t i = 0; i < p->nspec[set]; i++) {
+        if (p->spec[set][i].kind != GFX_BIND_SSBO) continue;
+        if (p->spec[set][i].nvn_slot == (int32_t)slot) { found = (int)i; break; }
+    }
+    int ok = reflect_write_slot_locked(p, set, found, data, size, 1);
+    pthread_mutex_unlock(&g_lock);
+    return ok;
+}
+
+int gfx_backend_reflected_bind_texture_slot(GfxReflectedPipeline *p, uint32_t stage,
+                                            uint32_t slot, const GfxTexture *texture) {
+    if (!p || !texture) return 0;
+    int set = reflect_set_for_stage(stage);
+    if (set < 0) return 0;
+    pthread_mutex_lock(&g_lock);
+    int i = reflect_find_slot_locked(p, set, slot, 1);
+    uint32_t binding = i >= 0 ? p->spec[set][i].binding : 0;
+    pthread_mutex_unlock(&g_lock);
+    if (i < 0) return 0;
+    return gfx_backend_reflected_bind_texture(p, (uint32_t)set, binding, texture);
 }
 
 GfxReflectedPipeline *gfx_backend_reflected_builtin_texture_pipeline_create(void) {
@@ -2401,9 +2591,46 @@ static VkPrimitiveTopology vk_reflect_topology(uint32_t primitive) {
     }
 }
 
+static int vk_reflect_ensure_buffer(VkBuffer *buf, VkDeviceMemory *mem, size_t *cap,
+                                    size_t need, VkBufferUsageFlags usage) {
+    if (need < 1) need = 1;
+    if (*buf && *cap >= need) return 1;
+    if (*buf) vkDestroyBuffer(g.dev, *buf, NULL);
+    if (*mem) vkFreeMemory(g.dev, *mem, NULL);
+    *buf = VK_NULL_HANDLE;
+    *mem = VK_NULL_HANDLE;
+    size_t size = (need + 255) & ~(size_t)255;
+    if (!vk_make_buffer_usage((uint32_t)size, usage, buf, mem)) return 0;
+    *cap = size;
+    return 1;
+}
+
+static int vk_reflect_upload(VkDeviceMemory mem, size_t offset, const void *data, size_t size) {
+    if (!data || !size) return 0;
+    void *mapped = NULL;
+    if (!vk_ok(vkMapMemory(g.dev, mem, offset, size, 0, &mapped), "vkMapMemory(reflected stream)"))
+        return 0;
+    memcpy(mapped, data, size);
+    vkUnmapMemory(g.dev, mem);
+    return 1;
+}
+
+static VkIndexType vk_reflect_index_type(uint32_t type) {
+    /* NVN: 0 u8, 1 u16, 2 u32.  u8 is widened to u16 because the base Vulkan
+     * 1.0 path does not require VK_EXT_index_type_uint8. */
+    return type == 2 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+}
+
 int gfx_backend_reflected_execute(GfxReflectedPipeline *p, GfxOffscreenTarget *t,
                                   const GfxCmd *cmds, uint32_t count,
                                   const float default_clear[4]) {
+    return gfx_backend_reflected_execute_ex(p, t, cmds, count, default_clear, NULL, 0);
+}
+
+int gfx_backend_reflected_execute_ex(GfxReflectedPipeline *p, GfxOffscreenTarget *t,
+                                     const GfxCmd *cmds, uint32_t count,
+                                     const float default_clear[4],
+                                     const GfxVertexStream *streams, uint32_t nstreams) {
     if (!p || !t) return 0;
     pthread_mutex_lock(&g_lock);
     if (!g.ready || t->format != p->format || t->bpp != 4) { pthread_mutex_unlock(&g_lock); return 0; }
@@ -2419,6 +2646,65 @@ int gfx_backend_reflected_execute(GfxReflectedPipeline *p, GfxOffscreenTarget *t
         p->fb_view = t->view; p->fb_w = t->width; p->fb_h = t->height;
     }
 
+    /* Upload the guest stream ranges before recording.  These buffers are
+     * host-visible and are rebuilt only when the bound range grows. */
+    for (uint32_t s = 0; s < nstreams; s++) {
+        uint32_t binding = streams[s].binding;
+        if (binding >= 16 || !streams[s].data || !streams[s].size) continue;
+        if (!vk_reflect_ensure_buffer(&p->vbuf[binding], &p->vbuf_mem[binding],
+                                      &p->vbuf_cap[binding], streams[s].size,
+                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) ||
+            !vk_reflect_upload(p->vbuf_mem[binding], 0, streams[s].data, streams[s].size)) {
+            vk_log("ERROR reflected vertex stream upload binding=%u size=%zu", binding, streams[s].size);
+            pthread_mutex_unlock(&g_lock);
+            return 0;
+        }
+    }
+
+    size_t *index_offsets = calloc(count ? count : 1, sizeof *index_offsets);
+    if (!index_offsets) { pthread_mutex_unlock(&g_lock); return 0; }
+    size_t index_total = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (cmds[i].kind != GFX_CMD_DRAW_INDEXED) continue;
+        const GfxCmd *c = &cmds[i];
+        uint32_t it = c->u.draw_indexed.index_type;
+        size_t src = c->u.draw_indexed.index_size;
+        if (!src) src = (size_t)c->u.draw_indexed.count * (it == 2 ? 4 : it == 1 ? 2 : 1);
+        size_t dst = it == 0 ? (size_t)c->u.draw_indexed.count * 2 : src;
+        index_offsets[i] = (index_total + 3) & ~(size_t)3;
+        index_total = index_offsets[i] + dst;
+    }
+    if (index_total) {
+        if (!vk_reflect_ensure_buffer(&p->index_buf, &p->index_mem, &p->index_cap,
+                                      index_total, VK_BUFFER_USAGE_INDEX_BUFFER_BIT)) {
+            free(index_offsets);
+            pthread_mutex_unlock(&g_lock);
+            return 0;
+        }
+        for (uint32_t i = 0; i < count; i++) {
+            if (cmds[i].kind != GFX_CMD_DRAW_INDEXED) continue;
+            const GfxCmd *c = &cmds[i];
+            uint32_t it = c->u.draw_indexed.index_type;
+            size_t src = c->u.draw_indexed.index_size;
+            if (!src) src = (size_t)c->u.draw_indexed.count * (it == 2 ? 4 : it == 1 ? 2 : 1);
+            if (it == 0) {
+                size_t n = c->u.draw_indexed.count;
+                uint16_t *wide = malloc(n * 2);
+                if (!wide) { free(index_offsets); pthread_mutex_unlock(&g_lock); return 0; }
+                const uint8_t *in = c->u.draw_indexed.indices;
+                for (size_t k = 0; k < n; k++) wide[k] = in[k];
+                int ok = vk_reflect_upload(p->index_mem, index_offsets[i], wide, n * 2);
+                free(wide);
+                if (!ok) { free(index_offsets); pthread_mutex_unlock(&g_lock); return 0; }
+            } else if (!vk_reflect_upload(p->index_mem, index_offsets[i],
+                                          c->u.draw_indexed.indices, src)) {
+                free(index_offsets);
+                pthread_mutex_unlock(&g_lock);
+                return 0;
+            }
+        }
+    }
+
     float clear[4] = { 0.05f, 0.08f, 0.12f, 1.0f };
     if (default_clear) memcpy(clear, default_clear, sizeof clear);
     int first_is_clear = count && cmds[0].kind == GFX_CMD_CLEAR_COLOR;
@@ -2428,6 +2714,7 @@ int gfx_backend_reflected_execute(GfxReflectedPipeline *p, GfxOffscreenTarget *t
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     if (!vk_ok(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer(reflected-execute)")) {
+        free(index_offsets);
         pthread_mutex_unlock(&g_lock); return 0;
     }
     VkClearValue cv = { .color = { .float32 = { clear[0], clear[1], clear[2], clear[3] } } };
@@ -2438,6 +2725,12 @@ int gfx_backend_reflected_execute(GfxReflectedPipeline *p, GfxOffscreenTarget *t
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pipe);
     VkDescriptorSet sets[2] = { p->dset[0], p->dset[1] };
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, 2, sets, 0, NULL);
+    for (uint32_t s = 0; s < nstreams; s++) {
+        uint32_t binding = streams[s].binding;
+        if (binding >= 16 || !streams[s].data || !streams[s].size) continue;
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, binding, 1, &p->vbuf[binding], &offset);
+    }
 
     VkViewport viewport = { 0, 0, (float)t->width, (float)t->height, 0, 1 };
     VkRect2D scissor = { { 0, 0 }, { t->width, t->height } };
@@ -2478,6 +2771,16 @@ int gfx_backend_reflected_execute(GfxReflectedPipeline *p, GfxOffscreenTarget *t
             vkCmdDraw(cmd, c->u.draw.count, 1, c->u.draw.first, 0);
             break;
         }
+        case GFX_CMD_DRAW_INDEXED: {
+            uint32_t prim = c->u.draw_indexed.primitive;
+            if (vk_reflect_topology(prim) != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+                vk_log("reflected execute: indexed primitive %u uses the TRIANGLE_LIST pipeline", prim);
+            vkCmdBindIndexBuffer(cmd, p->index_buf, index_offsets[i],
+                                 vk_reflect_index_type(c->u.draw_indexed.index_type));
+            vkCmdDrawIndexed(cmd, c->u.draw_indexed.count, 1, 0,
+                             (int32_t)c->u.draw_indexed.base_vertex, 0);
+            break;
+        }
         default:
             break;
         }
@@ -2492,14 +2795,19 @@ int gfx_backend_reflected_execute(GfxReflectedPipeline *p, GfxOffscreenTarget *t
         .buffer = t->readback, .offset = 0, .size = VK_WHOLE_SIZE };
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                          0, 0, NULL, 1, &bb, 0, NULL);
-    if (!vk_submit_and_wait(cmd, "reflected-execute")) { pthread_mutex_unlock(&g_lock); return 0; }
+    if (!vk_submit_and_wait(cmd, "reflected-execute")) {
+        free(index_offsets);
+        pthread_mutex_unlock(&g_lock); return 0;
+    }
     t->layout = VK_IMAGE_LAYOUT_GENERAL;
     void *mapped = NULL;
     if (!vk_ok(vkMapMemory(g.dev, t->readback_mem, 0, VK_WHOLE_SIZE, 0, &mapped), "vkMapMemory(reflected-execute)")) {
+        free(index_offsets);
         pthread_mutex_unlock(&g_lock); return 0;
     }
     memcpy(t->pixels, mapped, t->pixels_size);
     vkUnmapMemory(g.dev, t->readback_mem);
+    free(index_offsets);
     pthread_mutex_unlock(&g_lock);
     return 1;
 }

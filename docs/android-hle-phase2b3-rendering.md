@@ -9,10 +9,11 @@
 | 3 | on-screen clear | done (emulator) | Surface test APK, 1,620+ frames at ~60 Hz, screenshot |
 | 4 | triangle | done | `probe-vulkan-triangle`, 60 frames, screenshot |
 | 5 | NVN program/pipeline/texture/draw | done | `probe-nvn-texture` (guest block-linear upload), `probe-totk-vs` visible TOTK VS/PS |
-| 6 | game first frame | blocked | registry/TLS/UI/audio/lm done; missing boot TexToGo resources stop texture worker |
+| 6 | game first frame | blocked | reaches first GPU submit; stops at `main+0x7a8600` null renderer object |
 | 7 | continuous frames | done (host) | triangle 60 frames; surface 1,620+ frames; NVN 60 draws |
 | 8 | shader cache + `nvnProgramSetShaders*` -> pipeline | done (host) | `probe-nvn-frame`: key hit, reflected pipeline, visible draw |
 | 9 | command-buffer clear/viewport/draw translation | done (first slice) | `probe-nvn-frame` center `ff4d0dff`; miss fallback `0d141fff` |
+| 10 | command-buffer resource + vertex/index translation | done (first slice) | `probe-nvn-state`: UBO `4080bfff`, texture `808080ff`, attr/index `808040ff` |
 
 The game's own first frame is **not** claimed.  The renderer path is now
 independently exercisable.  The former `nn::gfx` context-registry stop was a
@@ -386,11 +387,55 @@ resolves the window from its color texture, so draw and present share one host
 target.  When the guest's native-window pointer is not a host window yet (the
 VI/app-shell handoff is still incomplete), `nvnWindowInitialize` creates an
 offscreen 1920x1080 RGBA8 host window so the cached pipeline has a target.
-Descriptor/resource binds (`BindUniformBuffer`, `BindTexture`, `BindImage`,
-vertex buffers/states) are still recorded or traced and keep using the
-pipeline's descriptor sets.  Vertex/index resource reads, per-draw uploads and
-indexed draws are the next translation slice; `DrawElements` records the count
-but does not yet submit a `vkCmdDrawIndexed`.
+Descriptor/resource binds are translated after the clear/viewport/draw slice,
+in the order the guest records them.
+
+### Resource and vertex/index translation
+
+The next slice is in place:
+
+- `nvnCommandBufferBindUniformBuffer(s)` and
+  `nvnCommandBufferBindStorageBuffer(s)` store the last address/size per NVN
+  stage/slot.  At submit, the reflected pipeline maps the NVN slot through
+  `.res.json` (`nvn_slot`) and writes the guest memory into the real UBO/SSBO.
+- `nvnCommandBufferBindTexture(s)` resolves the combined handle through the
+  texture pool, uploads the guest block-linear texture and writes the real
+  image/sampler descriptor.
+- `nvnCommandBufferBindVertexBuffer(s)` stores the guest address range;
+  `BindVertexAttribState`/`BindVertexStreamState` decode
+  `{fmt:8, offset:19, stream:5}` and `{stride, divisor}` into a Vulkan vertex
+  layout.  The pipeline is recreated when the layout changes.
+- `nvnCommandBufferDrawElements`/`DrawElementsBaseVertex` translate to
+  `vkCmdBindIndexBuffer` + `vkCmdDrawIndexed`; u8 indices are widened to u16.
+
+`probe-nvn-state` covers all three paths without game data:
+
+```text
+[totk-nvn] state probe ubo     center=4080bfff ok=1
+[totk-nvn] state probe texture center=808080ff ok=1
+[totk-nvn] state probe attr    center=808040ff ok=1
+[totk-nvn] state selftest PASS
+{"status":"pass","probe":"nvn-state"}
+```
+
+The UBO path binds `(0.25, 0.5, 0.75, 1.0)`; the texture path binds a guest
+2x2 checker; the attr path uses an interleaved `{pos.xy, uv.xy}` vertex stream
+with two `R32G32_SFLOAT` attributes and a u16 index buffer.
+
+Limits of this slice:
+
+- descriptor state is **last-write-wins per submit**; a command buffer that
+  changes a UBO/texture between draws needs per-draw descriptor sets (the next
+  step);
+- a combined texture handle currently uses the texture's default sampler, not
+  the sampler-pool entry encoded in the handle;
+- guest UBO/SSBO ranges larger than the host allocation (64 KiB UBO, 4 KiB
+  SSBO) are copied up to the allocation and logged as truncated;
+- attributes whose NVN stream has no bound stride are dropped instead of
+  producing an invalid pipeline;
+- offline shaders must be translated with the matching `attr`/`tex` bind-state
+  answers for the SPIR-V input types to match the guest data;
+- depth/stencil targets and blend/raster state are still fixed.
 
 ## 6. Game first frame
 
@@ -427,17 +472,32 @@ returns an `ILogger` (moved session for a direct request, domain object for a
 domain request), so the singleton initializes and logging/asserts no longer
 crash.
 
-The next stop is the null texture builder it had been masking:
+The next stop was a null texture builder.  It was data, not a builder API bug:
+the base RomFS lacked `TexToGo/miasma_altitude2.bntx.zs`, so the material table
+entry for `SceneMaterial.ng_model7.15.x_0` was not registered.  Adding that
+base-XCI file (plus neighbouring Water assets) moves past `main+0x84cb1c` and
+`main+0xc49974`.
+
+The following HLE gaps were fixed with main-import overrides:
+
+- `nn::oe::SetExpectedVolumeBalance` / `GetExpectedVolumeBalance` called
+  `nn::am::GetAudioController()`, which the host does not provide;
+- `nn::oe::TryPopNotificationMessage` waited on a SystemEvent that the host
+  `nn::oe::Initialize` does not attach.
+
+The game now reaches its **first real GPU submit**:
 
 ```text
-[crash] sig=11 pc=main+0x84cb1c lr=main+0x128225c fault=0x1c
-[crash] last NVN api: nvnTextureBuilderGetStorageSize
+[totk-nvn] GPU submit #1 queue=... commands=1 (CPU-only host)
+[crash] sig=11 pc=main+0x7a8600 lr=main+0x7a8434 fault=0x150
+[crash] last NVN api: nvnQueueFenceSync
 ```
 
-Adding the `TexToGo/Water*` assets moves it further to `main+0xc49974` on a
-texture-worker thread, after more missing `TexToGo`/`Event` resources
-(`CmnTex_DriftSand_Alb`, event setting lists).  TLS remains valid and the
-Vulkan/NVN probes still pass.  The earlier non-fatal
+At `main+0x7a8600` the renderer object's first qword is null before the
+`+0x150` virtual call.  This is after the first submit, not a log-manager or
+base-RomFS stop.  The 56 remaining "not found" paths are update-only/optional
+and none exist in base v0.  TLS remains valid and the Vulkan/NVN probes still
+pass.  The earlier non-fatal
 `nvnMemoryPoolMap: pool is CPU_NO_ACCESS` remains a separate pool-flag item.
 
 ## 7. Verification commands
@@ -455,7 +515,9 @@ totk-android <dir> probe-vulkan-reflect-texture
 totk-android <dir> probe-vulkan-reflect-ubo
 totk-android <dir> probe-nvn-texture-reflect
 totk-android <dir> probe-nvn-bind
+totk-android <dir> probe-nvn-cb-lifetime
 totk-android <dir> probe-nvn-frame
+totk-android <dir> probe-nvn-state
 totk-android <dir> probe-shader-cache
 totk-android <dir> probe-spirv
 totk-android <dir> probe-nvn-submit
@@ -485,9 +547,15 @@ Expected:
   program and reflected pipeline; visible draw and PPM.
 - `probe-nvn-bind`: NVN texture/sampler pool registration, combined-handle
   packing and the descriptor bind entry points pass.
+- `probe-nvn-cb-lifetime`: 96 live command buffers, stale-handle rejection and
+  storage reuse; the dynamic registry no longer drops the 65th or hands a
+  finalized buffer to the driver.
 - `probe-nvn-frame`: writes two synthetic NVN shader keys, hits the offline
   cache, creates the reflected pipeline and translates
   clear/viewport/scissor/draw; center `ff4d0dff`, corner `0d141fff`.
+- `probe-nvn-state`: binds a UBO, a guest texture and an indexed vertex stream
+  through the NVN command buffer; centers `4080bfff`, `808080ff`,
+  `808040ff`.
 - `probe-shader-cache`: every packed `<stage>/<key>.spv` is accepted by
   `vkCreateShaderModule` and its `.res.json` is present.
 - `probe-spirv`: all cached SPIR-V modules accepted by the driver.
@@ -495,20 +563,20 @@ Expected:
 
 ## 8. Next
 
-1. Feed real storage-image/texel-buffer resources and guest storage ranges
-   into the reflected descriptor sets at draw time; real sampled textures, NVN
-   texture objects and uniform buffers are now bound after pipeline creation.
-   The remaining work is the upload/copy path for images and full mip/format
-   coverage.
+1. Move descriptor binds to per-draw state: a command buffer that changes a
+   UBO/texture between draws needs separate descriptor sets (or dynamic
+   offsets), and combined handles should use the sampler-pool entry instead of
+   the texture's default sampler.  The current slice is last-write-wins per
+   submit (`probe-nvn-state`).
 2. Pack the startup/title shader subset into the offline cache and run the
    game's own `nvnProgramSetShaders*` against it.  The key/lookup/pipeline path
    is in place (`probe-nvn-frame`); a cache miss still presents a clear frame.
-3. Translate vertex streams/attributes and indexed draws so translated
-   geometry reads the guest vertex data, then bind the real cbufs/textures
-   recorded by the command buffer.
-4. Fill the remaining boot `TexToGo`/UI/Event resources.  The real `lm` logger
-   and the Water textures fixed the logged `main+0x84cb1c` stop; the next crash
-   is `main+0xc49974` on a texture worker after missing
-   `CmnTex_DriftSand_Alb`/event setting resources.
+3. Translate the remaining render state (depth/stencil targets, blend,
+   rasterization) and pack shaders with the matching `attr`/`tex` bind-state
+   answers.  Vertex streams/attributes, indexed draws and the real cbuf/texture
+   binds are in place (`probe-nvn-state`).
+4. Fix the null renderer object at `main+0x7a8600` after the first GPU submit
+   (`nvnQueueFenceSync`).  The lm logger, base RomFS material, `nn::oe` volume
+   and notification paths are now in place; the game reaches its first submit.
 5. Unlock the physical device and keep the screen on, then re-run the Surface
    test; `adb install` now succeeds on the Xiaomi device.

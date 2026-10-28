@@ -2107,6 +2107,28 @@ int main(int argc, char **argv) {
                "\"frames\":%d,\"screenshot\":\"%s\"}\n", frames, shot);
         return 0;
     }
+    if (!strcmp(argv[2], "probe-nvn-state")) {
+        int runtime_nvn_state_selftest(const char *screenshot, int frames);
+        char shot[PATH_MAX];
+        const char *env = getenv("TOTK_ANDROID_SCREENSHOT");
+        if (env && *env) snprintf(shot, sizeof shot, "%s", env);
+        else snprintf(shot, sizeof shot, "%s/nvn-state.ppm", argv[1]);
+        const char *fs = getenv("TOTK_ANDROID_NVN_DRAW_FRAMES");
+        int frames = fs && *fs ? atoi(fs) : 2;
+        if (!getenv("TOTK_ANDROID_SHADER_CACHE")) {
+            static char cache[PATH_MAX];
+            snprintf(cache, sizeof cache, "%s/shader-cache", argv[1]);
+            setenv("TOTK_ANDROID_SHADER_CACHE", cache, 1);
+        }
+        if (!runtime_nvn_state_selftest(shot, frames)) {
+            fprintf(stderr, "[totk-nvn] NVN state selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-state\","
+               "\"frames\":%d,\"shader_cache\":\"%s\",\"screenshot\":\"%s\"}\n",
+               frames, getenv("TOTK_ANDROID_SHADER_CACHE"), shot);
+        return 0;
+    }
     if (!strcmp(argv[2], "probe-nvn-frame")) {
         int runtime_nvn_frame_selftest(const char *screenshot, int frames);
         char shot[PATH_MAX];

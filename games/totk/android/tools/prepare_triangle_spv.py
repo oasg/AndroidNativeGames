@@ -20,6 +20,10 @@ def main():
     p.add_argument('--tex-frag', type=pathlib.Path, default=pathlib.Path(__file__).with_name('triangle_tex.frag'))
     p.add_argument('--reflect-ubo-frag', type=pathlib.Path,
                    default=pathlib.Path(__file__).with_name('reflect_ubo.frag'))
+    p.add_argument('--attr-vert', type=pathlib.Path,
+                   default=pathlib.Path(__file__).with_name('triangle_attr.vert'))
+    p.add_argument('--attr-frag', type=pathlib.Path,
+                   default=pathlib.Path(__file__).with_name('triangle_attr.frag'))
     a = p.parse_args()
     host = ('darwin' if sys.platform == 'darwin' else 'linux') + '-x86_64'
     glslc = a.ndk/'shader-tools'/host/'glslc'
@@ -30,9 +34,11 @@ def main():
     vs, fs = tmp/'triangle.vert.spv', tmp/'triangle.frag.spv'
     tvs, tfs = tmp/'triangle_tex.vert.spv', tmp/'triangle_tex.frag.spv'
     ufs = tmp/'reflect_ubo.frag.spv'
+    avs, afs = tmp/'triangle_attr.vert.spv', tmp/'triangle_attr.frag.spv'
+    attrs = [('vert', a.attr_vert, avs), ('frag', a.attr_frag, afs)]
     for stage, src, dst in [('vert', a.vert, vs), ('frag', a.frag, fs),
                             ('vert', a.tex_vert, tvs), ('frag', a.tex_frag, tfs),
-                            ('frag', a.reflect_ubo_frag, ufs)]:
+                            ('frag', a.reflect_ubo_frag, ufs)] + attrs:
         subprocess.run([str(glslc), '--target-env=vulkan1.0', '-O', f'-fshader-stage={stage}',
                         str(src), '-o', str(dst)], check=True)
     def arr(name, path):
@@ -52,7 +58,9 @@ def main():
                      + arr('triangle_frag_spv', fs) + '\n'
                      + arr('triangle_tex_vert_spv', tvs) + '\n'
                      + arr('triangle_tex_frag_spv', tfs) + '\n'
-                     + arr('reflect_ubo_frag_spv', ufs) + '\n')
+                     + arr('reflect_ubo_frag_spv', ufs) + '\n'
+                     + arr('triangle_attr_vert_spv', avs) + '\n'
+                     + arr('triangle_attr_frag_spv', afs) + '\n')
     print(f'wrote {a.out} ({vs.stat().st_size}+{fs.stat().st_size}+{ufs.stat().st_size} bytes)')
 
 if __name__ == '__main__':

@@ -33,6 +33,26 @@ static uint64_t oe_desired_language(void) { return language_code(); }
 static int oe_operation_mode(void) { return handheld() ? 0 : 1; }
 static int oe_performance_mode(void) { return handheld() ? 0 : 1; }
 static int oe_focus_state(void) { return 1; }
+/* The SDK implementation calls nn::am::GetAudioController(), which this HLE
+ * does not provide (it returns null).  Report the normal unity balance; the
+ * host audio mixer has no applet volume policy yet. */
+static uint64_t oe_expected_volume_balance(float *main_volume, float *library_volume) {
+    if (main_volume) *main_volume = 1.0f;
+    if (library_volume) *library_volume = 1.0f;
+    return 0;
+}
+static uint64_t oe_set_expected_volume_balance(float main_volume, float library_volume) {
+    (void)main_volume;
+    (void)library_volume;
+    return 0;
+}
+/* The SDK implementation waits on a notification SystemEvent that the host
+ * nn::oe::Initialize does not attach.  There are no host notifications yet. */
+static int oe_try_pop_notification_message(uint32_t *message) {
+    if (message) *message = 0;
+    return 0;
+}
+static uint64_t oe_pop_notification_message(void) { return 0; }
 static int oe_focus_mode(int mode) { fprintf(stderr, "[totk-android] focus handling mode %d\n", mode); return 0; }
 static int oe_performance_config(int mode, int config) { fprintf(stderr, "[totk-android] performance configuration mode=%d config=%#x\n", mode, config); return 0; }
 static int oe_cpu_boost(int mode) { fprintf(stderr, "[totk-android] CPU boost mode %d\n", mode); return 0; }
@@ -156,6 +176,10 @@ void *runtime_override(const char *name) {
         {"_ZN2nn2oe16GetOperationModeEv", oe_operation_mode},
         {"_ZN2nn2oe18GetPerformanceModeEv", oe_performance_mode},
         {"_ZN2nn2oe20GetCurrentFocusStateEv", oe_focus_state},
+        {"_ZN2nn2oe24GetExpectedVolumeBalanceEPfS1_", oe_expected_volume_balance},
+        {"_ZN2nn2oe24SetExpectedVolumeBalanceEff", oe_set_expected_volume_balance},
+        {"_ZN2nn2oe25TryPopNotificationMessageEPj", oe_try_pop_notification_message},
+        {"_ZN2nn2oe22PopNotificationMessageEv", oe_pop_notification_message},
         {"_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE", oe_focus_mode},
         {"_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", oe_performance_config},
         {"_ZN2nn2oe15SetCpuBoostModeENS0_12CpuBoostModeE", oe_cpu_boost},
