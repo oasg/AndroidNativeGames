@@ -73,6 +73,14 @@ gate + HLE-stack thunks + a minimal SVC layer.
   and a separate Android Surface clear APK under `surface_test/` (1,620+
   frames on the arm64 emulator).  See
   `docs/android-hle-phase2b3-rendering.md`.
+- First non-clear game frame: the game's own NVN submit/draw covers 1920x1080
+  with 66,242 unique colours (boot compositor pattern, not the scene yet).
+  This required the VI vsync copy-handle fix, BAHS code-pool offset resolution,
+  retired command-buffer handles, real vertex attribute/stream state,
+  `nvnCommandBufferUpdateUniformBuffer`, inherited texture/sampler pools and
+  the NVN-to-Vulkan winding transform.  New probes:
+  `probe-nvn-cb-call`, `probe-nvn-vertex-state`.  See section 6.1 of
+  `docs/android-hle-phase2b3-rendering.md`.
 - Shader cache: `nvnProgramSetShaders`/`Ext` hash the NVN control+code pair
   with the 2B.2 key and load `<stage>/<key>.spv` + `.res.json` from
   `TOTK_ANDROID_SHADER_CACHE`.  The first submit creates the reflected

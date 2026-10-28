@@ -9,17 +9,19 @@
 | 3 | on-screen clear | done (emulator) | Surface test APK, 1,620+ frames at ~60 Hz, screenshot |
 | 4 | triangle | done | `probe-vulkan-triangle`, 60 frames, screenshot |
 | 5 | NVN program/pipeline/texture/draw | done | `probe-nvn-texture` (guest block-linear upload), `probe-totk-vs` visible TOTK VS/PS |
-| 6 | game first frame | blocked | reaches first GPU submit; stops at `main+0x7a8600` null renderer object |
+| 6 | game first frame | done (first non-clear) | game's own NVN submit/draw covers 1920x1080; 66,242 colours, `first.ppm` |
 | 7 | continuous frames | done (host) | triangle 60 frames; surface 1,620+ frames; NVN 60 draws |
 | 8 | shader cache + `nvnProgramSetShaders*` -> pipeline | done (host) | `probe-nvn-frame`: key hit, reflected pipeline, visible draw |
 | 9 | command-buffer clear/viewport/draw translation | done (first slice) | `probe-nvn-frame` center `ff4d0dff`; miss fallback `0d141fff` |
 | 10 | command-buffer resources, per-draw descriptors, vertex/index and render state | done | `probe-nvn-state`: order `0000ffff`/`ff0000ff`, texture `ff00ffff`, sampler `ffffffff`, depth `ff0000ff`/`0000ffff`, blend `807f0080`, cull `0d141fff`, attr/index `808040ff` |
 
-The game's own first frame is **not** claimed.  The renderer path is now
-independently exercisable.  The former `nn::gfx` context-registry stop was a
-`ThreadLocalRegion+0x1f0` TLS bug and is fixed; the boot now passes the UI
-layout and audio renderer, and the remaining stop is the missing boot
-`TexToGo`/`Event` resources on a texture-worker thread.
+The game's own submit/draw now covers the frame, but the **scene itself is not
+claimed**.  The first non-clear frame is a boot compositor pattern: the
+submitted quad samples the 1920x1080 `0x3f` HDR target, which the engine has
+not rendered yet.  The renderer path is independently exercisable.  The former
+`nn::gfx` context-registry stop was a `ThreadLocalRegion+0x1f0` TLS bug and is
+fixed; the boot now passes the UI layout and audio renderer, the startup
+shader pack, the first real NVN submit, and the first full-coverage draw.
 
 ## 2. Offscreen clear
 
@@ -535,6 +537,60 @@ NVN API is `nvnBufferMap`.  With only the 92-module sample cache, the startup
 draws are cache misses (clear-frame fallback), so the next input is the
 startup/title shader pack rather than another renderer feature.
 
+### 6.1 First non-clear game frame
+
+The first full-coverage frame came from five fixes that are now on `main`:
+
+1. **VI vsync handle**: `GetDisplayVsyncEvent` returned the writable end as a
+   move handle, so every `WaitSynchronization` failed or waited on 0.  It now
+   returns a **copy** of the readable end; a 60 Hz host thread signals the
+   writable end.
+2. **BAHS shader code offsets**: `NVNshaderData.data` for the first draws is an
+   offset into the shader package's code pool (`0x16300`, `0x16700`), not a host
+   pointer.  `runtime_shader_resolve_code` locates the containing BAHS record,
+   validates the declared length and resolves `pool + offset`; the two first
+   draw shaders are in the offline cache.
+3. **Retired command-buffer handles**: TOTK finalizes a 6-draw command buffer
+   and keeps using its handle through `CallCommands`.  Finalize now retires an
+   immutable snapshot (commands, bind state, program/window/pools, target
+   layout) in a handle LRU; `CallCommands`/`CopyCommands` replay it.  The new
+   `probe-nvn-cb-call` clobbers the guest CB after finalize and still executes
+   the six draws.
+4. **Real vertex state**: the `nvnVertexAttribState*`/`nvnVertexStreamState*`
+   and `nvnCommandBufferBindVertexAttribState/BindVertexStreamState` procs were
+   missing, so every layout was empty.  They now decode the packed
+   `{fmt:8,offset:19,stream:5}` and `{stride,divisor}` objects; the first draw
+   has `attrs=1 streams=1`, a real quad and u16 indices.
+5. **Uniform update and winding**: `nvnCommandBufferUpdateUniformBuffer` was
+   unimplemented, leaving the VS constant buffer all zero.  It now records the
+   payload and replays it into the guest buffer before translation; the first
+   draw binds the game's own matrix.  NVN CCW front faces are mapped to Vulkan
+   CW because NVN NDC is Y-up while the Vulkan framebuffer is Y-down.
+
+Evidence on the Adreno 830 with the split RomFS and the startup cache:
+
+```text
+program=0x340c69798 ... format=0x25 colors=1 depth=0 attrs=1 streams=1
+NVN draw #1 program=0x340c69798 window=0x332c121c0 vertices=6 reflected
+first reflected frame -> first.ppm (ok)
+```
+
+`first.ppm` is 1920x1080 with **66,242 unique colours** (not the clear colour);
+center `(128,128,127)`, corner `(128,128,128)`, and the quad covers the whole
+window.  The content is a boot compositor gradient, not the game scene.
+
+Remaining first-frame/scene work:
+
+- The submitted quad samples the `0x3f` HDR target, but the engine's HDR/source
+  pass is not submitted in this state; that pass is the next visual input.
+- The faithful NVN upper-left origin needs a negative-height viewport (or an
+  API 1.1 / `VK_KHR_maintenance1` path).  The current frame is vertically
+  mirrored; the winding fix alone does not flip the image.  The backend now
+  accepts a negative height, but the instance is still created at Vulkan 1.0,
+  so enabling the transform needs the API/extension follow-up.
+- The engine recycles the 188-command `0x31ffffa88` CB before submit; it has
+  zero draws and is a descriptor scratch buffer, not the missing scene pass.
+
 ## 7. Verification commands
 
 ```sh
@@ -551,8 +607,12 @@ totk-android <dir> probe-vulkan-reflect-ubo
 totk-android <dir> probe-nvn-texture-reflect
 totk-android <dir> probe-nvn-bind
 totk-android <dir> probe-nvn-cb-lifetime
+totk-android <dir> probe-nvn-cb-call
+totk-android <dir> probe-nvn-vertex-state
 totk-android <dir> probe-nvn-frame
 totk-android <dir> probe-nvn-state
+totk-android <dir> probe-vulkan-texture-formats
+totk-android <dir> probe-vulkan-mrt
 totk-android <dir> probe-shader-cache
 totk-android <dir> probe-spirv
 totk-android <dir> probe-nvn-submit
@@ -599,18 +659,23 @@ Expected:
 
 ## 8. Next
 
-1. Grow/stream the per-binding UBO/SSBO arena for very large or heavily
+1. Get the HDR/source pass submitted so the first frame shows game content
+   instead of the boot compositor gradient.  The current window quad samples
+   the `0x3f` target; the pass that renders it is still recorded/recycled
+   before submit in this state.
+2. Implement the NVN upper-left-origin Y transform correctly: create the
+   Vulkan instance/device at 1.1 or enable `VK_KHR_maintenance1`, then emit the
+   negative-height viewport for origin mode 1.  The current frame is
+   vertically mirrored; the winding fix does not flip the image.
+3. Grow/stream the per-binding UBO/SSBO arena for very large or heavily
    re-bound storage buffers, and add the remaining fixed state (stencil
    compare/write masks, alpha-to-coverage, logic op, MSAA).
-2. Pack the startup/title shader subset into the offline cache and run the
-   game's own `nvnProgramSetShaders*` against it.  The key/lookup/pipeline and
-   `<key>-<suffix>` variant path are in place (`probe-nvn-frame`,
-   `probe-nvn-state`); a cache miss still presents a clear frame.
-3. Add array/3D/cube/mip texture upload and generate the offline `attr`/`tex`
+4. Keep the startup/title shader cache current for the new draws; the
+   BAHS-offset resolver and `<key>-<suffix>` variants are in place
+   (`probe-nvn-frame`, `probe-nvn-state`, `probe-shader-cache`).
+5. Add array/3D/cube/mip texture upload and generate the offline `attr`/`tex`
    answer rows from the game's bound state so the variant files exist for the
-   startup shaders.
-4. Fix the null renderer object at `main+0x7a8600` after the first GPU submit
-   (`nvnQueueFenceSync`).  The lm logger, base RomFS material, `nn::oe` volume
-   and notification paths are now in place; the game reaches its first submit.
-5. Unlock the physical device and keep the screen on, then re-run the Surface
-   test; `adb install` now succeeds on the Xiaomi device.
+   scene shaders.
+6. Unlock the physical device and keep the screen on, then run the Surface
+   shell against the first game frame; `adb install` now succeeds on the
+   Xiaomi device.
