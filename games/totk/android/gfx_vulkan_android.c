@@ -4115,7 +4115,9 @@ int gfx_backend_reflected_execute_ex(GfxReflectedPipeline *p, GfxOffscreenTarget
         case GFX_CMD_SET_VIEWPORT:
             viewport = (VkViewport){ (float)c->u.rect.x, (float)c->u.rect.y,
                                      (float)c->u.rect.width, (float)c->u.rect.height, 0, 1 };
-            if (c->u.rect.width > 0 && c->u.rect.height > 0)
+            /* A negative height is the NVN upper-left-origin transform and is
+             * legal with Vulkan 1.1+ (VK_KHR_maintenance1). */
+            if (c->u.rect.width > 0 && c->u.rect.height != 0)
                 vkCmdSetViewport(cmd, 0, 1, &viewport);
             break;
         case GFX_CMD_SET_SCISSOR:
