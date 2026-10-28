@@ -29,6 +29,10 @@ int runtime_shader_identity(const void *control_v, const void *code_v,
                             RuntimeShaderIdentity *out) {
     const uint8_t *control = control_v, *code = code_v;
     if (!control || !code || !out) return 0;
+    /* A malformed NVNshaderData entry can carry a small integer where the
+     * control/code pointer belongs.  Never hash through an unmapped low
+     * address; the caller logs the entry and treats the stage as missing. */
+    if ((uintptr_t)control < 0x100000 || (uintptr_t)code < 0x100000) return 0;
 
     uint32_t declared, c1, length, stage;
     memcpy(&declared, control + 0x20, sizeof declared);

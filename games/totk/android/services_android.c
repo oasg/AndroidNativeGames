@@ -314,6 +314,37 @@ uint64_t runtime_svc(unsigned num, uint64_t *r, const char *module, uint64_t off
         fprintf(stderr, "[totk-android] SVC %#x at %s+%#llx x0=%#llx x1=%#llx x2=%#llx\n",
                 num, module, (unsigned long long)offset,
                 (unsigned long long)r[0], (unsigned long long)r[1], (unsigned long long)r[2]);
+    if (num == 0x18 && getenv("TOTK_ANDROID_TRACE_SYNC") &&
+        r[1] && *(const uint32_t *)(uintptr_t)r[1] == 0) {
+        static int shown;
+        if (shown++ < 3) {
+            fprintf(stderr, "[svc-sync] handle0 at %s+%#llx lr=%#llx fp=%#llx\n",
+                    module, (unsigned long long)offset,
+                    (unsigned long long)r[30], (unsigned long long)r[29]);
+            fprintf(stderr, "[svc-sync]   harr=%#llx lr0=%#llx fp0=%#llx\n",
+                    (unsigned long long)r[1], (unsigned long long)r[30],
+                    (unsigned long long)r[29]);
+            if (r[1]) {
+                uint64_t w[8] = { 0 };
+                memcpy(w, (const void *)(uintptr_t)(r[1] - 16), sizeof w);
+                fprintf(stderr, "[svc-sync]   harr-16: %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx\n",
+                        (unsigned long long)w[0], (unsigned long long)w[1],
+                        (unsigned long long)w[2], (unsigned long long)w[3],
+                        (unsigned long long)w[4], (unsigned long long)w[5],
+                        (unsigned long long)w[6], (unsigned long long)w[7]);
+            }
+            uint64_t fp = r[29];
+            for (int i = 0; i < 8 && fp; i++) {
+                uint64_t pair[2] = { 0, 0 };
+                memcpy(pair, (const void *)(uintptr_t)fp, sizeof pair);
+                if (!pair[0] && !pair[1]) break;
+                fprintf(stderr, "[svc-sync]   frame %d fp=%#llx lr=%#llx\n", i,
+                        (unsigned long long)pair[0], (unsigned long long)pair[1]);
+                if (pair[0] <= fp || (pair[0] & 7)) break;
+                fp = pair[0];
+            }
+        }
+    }
     if (svc_thread((int)num, r)) return r[0];
     if (runtime_ipc_svc(num, r)) return r[0];
     memory_init();

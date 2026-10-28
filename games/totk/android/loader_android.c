@@ -10,6 +10,7 @@
 #include "sha256.h"
 #include "gfx_backend_android.h"
 #include "shader_cache_android.h"
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -369,6 +370,13 @@ static void describe_address(uint64_t addr, char *out, size_t cap) {
             snprintf(out, cap, "%s+%#llx", modules[i].name, (unsigned long long)(addr - b));
             return;
         }
+    }
+    Dl_info di;
+    if (dladdr((void *)(uintptr_t)addr, &di) && di.dli_fname) {
+        const char *base = strrchr(di.dli_fname, '/');
+        snprintf(out, cap, "%s+%#llx", base ? base + 1 : di.dli_fname,
+                 (unsigned long long)(addr - (uintptr_t)di.dli_fbase));
+        return;
     }
     snprintf(out, cap, "0x%llx", (unsigned long long)addr);
 }

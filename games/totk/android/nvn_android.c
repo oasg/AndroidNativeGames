@@ -3075,6 +3075,16 @@ static uint32_t nvn_program_set_shaders(prog_t *p, int n, const void *shaders,
         p->control[i] = control;
 
         RuntimeShaderIdentity id;
+        if (data < 0x100000) {
+            uint64_t raw[6] = { 0 };
+            memcpy(raw, entry, sizeof raw);
+            fprintf(stderr, "[totk-nvn] %s low data: n=%d stride=%zu slot=%d"
+                            " raw=%#llx %#llx %#llx %#llx %#llx %#llx control=%p\n",
+                    what, n, stride, i, (unsigned long long)raw[0],
+                    (unsigned long long)raw[1], (unsigned long long)raw[2],
+                    (unsigned long long)raw[3], (unsigned long long)raw[4],
+                    (unsigned long long)raw[5], control);
+        }
         if (!runtime_shader_identity(control, (const void *)(uintptr_t)data, &id)) {
             fprintf(stderr, "[totk-nvn] %s program=%p slot=%d: no NVN shader identity"
                             " (control=%p data=%#llx)\n",

@@ -7,15 +7,42 @@
  * reply is visible as the next failure instead of a faked success. */
 #include "runtime.h"
 #include "ipc.h"
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct {
     uint64_t display;
     uint64_t next_layer;
 } ViState;
+
+/* The display vsync event is a host-owned kernel event.  The guest waits on
+ * the readable end; the writable end stays here and is signaled at 60 Hz.
+ * Returning the writable handle (the old behavior) made WaitSynchronization
+ * fail with a bad handle, and nothing ever signaled it. */
+static uint32_t g_vsync_w;
+static pthread_once_t g_vsync_once = PTHREAD_ONCE_INIT;
+
+static void *vi_vsync_thread(void *unused) {
+    (void)unused;
+    struct timespec delay = { 0, 16666667 };
+    for (;;) {
+        nanosleep(&delay, NULL);
+        if (g_vsync_w) runtime_event_signal(g_vsync_w);
+    }
+    return NULL;
+}
+static void vi_vsync_init(void) {
+    g_vsync_w = runtime_event_new();
+    pthread_t t;
+    if (pthread_create(&t, NULL, vi_vsync_thread, NULL) == 0)
+        pthread_detach(t);
+    else
+        fprintf(stderr, "[totk-vi] ERROR vsync thread creation failed\n");
+}
 
 static unsigned vi_logged;
 static int vi_trace(void) {
@@ -90,7 +117,13 @@ static void vi_application_handler(IpcSession *s, const IpcRequest *rq, IpcRespo
     case 21:                                    /* ...ForDebug */
     case 5202:
     case 5203: {
-        rs->move[rs->nmove++] = runtime_event_new();
+        pthread_once(&g_vsync_once, vi_vsync_init);
+        uint32_t hr = runtime_event_readable(g_vsync_w);
+        if (getenv("TOTK_ANDROID_TRACE_SYNC"))
+            fprintf(stderr, "[totk-vi] vsync event write=%#x read=%#x\n", g_vsync_w, hr);
+        /* GetDisplayVsyncEvent returns Out<NativeHandle>; the service keeps the
+         * event, so this is a copy handle, not a move handle. */
+        rs->copy[rs->ncopy++] = hr;
         return;
     }
     case 100:                                   /* GetRelayService */
