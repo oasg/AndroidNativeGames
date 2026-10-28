@@ -61,6 +61,20 @@ class AndroidShaderCachePacker(unittest.TestCase):
         meta = json.loads((out/'cache.json').read_text())
         self.assertEqual(meta['skipped'][0]['key'], 'system-vs-deadbeef')
 
+    def test_bind_state_variants_are_packed_next_to_the_key(self):
+        report = json.loads((self.spike/'spike-report.json').read_text())
+        report['modules'].append(dict(key='system-vs-deadbeef', nvn_key=VS_KEY,
+                                      stage='vs', variant='aff_______________'))
+        (self.spike/'spike-report.json').write_text(json.dumps(report))
+        out = self.root/'cache'
+        r = self.run_tool(out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        variant = out/'vs'/(VS_KEY+'-aff_______________.spv')
+        self.assertEqual(variant.read_bytes(), spv())
+        self.assertTrue((out/'vs'/(VS_KEY+'.spv')).is_file())
+        meta = json.loads((out/'cache.json').read_text())
+        self.assertEqual(meta['modules'], 3)
+
     def test_clean_removes_stale_entries(self):
         out = self.root/'cache'
         out.mkdir()

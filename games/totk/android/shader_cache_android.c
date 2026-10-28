@@ -195,6 +195,55 @@ int runtime_shader_cache_load(const char *root, const RuntimeShaderIdentity *id,
     return 0;
 }
 
+static int suffix_ok(const char *s) {
+    if (!s || !*s) return 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '-' || *p == '_'))
+            return 0;
+    return 1;
+}
+
+int runtime_shader_cache_load_variant(const char *root, const RuntimeShaderIdentity *id,
+                                      const char *suffix, RuntimeShaderModule *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof *out);
+    if (!id) return 0;
+    if (!root || !*root) root = runtime_shader_cache_root();
+    if (!suffix_ok(suffix)) return runtime_shader_cache_load(root, id, out);
+    const char *subdir = runtime_shader_stage_name(id->stage);
+    char name[RUNTIME_SHADER_PATH_MAX];
+    snprintf(name, sizeof name, "%s-%s.spv", id->key, suffix);
+    if (try_candidate(root, subdir, name, out)) return 1;
+    if (try_candidate(root, "", name, out)) return 1;
+    return runtime_shader_cache_load(root, id, out);
+}
+
+int runtime_shader_cache_has_variants(const char *root, const RuntimeShaderIdentity *id) {
+    if (!id) return 0;
+    if (!root || !*root) root = runtime_shader_cache_root();
+    const char *subdirs[2] = { runtime_shader_stage_name(id->stage), "" };
+    size_t klen = strlen(id->key);
+    for (unsigned k = 0; k < 2; k++) {
+        char dir[RUNTIME_SHADER_PATH_MAX];
+        if (subdirs[k][0]) snprintf(dir, sizeof dir, "%s/%s", root, subdirs[k]);
+        else snprintf(dir, sizeof dir, "%s", root);
+        DIR *d = opendir(dir);
+        if (!d) continue;
+        struct dirent *ent;
+        int found = 0;
+        while ((ent = readdir(d))) {
+            const char *n = ent->d_name;
+            size_t nlen = strlen(n);
+            if (nlen > klen + 5 && !strncmp(n, id->key, klen) && n[klen] == '-' &&
+                !strcmp(n + nlen - 4, ".spv")) { found = 1; break; }
+        }
+        closedir(d);
+        if (found) return 1;
+    }
+    return 0;
+}
+
 void runtime_shader_cache_module_free(RuntimeShaderModule *module) {
     if (!module) return;
     free(module->spv);

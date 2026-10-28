@@ -24,6 +24,8 @@ def main():
                    default=pathlib.Path(__file__).with_name('triangle_attr.vert'))
     p.add_argument('--attr-frag', type=pathlib.Path,
                    default=pathlib.Path(__file__).with_name('triangle_attr.frag'))
+    p.add_argument('--depth-vert', type=pathlib.Path,
+                   default=pathlib.Path(__file__).with_name('triangle_z.vert'))
     a = p.parse_args()
     host = ('darwin' if sys.platform == 'darwin' else 'linux') + '-x86_64'
     glslc = a.ndk/'shader-tools'/host/'glslc'
@@ -35,7 +37,9 @@ def main():
     tvs, tfs = tmp/'triangle_tex.vert.spv', tmp/'triangle_tex.frag.spv'
     ufs = tmp/'reflect_ubo.frag.spv'
     avs, afs = tmp/'triangle_attr.vert.spv', tmp/'triangle_attr.frag.spv'
-    attrs = [('vert', a.attr_vert, avs), ('frag', a.attr_frag, afs)]
+    dvs = tmp/'triangle_z.vert.spv'
+    attrs = [('vert', a.attr_vert, avs), ('frag', a.attr_frag, afs),
+             ('vert', a.depth_vert, dvs)]
     for stage, src, dst in [('vert', a.vert, vs), ('frag', a.frag, fs),
                             ('vert', a.tex_vert, tvs), ('frag', a.tex_frag, tfs),
                             ('frag', a.reflect_ubo_frag, ufs)] + attrs:
@@ -60,7 +64,8 @@ def main():
                      + arr('triangle_tex_frag_spv', tfs) + '\n'
                      + arr('reflect_ubo_frag_spv', ufs) + '\n'
                      + arr('triangle_attr_vert_spv', avs) + '\n'
-                     + arr('triangle_attr_frag_spv', afs) + '\n')
+                     + arr('triangle_attr_frag_spv', afs) + '\n'
+                     + arr('triangle_z_vert_spv', dvs) + '\n')
     print(f'wrote {a.out} ({vs.stat().st_size}+{fs.stat().st_size}+{ufs.stat().st_size} bytes)')
 
 if __name__ == '__main__':

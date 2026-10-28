@@ -93,6 +93,10 @@ def main():
                    help='first N shaders per package (default 2); use --all for every shader')
     p.add_argument('--all', action='store_true')
     p.add_argument('--keep-code', action='store_true', help='keep the sliced Maxwell code files')
+    p.add_argument('--answers', type=pathlib.Path,
+                   help='JSON list of bind-state answer sets; each row may carry name, attr, tex, img, fout')
+    p.add_argument('--keys', type=pathlib.Path,
+                   help='file with one NVN shader key per line; translate only those keys')
     a = p.parse_args()
 
     if not a.romfs.is_dir():
@@ -111,6 +115,42 @@ def main():
         return (a.romfs/name).read_bytes()
 
     decode = decoder(a.romfs, read)
+    wanted = None
+    if a.keys:
+        wanted = {line.strip() for line in a.keys.read_text().splitlines() if line.strip()}
+        if not wanted:
+            raise SystemExit(f'{a.keys}: no keys')
+    answer_rows = []
+    if a.answers:
+        raw = json.loads(a.answers.read_text())
+        if not isinstance(raw, list) or not raw:
+            raise SystemExit(f'{a.answers}: expected a non-empty JSON list')
+        answer_rows = raw
+
+    def answer_suffix(ans):
+        """The suffix the Android runtime derives from the same bind state."""
+        names = {'1d': '1d', '2d': '2d', '3d': '3d', '1darray': '1da',
+                 '2darray': '2da', '2dms': '2dms', '2dmsarray': '2dmsa',
+                 'cube': 'cube', 'cubearray': 'cubearr', 'buffer': 'buf'}
+        attr = ans.get('attr') or {}
+        chars, any_attr = [], False
+        for i in range(16):
+            v = attr.get(str(i))
+            c = {'uint': 'u', 'sint': 's', 'float': 'f'}.get(v, '_')
+            chars.append(c)
+            any_attr = any_attr or c != '_'
+        out = ('a' + ''.join(chars)) if any_attr else ''
+        tex = ans.get('tex') or {}
+        parts = []
+        for k in sorted(tex, key=lambda x: int(x)):
+            t = tex[k]
+            depth = t.endswith('_depth')
+            base = t[:-6] if depth else t
+            parts.append(f"t{k}_{names.get(base, base)}{'d' if depth else ''}")
+        if parts:
+            out += ('-' if out else '') + '-'.join(parts)
+        return out
+
     jobs = []
     meta = {}
     used_names = set()
@@ -121,7 +161,10 @@ def main():
         data = decode(read(package))
         print(f'scan {package}: {len(data)} bytes ({data[:4]!r})')
         selected = 0
-        for key, stage, control, code, at in package_shaders(data, None if a.all else a.limit_per_file):
+        per_file = None if (a.all or wanted) else a.limit_per_file
+        for key, stage, control, code, at in package_shaders(data, per_file):
+            if wanted is not None and key not in wanted:
+                continue
             if stage not in ('vs', 'ps', 'cs'):
                 continue
             # Keep the spike focused on draw shaders; compute needs thread-group answers.
@@ -142,11 +185,24 @@ def main():
             job = dict(key=stem, stage=stage, code=str(code_path), c1=code[c1:length].hex(),
                        depth_minus_w=True, debug=False, reduced=True,
                        tex={}, img={}, attr={}, fout={})
-            jobs.append(job)
-            meta[stem] = dict(source=package, key=key, stage=stage, control_bytes=len(control),
-                              code_bytes=length, c1_hex=c1, source_offset=at)
+            base_meta = dict(source=package, key=key, stage=stage, control_bytes=len(control),
+                             code_bytes=length, c1_hex=c1, source_offset=at)
+            if answer_rows:
+                for ans in answer_rows:
+                    suffix = ans.get('name') or answer_suffix(ans)
+                    if not suffix:
+                        continue
+                    vstem = f'{stem}--{suffix}'
+                    vjob = dict(job, key=vstem,
+                                tex=ans.get('tex') or {}, img=ans.get('img') or {},
+                                attr=ans.get('attr') or {}, fout=ans.get('fout') or {})
+                    jobs.append(vjob)
+                    meta[vstem] = dict(base_meta, stem=stem, variant=suffix)
+            else:
+                jobs.append(job)
+                meta[stem] = base_meta
             selected += 1
-            if not a.all and selected >= a.limit_per_file:
+            if not a.all and not wanted and selected >= a.limit_per_file:
                 break
         print(f'  selected {selected}')
 
@@ -177,6 +233,7 @@ def main():
         words = struct.unpack_from('<5I', b)
         report['translated'] += 1
         report['modules'].append(dict(key=stem, stage=m['stage'], nvn_key=m['key'],
+                                      variant=m.get('variant', ''), stem=m.get('stem', stem),
                                       bytes=len(b), words=words[1],
                                       version=f'{words[1] >> 16}.{(words[1] >> 8) & 0xff}',
                                       sha256=hashlib.sha256(b).hexdigest(),
@@ -186,8 +243,8 @@ def main():
     report['bytes_avg'] = report['bytes_total']//max(1, report['translated'])
     (a.out/'spike-report.json').write_text(json.dumps(report, indent=2)+'\n')
     (a.out/'spike-report.tsv').write_text(
-        'key\tstage\tnvn_key\tbytes\tversion\tsha256\n' +
-        ''.join(f"{x['key']}\t{x['stage']}\t{x['nvn_key']}\t{x['bytes']}\t{x['version']}\t{x['sha256']}\n"
+        'key\tstage\tnvn_key\tvariant\tbytes\tversion\tsha256\n' +
+        ''.join(f"{x['key']}\t{x['stage']}\t{x['nvn_key']}\t{x['variant']}\t{x['bytes']}\t{x['version']}\t{x['sha256']}\n"
                 for x in report['modules']))
     if not a.keep_code:
         shutil.rmtree(code_dir, ignore_errors=True)

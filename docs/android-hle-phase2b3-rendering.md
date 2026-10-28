@@ -13,7 +13,7 @@
 | 7 | continuous frames | done (host) | triangle 60 frames; surface 1,620+ frames; NVN 60 draws |
 | 8 | shader cache + `nvnProgramSetShaders*` -> pipeline | done (host) | `probe-nvn-frame`: key hit, reflected pipeline, visible draw |
 | 9 | command-buffer clear/viewport/draw translation | done (first slice) | `probe-nvn-frame` center `ff4d0dff`; miss fallback `0d141fff` |
-| 10 | command-buffer resource + vertex/index translation | done (first slice) | `probe-nvn-state`: UBO `4080bfff`, texture `808080ff`, attr/index `808040ff` |
+| 10 | command-buffer resources, per-draw descriptors, vertex/index and render state | done | `probe-nvn-state`: order `0000ffff`/`ff0000ff`, texture `ff00ffff`, sampler `ffffffff`, depth `ff0000ff`/`0000ffff`, blend `807f0080`, cull `0d141fff`, attr/index `808040ff` |
 
 The game's own first frame is **not** claimed.  The renderer path is now
 independently exercisable.  The former `nn::gfx` context-registry stop was a
@@ -390,52 +390,76 @@ offscreen 1920x1080 RGBA8 host window so the cached pipeline has a target.
 Descriptor/resource binds are translated after the clear/viewport/draw slice,
 in the order the guest records them.
 
-### Resource and vertex/index translation
+### Resource, vertex/index and per-draw state translation
 
-The next slice is in place:
+Command-buffer translation now covers the resources and state a real draw
+needs:
 
-- `nvnCommandBufferBindUniformBuffer(s)` and
-  `nvnCommandBufferBindStorageBuffer(s)` store the last address/size per NVN
-  stage/slot.  At submit, the reflected pipeline maps the NVN slot through
-  `.res.json` (`nvn_slot`) and writes the guest memory into the real UBO/SSBO.
+- `nvnCommandBufferBindUniformBuffer(s)` / `BindStorageBuffer(s)` record every
+  bind in command order.  At submit, each bind gets a descriptor **epoch**:
+  UBO/SSBO data is written into a per-binding host arena and selected with a
+  Vulkan dynamic offset, and a new descriptor-set pair is written for the
+  epoch.  Two draws in one command buffer therefore see different constants.
 - `nvnCommandBufferBindTexture(s)` resolves the combined handle through the
-  texture pool, uploads the guest block-linear texture and writes the real
-  image/sampler descriptor.
-- `nvnCommandBufferBindVertexBuffer(s)` stores the guest address range;
+  texture pool and the sampler pool.  The texture is uploaded lazily (guest
+  block-linear -> linear) and the combined descriptor uses the sampler entry
+  encoded in the handle, not the texture's creation-time default.
+- `nvnCommandBufferBindVertexBuffer(s)` stores the guest range;
   `BindVertexAttribState`/`BindVertexStreamState` decode
   `{fmt:8, offset:19, stream:5}` and `{stride, divisor}` into a Vulkan vertex
-  layout.  The pipeline is recreated when the layout changes.
-- `nvnCommandBufferDrawElements`/`DrawElementsBaseVertex` translate to
+  layout.  The pipeline is keyed by a vertex-layout signature.
+- `DrawElements` / `DrawElementsBaseVertex` become
   `vkCmdBindIndexBuffer` + `vkCmdDrawIndexed`; u8 indices are widened to u16.
+- Blend/color/channel-mask/polygon/depth-stencil/multisample state objects and
+  their `Bind*State` command variants are decoded per draw.  The backend keeps
+  a graphics-pipeline variant per unique render-state hash, so blend/depth/cull
+  changes between draws do not leak.  The window/offscreen target now owns a
+  D24S8 (or D32F) depth image, the render pass has a depth/stencil attachment,
+  and `ClearDepthStencil` is translated.
+- A shader-cache entry can be stored as `<key>-<suffix>.spv`.  The runtime
+  derives the suffix from the bound vertex format classes (`a f/u/s/_`) and
+  texture targets (`.res.json` slots, `t<slot>_<target>[d]`) and loads the
+  matching variant; `shader_spike.py --answers` and
+  `prepare_shader_cache.py` can produce/pack those variants.
 
-`probe-nvn-state` covers all three paths without game data:
+`probe-nvn-state` covers these paths without game data:
 
 ```text
 [totk-nvn] state probe ubo     center=4080bfff ok=1
-[totk-nvn] state probe texture center=808080ff ok=1
+[totk-nvn] state probe orderL  center=0000ffff ok=1
+[totk-nvn] state probe orderR  center=ff0000ff ok=1
+[totk-nvn] state probe texture center=ff00ffff ok=1
+[totk-nvn] state probe sampler center=ffffffff ok=1
+[totk-nvn] state probe depth   center=ff0000ff ok=1
+[totk-nvn] state probe depthN  center=0000ffff ok=1
+[totk-nvn] state probe blend   center=807f0080 ok=1
+[totk-nvn] state probe cull    center=0d141fff ok=1
 [totk-nvn] state probe attr    center=808040ff ok=1
 [totk-nvn] state selftest PASS
 {"status":"pass","probe":"nvn-state"}
 ```
 
-The UBO path binds `(0.25, 0.5, 0.75, 1.0)`; the texture path binds a guest
-2x2 checker; the attr path uses an interleaved `{pos.xy, uv.xy}` vertex stream
-with two `R32G32_SFLOAT` attributes and a u16 index buffer.
+The `order` pair binds red, draws, binds blue and draws again in one command
+buffer: the right half stays red and the left half is blue, which proves the
+per-draw UBO epoch.  The texture probe uses solid magenta (the default checker
+would hide a failed bind); the sampler probe binds a NEAREST sampler in the
+sampler pool and gets a corner texel instead of a linear blend.  The depth pair
+draws z=0.5 then z=0.75 (red survives) and z=0.5 then z=0.25 (blue wins); the
+blend probe gets `(0.5,0.5,0,1)`; the cull probe uses back-face culling.
 
-Limits of this slice:
+Remaining limits:
 
-- descriptor state is **last-write-wins per submit**; a command buffer that
-  changes a UBO/texture between draws needs per-draw descriptor sets (the next
-  step);
-- a combined texture handle currently uses the texture's default sampler, not
-  the sampler-pool entry encoded in the handle;
-- guest UBO/SSBO ranges larger than the host allocation (64 KiB UBO, 4 KiB
-  SSBO) are copied up to the allocation and logged as truncated;
-- attributes whose NVN stream has no bound stride are dropped instead of
-  producing an invalid pipeline;
-- offline shaders must be translated with the matching `attr`/`tex` bind-state
-  answers for the SPIR-V input types to match the guest data;
-- depth/stencil targets and blend/raster state are still fixed.
+- the per-binding UBO/SSBO arena is capped at 64 MiB; very large or very
+  frequently changing storage buffers fall back to the previous epoch;
+- the depth/stencil attachment is cleared at each submit; guest depth/stencil
+  contents are not uploaded or preserved across command buffers;
+- stencil compare/write masks are fixed at `0xff`, stencil front/back use the
+  same reference, logic-op/alpha-to-coverage are not implemented, and MSAA is
+  fixed at one sample;
+- array/3D/cube texture upload still only handles the level-0 2D RGBA8 path;
+- the offline variant files still need real `attr`/`tex` answer rows from the
+  game's bound state; the runtime falls back to the canonical `<key>.spv` when
+  a variant is absent.
 
 ## 6. Game first frame
 
@@ -497,8 +521,19 @@ At `main+0x7a8600` the renderer object's first qword is null before the
 `+0x150` virtual call.  This is after the first submit, not a log-manager or
 base-RomFS stop.  The 56 remaining "not found" paths are update-only/optional
 and none exist in base v0.  TLS remains valid and the Vulkan/NVN probes still
-pass.  The earlier non-fatal
-`nvnMemoryPoolMap: pool is CPU_NO_ACCESS` remains a separate pool-flag item.
+pass.  `nvnMemoryPoolMap` now returns the host mapping for CPU_NO_ACCESS
+pools; the HLE needs CPU access for shader/vertex/index translation even when
+the guest contract marks the pool GPU-only.
+
+The 5.5 GiB RomFS content is nested under
+`.../romfs-min/totk-romfs-min`; pointing `TOTK_ANDROID_ROMFS` at that directory
+passes the `SpStepRateConfig` stop.  The boot then loads the startup shader
+set, reaches the first real NVN submit (`[totk-nvn] GPU submit #1`) and stops
+at `main+0x1158830` (caller `main+0x119cc3c`) with `fault=0x20` and `x0=0`:
+a guest list insert stores through the result of a null allocation.  The last
+NVN API is `nvnBufferMap`.  With only the 92-module sample cache, the startup
+draws are cache misses (clear-frame fallback), so the next input is the
+startup/title shader pack rather than another renderer feature.
 
 ## 7. Verification commands
 
@@ -553,9 +588,10 @@ Expected:
 - `probe-nvn-frame`: writes two synthetic NVN shader keys, hits the offline
   cache, creates the reflected pipeline and translates
   clear/viewport/scissor/draw; center `ff4d0dff`, corner `0d141fff`.
-- `probe-nvn-state`: binds a UBO, a guest texture and an indexed vertex stream
-  through the NVN command buffer; centers `4080bfff`, `808080ff`,
-  `808040ff`.
+- `probe-nvn-state`: per-draw UBO epochs, a guest texture, sampler-pool
+  selection, depth test (two frames), blend, back-face culling and an indexed
+  attribute stream through the NVN command buffer; see the center values in the
+  table above.
 - `probe-shader-cache`: every packed `<stage>/<key>.spv` is accepted by
   `vkCreateShaderModule` and its `.res.json` is present.
 - `probe-spirv`: all cached SPIR-V modules accepted by the driver.
@@ -563,18 +599,16 @@ Expected:
 
 ## 8. Next
 
-1. Move descriptor binds to per-draw state: a command buffer that changes a
-   UBO/texture between draws needs separate descriptor sets (or dynamic
-   offsets), and combined handles should use the sampler-pool entry instead of
-   the texture's default sampler.  The current slice is last-write-wins per
-   submit (`probe-nvn-state`).
+1. Grow/stream the per-binding UBO/SSBO arena for very large or heavily
+   re-bound storage buffers, and add the remaining fixed state (stencil
+   compare/write masks, alpha-to-coverage, logic op, MSAA).
 2. Pack the startup/title shader subset into the offline cache and run the
-   game's own `nvnProgramSetShaders*` against it.  The key/lookup/pipeline path
-   is in place (`probe-nvn-frame`); a cache miss still presents a clear frame.
-3. Translate the remaining render state (depth/stencil targets, blend,
-   rasterization) and pack shaders with the matching `attr`/`tex` bind-state
-   answers.  Vertex streams/attributes, indexed draws and the real cbuf/texture
-   binds are in place (`probe-nvn-state`).
+   game's own `nvnProgramSetShaders*` against it.  The key/lookup/pipeline and
+   `<key>-<suffix>` variant path are in place (`probe-nvn-frame`,
+   `probe-nvn-state`); a cache miss still presents a clear frame.
+3. Add array/3D/cube/mip texture upload and generate the offline `attr`/`tex`
+   answer rows from the game's bound state so the variant files exist for the
+   startup shaders.
 4. Fix the null renderer object at `main+0x7a8600` after the first GPU submit
    (`nvnQueueFenceSync`).  The lm logger, base RomFS material, `nn::oe` volume
    and notification paths are now in place; the game reaches its first submit.

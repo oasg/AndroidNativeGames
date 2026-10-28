@@ -80,12 +80,18 @@ gate + HLE-stack thunks + a minimal SVC layer.
   `tools/prepare_shader_cache.py` packs the offline spike output into that
   layout, and `probe-nvn-frame` covers cache hit, pipeline creation,
   clear/viewport/scissor/draw translation and the miss fallback.
-- Command-buffer resources: UBO/SSBO and texture binds are applied through the
-  NVN stage/slot (`nvn_slot` in `.res.json`), guest vertex buffers/attributes
-  become a Vulkan vertex layout, and `DrawElements` becomes
-  `vkCmdDrawIndexed` (u8 widened to u16).  `probe-nvn-state` binds a UBO
-  (`4080bfff`), a guest checker texture (`808080ff`) and an indexed
-  `{pos,uv}` vertex stream (`808040ff`).
+- Command-buffer resources and state: UBO/SSBO and texture binds are applied
+  through the NVN stage/slot (`nvn_slot` in `.res.json`) using per-draw
+  descriptor epochs (dynamic offsets for UBO/SSBO), combined handles use the
+  sampler-pool entry, guest vertex buffers/attributes become a Vulkan vertex
+  layout, `DrawElements` becomes `vkCmdDrawIndexed` (u8 widened to u16), and
+  blend/color/channel-mask/polygon/depth-stencil state produces per-draw
+  pipeline variants against a depth/stencil render target.  `probe-nvn-state`
+  checks two UBO epochs in one command buffer, a magenta guest texture, a
+  NEAREST sampler-pool sampler, depth-test accept/reject, blend, culling and an
+  indexed `{pos,uv}` stream.  Shader-cache entries may be stored as
+  `<key>-<attr/tex suffix>.spv`; `shader_spike.py --answers` and
+  `prepare_shader_cache.py` produce and pack those bind-state variants.
 - `nn::hid::InitializeNpad` is a host no-pad backend for now (zero Npad/6-axis
   state, vibration stub). Keyboard/mouse/touch/debug-pad/gesture initialization
   are host no-device initializers too, because the HID shared-memory service is
@@ -221,12 +227,15 @@ List any remaining misses with:
 adb shell 'cd /data/local/tmp/totk-android && \
   TOTK_ANDROID_INITS=1 TOTK_ANDROID_RUN_NNMAIN=1 \
   TOTK_ANDROID_FS_TRACE=1 \
-  TOTK_ANDROID_ROMFS=/data/local/tmp/totk-android/romfs-min \
+  TOTK_ANDROID_ROMFS=/data/local/tmp/totk-android/romfs-min/totk-romfs-min \
   ./totk-android /data/local/tmp/totk-android boot-sdk' 2>&1 | grep 'not found'
 ```
 
-Add the missing assets (or use the full RomFS) before treating the next crash
-as a renderer/HL issue.
+On the current device the full 5.5 GiB RomFS content is nested under
+`romfs-min/totk-romfs-min`; point `TOTK_ANDROID_ROMFS` at that directory (the
+top-level `romfs-min` is only the older partial overlay).  Add any missing
+assets (or use the full RomFS) before treating the next crash as a
+renderer/HLE issue.
 
 ### Android audio and time
 

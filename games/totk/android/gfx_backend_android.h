@@ -14,6 +14,23 @@
 
 typedef struct GfxOffscreenTarget GfxOffscreenTarget;
 typedef struct GfxTexture GfxTexture;
+typedef struct GfxSampler GfxSampler;
+
+/* NVN sampler parameters -> a cached Vulkan sampler.  This is what makes a
+ * combined texture handle use the sampler-pool entry encoded in the handle
+ * instead of the texture's creation-time default. */
+typedef struct {
+    uint32_t min_filter;      /* NVNminFilter */
+    uint32_t mag_filter;      /* NVNmagFilter */
+    uint32_t wrap_s, wrap_t, wrap_r;
+    uint32_t compare_enable;
+    uint32_t compare_op;
+    uint32_t reduction_filter;
+    float lod_min, lod_max, lod_bias, max_anisotropy;
+    float border[4];
+} GfxSamplerDesc;
+GfxSampler *gfx_backend_sampler_create(const GfxSamplerDesc *desc);
+void gfx_backend_sampler_destroy(GfxSampler *sampler);
 
 /* Backend availability is explicit: a failed Vulkan path never reports a fake
  * success.  `gfx_backend_vulkan_init` is idempotent and thread-safe. */
@@ -70,6 +87,8 @@ void gfx_backend_builtin_ubo_modules(const uint8_t **vs, size_t *vs_size,
                                      const uint8_t **ps, size_t *ps_size);
 void gfx_backend_builtin_attr_modules(const uint8_t **vs, size_t *vs_size,
                                       const uint8_t **ps, size_t *ps_size);
+void gfx_backend_builtin_depth_modules(const uint8_t **vs, size_t *vs_size,
+                                       const uint8_t **ps, size_t *ps_size);
 
 typedef struct { uint32_t binding; uint32_t size; } GfxUboBinding;
 GfxTrianglePipeline *gfx_backend_triangle_pipeline_create_ubo(const uint8_t *vs, size_t vs_size,
@@ -138,6 +157,27 @@ typedef struct {
     GfxVertexAttribute attributes[16];
 } GfxVertexLayout;
 
+/* Render state captured at draw time.  Values are Vulkan enums where they map
+ * directly (cull/front/polygon/depth/stencil/blend factors) and NVN enums are
+ * converted by the backend.  The backend caches a graphics-pipeline variant
+ * per unique state. */
+typedef struct {
+    uint32_t blend_enable;      /* bit 0 = colour target 0 */
+    uint32_t blend_src_rgb, blend_dst_rgb, blend_src_a, blend_dst_a;
+    uint32_t blend_eq_rgb, blend_eq_a;
+    uint32_t color_write_mask;  /* 4 bits */
+    uint32_t depth_test, depth_write, depth_func;
+    uint32_t stencil_test;
+    uint32_t stencil_func_front, stencil_func_back;
+    uint32_t stencil_fail_front, stencil_zfail_front, stencil_pass_front;
+    uint32_t stencil_fail_back, stencil_zfail_back, stencil_pass_back;
+    uint32_t cull_mode;
+    uint32_t front_face;
+    uint32_t polygon_mode;
+    uint32_t stencil_ref;
+    float blend_color[4];
+} GfxPipelineState;
+
 /* Offline reflection helpers shared by the probes and the NVN program bridge.
  * They are implemented in loader_android.c; `json_path` is the .res.json and
  * `spv_path` the translated module.  SPIR-V wins for descriptor type/count. */
@@ -171,20 +211,38 @@ typedef enum {
     GFX_CMD_CLEAR_COLOR = 1,
     GFX_CMD_SET_VIEWPORT,
     GFX_CMD_SET_SCISSOR,
+    GFX_CMD_BIND_DESC,
+    GFX_CMD_CLEAR_DEPTH_STENCIL,
     GFX_CMD_DRAW,
     GFX_CMD_DRAW_INDEXED
 } GfxCmdKind;
+
+typedef enum {
+    GFX_DESC_UBO = 0,
+    GFX_DESC_SSBO,
+    GFX_DESC_TEXTURE
+} GfxDescKind;
 
 typedef struct {
     uint32_t kind;
     union {
         struct { float rgba[4]; uint32_t mask; } clear;
+        struct { float depth; uint32_t dmask; int stencil; uint32_t smask; } clear_depth;
         struct { int32_t x, y, width, height; } rect;
-        struct { uint32_t primitive, first, count; } draw;
+        struct {
+            uint32_t stage, kind, slot;
+            const void *data;
+            size_t size;
+            const GfxTexture *texture;
+            const GfxSampler *sampler;
+        } bind;
+        struct { uint32_t primitive, first, count; GfxPipelineState state; uint32_t has_state; } draw;
         struct {
             uint32_t primitive, count, index_type, base_vertex;
             const void *indices;
             size_t index_size;
+            GfxPipelineState state;
+            uint32_t has_state;
         } draw_indexed;
     } u;
 } GfxCmd;

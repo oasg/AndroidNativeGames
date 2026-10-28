@@ -69,23 +69,30 @@ def main():
         if len(key) != 64 or any(c not in '0123456789abcdef' for c in key):
             skipped.append((stem, 'invalid nvn key'))
             continue
-        if key in seen:
-            skipped.append((stem, 'duplicate nvn key'))
+        variant = m.get('variant') or ''
+        if variant and any(c not in '-_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+                           for c in variant):
+            skipped.append((stem, 'invalid variant suffix'))
+            continue
+        row_key = (key, variant)
+        if row_key in seen:
+            skipped.append((stem, 'duplicate nvn key/variant'))
             continue
         src_spv = a.spike/'out'/(stem+'.spv')
         err = validity(src_spv)
         if err:
             skipped.append((stem, err))
             continue
-        seen.add(key)
+        seen.add(row_key)
         dst = out/stage
         dst.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src_spv, dst/(key+'.spv'))
+        name = key + (f'-{variant}' if variant else '')
+        shutil.copyfile(src_spv, dst/(name+'.spv'))
         res = a.spike/'out'/(stem+'.res.json')
         if res.is_file():
-            shutil.copyfile(res, dst/(key+'.res.json'))
-        written.append(dict(key=stem, nvn_key=key, stage=stage,
-                            spv=(dst/(key+'.spv')).stat().st_size,
+            shutil.copyfile(res, dst/(name+'.res.json'))
+        written.append(dict(key=stem, nvn_key=key, variant=variant, stage=stage,
+                            spv=(dst/(name+'.spv')).stat().st_size,
                             reflection=res.is_file()))
     (out/'cache.json').write_text(json.dumps(dict(
         schema=1, source=str(report_path), spike=str(a.spike),

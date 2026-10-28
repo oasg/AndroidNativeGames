@@ -19,6 +19,8 @@
 #include <string.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <time.h>
 #include "gfx_backend_android.h"
 #include "shader_cache_android.h"
@@ -123,16 +125,65 @@ enum {
     NVN_CMD_SET_VIEWPORT,
     NVN_CMD_SET_SCISSOR,
     NVN_CMD_SET_RENDER_TARGETS,
+    NVN_CMD_BIND_DESC,
+    NVN_CMD_BIND_STATE,
     NVN_CMD_DRAW,
     NVN_CMD_DRAW_INDEXED,
 };
+
+/* Packed NVN state objects (same layout as the macOS NVN layer). */
+typedef struct { uint32_t blend_en : 8, logic_op : 4, alpha_func : 4; } nvn_color_st;
+typedef struct { uint32_t mask; } nvn_chmask_st;
+typedef struct {
+    uint64_t target : 3, src_rgb : 7, dst_rgb : 7, src_a : 7, dst_a : 7,
+             eq_rgb : 3, eq_a : 3;
+} nvn_blend_st;
+typedef struct {
+    uint8_t enable, samples, a2c, a2c_dither, raster_samples,
+            cov_mod, cov2color_en, cov2color_out, sl_en, sl_grid;
+} nvn_ms_st;
+typedef struct { uint32_t cull : 2, front : 1, mode : 2, offset_en : 3; } nvn_poly_st;
+typedef struct {
+    uint64_t dt : 1, dw : 1, df : 4, st : 1, sf_f : 4, sf_b : 4,
+             fail_f : 4, zfail_f : 4, zpass_f : 4,
+             fail_b : 4, zfail_b : 4, zpass_b : 4;
+} nvn_ds_st;
+
+typedef struct {
+    nvn_blend_st blend;
+    nvn_color_st color;
+    nvn_chmask_st chmask;
+    nvn_ms_st ms;
+    nvn_poly_st poly;
+    nvn_ds_st ds;
+    float blend_color[4];
+    int stencil_ref;
+    int stencil_mask;
+    int stencil_value_mask;
+} nvn_render_state_t;
+
+static void nvn_render_state_defaults(nvn_render_state_t *r) {
+    memset(r, 0, sizeof *r);
+    r->blend = (nvn_blend_st){ 0, 2, 1, 2, 1, 1, 1 };  /* ONE/ZERO, ADD */
+    r->color = (nvn_color_st){ 0, 3, 8 };               /* COPY, ALWAYS */
+    r->chmask.mask = 0xffffffffu;
+    r->ms = (nvn_ms_st){ .enable = 1, .samples = 1 };
+    r->poly = (nvn_poly_st){ .cull = 0, .front = 1, .mode = 2 };
+    r->ds = (nvn_ds_st){ .dt = 0, .dw = 1, .df = 2, .st = 0,
+                         .sf_f = 8, .sf_b = 8,
+                         .fail_f = 1, .zfail_f = 1, .zpass_f = 1,
+                         .fail_b = 1, .zfail_b = 1, .zpass_b = 1 };
+}
 
 typedef struct {
     uint32_t kind;
     union {
         struct { float rgba[4]; int index; uint32_t mask; } clear;
+        struct { float depth; uint32_t dmask; int stencil; uint32_t smask; } clear_ds;
         struct { int32_t x, y, width, height; } rect;
         struct { int count; void *rt0; } targets;
+        struct { uint32_t stage, kind, slot; uint64_t address; size_t size; uint64_t handle; } desc;
+        struct { nvn_render_state_t rs; } state;
         struct { uint32_t primitive, first, count, instances, base_instance; } draw;
         struct { uint32_t primitive, count, index_type, base_vertex; uint64_t indices; } draw_indexed;
     } u;
@@ -150,6 +201,8 @@ typedef struct {
     uint64_t vs[16];
     struct { uint64_t address; size_t size; } vb[16];
     uint32_t va_mask, vs_mask, vb_mask;
+    nvn_render_state_t rs;
+    const void *depth_tex;
 } nvn_bind_state_t;
 
 static const char *g_last_api = "none";
@@ -302,7 +355,6 @@ typedef struct {
 typedef struct { const tex_t *tex; void *gfx; } tex_bridge_t;
 static tex_bridge_t g_tex_bridges[64];
 static unsigned g_tex_bridge_count;
-
 typedef struct {
     uint8_t minf, magf, ws, wt, wr, cmp_mode, cmp_func, reduction;
     float lod_min, lod_max, lod_bias, aniso, border[4], lod_snap;
@@ -310,6 +362,9 @@ typedef struct {
 
 typedef struct { void *dev; samp_par p; } samp_builder_t;
 typedef struct { uint32_t magic; samp_par p; } samp_t;
+typedef struct { const samp_t *samp; GfxSampler *gfx; } samp_bridge_t;
+static samp_bridge_t g_samp_bridges[64];
+static unsigned g_samp_bridge_count;
 typedef struct { uint32_t magic, n; pool_t *pool; int64_t off; } samp_pool_t;
 
 /* NVN texture/sampler pool registrations.  The pool objects themselves are
@@ -975,8 +1030,13 @@ static void *nvnMemoryPoolMap(const pool_t *p) { nvn_api("nvnMemoryPoolMap");
         return NULL;
     }
     if (p->flags & NVN_POOL_CPU_NO_ACCESS) {
-        nvn_fail("nvnMemoryPoolMap", "pool is CPU_NO_ACCESS");
-        return NULL;
+        /* NVN marks this pool CPU_NO_ACCESS for the guest, but the HLE keeps
+         * all GPU resources in host memory and needs the mapping for shader,
+         * vertex and index translation.  Return it; the guest cannot tell. */
+        if (nvn_trace())
+            fprintf(stderr, "[totk-nvn] MemoryPoolMap CPU_NO_ACCESS pool=%p -> host mapping %p\n",
+                    (const void *)p, (void *)p->mem);
+        return p->mem;
     }
     return p->mem;
 }
@@ -1263,6 +1323,39 @@ static void *nvn_texture_gfx(const tex_t *t) {
     return NULL;
 }
 
+/* First bind uploads the guest block-linear texture.  The macOS runtime does
+ * the equivalent on texture creation; the Android path keeps the guest storage
+ * as the source of truth and uploads lazily. */
+static GfxTexture *nvn_texture_gfx_ready(const tex_t *t) {
+    GfxTexture *g = nvn_texture_gfx(t);
+    if (g) return g;
+    if (!t || t->magic != NVN_MAGIC('T', 'E', 'X', 0)) return NULL;
+    if (!runtime_nvn_texture_upload_guest((void *)t)) return NULL;
+    return nvn_texture_gfx(t);
+}
+
+static GfxSampler *nvn_sampler_gfx(const samp_t *s) {
+    if (!s || s->magic != NVN_MAGIC('S', 'A', 'M', 'P')) return NULL;
+    for (unsigned i = 0; i < g_samp_bridge_count; i++)
+        if (g_samp_bridges[i].samp == s) return g_samp_bridges[i].gfx;
+    GfxSamplerDesc d = {
+        .min_filter = s->p.minf, .mag_filter = s->p.magf,
+        .wrap_s = s->p.ws, .wrap_t = s->p.wt, .wrap_r = s->p.wr,
+        .compare_enable = s->p.cmp_mode == 1, .compare_op = s->p.cmp_func,
+        .lod_min = s->p.lod_min, .lod_max = s->p.lod_max, .lod_bias = s->p.lod_bias,
+        .max_anisotropy = s->p.aniso,
+    };
+    GfxSampler *g = gfx_backend_sampler_create(&d);
+    if (!g) return NULL;
+    if (g_samp_bridge_count < sizeof g_samp_bridges / sizeof g_samp_bridges[0]) {
+        g_samp_bridges[g_samp_bridge_count++] = (samp_bridge_t){ s, g };
+    } else {
+        gfx_backend_sampler_destroy(g);
+        return NULL;
+    }
+    return g;
+}
+
 static void nvnTextureFinalize(tex_t *t) {
     if (!t) return;
     for (unsigned i = 0; i < g_tex_bridge_count; i++) {
@@ -1489,7 +1582,16 @@ static uint32_t nvnSamplerInitialize(samp_t *s, const samp_builder_t *b) { nvn_a
     s->p = b->p;
     return 1;
 }
-static void nvnSamplerFinalize(samp_t *s) { if (s) s->magic = 0; }
+static void nvnSamplerFinalize(samp_t *s) {
+    if (!s) return;
+    for (unsigned i = 0; i < g_samp_bridge_count; i++)
+        if (g_samp_bridges[i].samp == s) {
+            gfx_backend_sampler_destroy(g_samp_bridges[i].gfx);
+            g_samp_bridges[i] = g_samp_bridges[--g_samp_bridge_count];
+            break;
+        }
+    s->magic = 0;
+}
 static void nvnSamplerSetDebugLabel(samp_t *s, const char *l) { (void)s; (void)l; }
 static int nvnSamplerGetMinMagFilter(const samp_t *s, int *min, int *mag) {
     if (!s || !min || !mag) return 0; *min = s->p.minf; *mag = s->p.magf; return 1;
@@ -1683,8 +1785,32 @@ static nvn_cmd_t *nvn_cb_cmd(cb_t *c, uint32_t kind) {
 
 static nvn_bind_state_t *nvn_cb_bind_state(cb_t *c) {
     if (!c) return NULL;
-    if (!c->bind_state) c->bind_state = calloc(1, sizeof(nvn_bind_state_t));
+    if (!c->bind_state) {
+        c->bind_state = calloc(1, sizeof(nvn_bind_state_t));
+        if (c->bind_state) nvn_render_state_defaults(&((nvn_bind_state_t *)c->bind_state)->rs);
+    }
     return c->bind_state;
+}
+
+static void nvn_cb_state_event(cb_t *c) {
+    nvn_bind_state_t *b = nvn_cb_bind_state(c);
+    if (!b) return;
+    nvn_cmd_t *cmd = nvn_cb_cmd(c, NVN_CMD_BIND_STATE);
+    if (cmd) cmd->u.state.rs = b->rs;
+}
+
+/* Descriptor events are recorded in command order so the backend can give
+ * each draw its own descriptor epoch.  kind: 0 UBO, 1 SSBO, 2 texture. */
+static void nvn_cb_desc_event(cb_t *c, uint32_t stage, uint32_t kind, uint32_t slot,
+                              uint64_t address, size_t size, uint64_t handle) {
+    nvn_cmd_t *cmd = nvn_cb_cmd(c, NVN_CMD_BIND_DESC);
+    if (!cmd) return;
+    cmd->u.desc.stage = stage;
+    cmd->u.desc.kind = kind;
+    cmd->u.desc.slot = slot;
+    cmd->u.desc.address = address;
+    cmd->u.desc.size = size;
+    cmd->u.desc.handle = handle;
 }
 
 static uint32_t nvnCommandBufferInitialize(cb_t *c, void *d) { nvn_api("nvnCommandBufferInitialize");
@@ -1760,8 +1886,13 @@ static void nvnCommandBufferBeginRecording(cb_t *c) {
     c->ncmds = 0;
     /* A fresh recording starts with default (unbound) resource/vertex state;
      * keeping the previous recording's state would re-apply stale guest
-     * pointers on the next submit. */
-    if (c->bind_state) memset(c->bind_state, 0, sizeof(nvn_bind_state_t));
+     * pointers on the next submit.  Render state, however, starts from the NVN
+     * defaults (not all-zero: a zero channel-mask would disable colour writes). */
+    if (c->bind_state) {
+        nvn_bind_state_t *b = c->bind_state;
+        memset(b, 0, sizeof *b);
+        nvn_render_state_defaults(&b->rs);
+    }
 }
 static uint64_t nvnCommandBufferEndRecording(cb_t *c) {
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferEndRecording", "invalid command buffer"); return 0; }
@@ -1838,12 +1969,164 @@ static void nvnCommandBufferDrawArraysInstanced(cb_t *c, int mode, int first, in
                 mode, first, count, base_instance, instances);
 }
 static void nvnCommandBufferSetRenderEnable(cb_t *c, int e) { (void)c; (void)e; }
+#define NVN_ST(T, x) ((T *)(x))
+
+static void nvnBlendStateSetDefaults(void *s) {
+    if (s) *(nvn_blend_st *)s = (nvn_blend_st){ 0, 2, 1, 2, 1, 1, 1 };
+}
+static void nvnBlendStateSetBlendTarget(void *s, int t) { if (s) ((nvn_blend_st *)s)->target = (uint32_t)t; }
+static void nvnBlendStateSetBlendFunc(void *s, int sr, int dr, int sa, int da) {
+    if (!s) return;
+    nvn_blend_st *o = s;
+    o->src_rgb = (uint32_t)sr; o->dst_rgb = (uint32_t)dr;
+    o->src_a = (uint32_t)sa; o->dst_a = (uint32_t)da;
+}
+static void nvnBlendStateSetBlendEquation(void *s, int er, int ea) {
+    if (!s) return;
+    ((nvn_blend_st *)s)->eq_rgb = (uint32_t)er;
+    ((nvn_blend_st *)s)->eq_a = (uint32_t)ea;
+}
+static void nvnColorStateSetDefaults(void *s) {
+    if (s) *(nvn_color_st *)s = (nvn_color_st){ 0, 3, 8 };
+}
+static void nvnColorStateSetBlendEnable(void *s, int i, uint32_t en) {
+    if (!s || i < 0 || i > 7) return;
+    nvn_color_st *o = s;
+    if (en) o->blend_en |= 1u << i; else o->blend_en &= ~(1u << i);
+}
+static void nvnChannelMaskStateSetDefaults(void *s) { if (s) ((nvn_chmask_st *)s)->mask = 0xffffffffu; }
+static void nvnChannelMaskStateSetChannelMask(void *s, int i, uint32_t r, uint32_t g,
+                                              uint32_t b, uint32_t a) {
+    if (!s || i < 0 || i > 7) return;
+    uint32_t m = (r ? 1u : 0u) | (g ? 2u : 0u) | (b ? 4u : 0u) | (a ? 8u : 0u);
+    nvn_chmask_st *o = s;
+    o->mask = (o->mask & ~(0xfu << (4 * i))) | (m << (4 * i));
+}
+static void nvnMultisampleStateSetDefaults(void *s) {
+    if (!s) return;
+    memset(s, 0, sizeof(nvn_ms_st));
+    ((nvn_ms_st *)s)->enable = 1;
+}
+static void nvnMultisampleStateSetMultisampleEnable(void *s, uint32_t e) {
+    if (s) ((nvn_ms_st *)s)->enable = e != 0;
+}
+static void nvnMultisampleStateSetSamples(void *s, int n) {
+    if (s) ((nvn_ms_st *)s)->samples = (uint8_t)n;
+}
+static void nvnMultisampleStateSetAlphaToCoverageEnable(void *s, uint32_t e) {
+    if (s) ((nvn_ms_st *)s)->a2c = e != 0;
+}
+static void nvnMultisampleStateSetSampleLocationsEnable(void *s, uint32_t e) {
+    if (s) ((nvn_ms_st *)s)->sl_en = e != 0;
+}
+static void nvnMultisampleStateSetSampleLocations(void *s, int start, int n, const float *v) {
+    (void)s; (void)start; (void)n; (void)v;
+}
+static void nvnPolygonStateSetDefaults(void *s) {
+    if (s) *(nvn_poly_st *)s = (nvn_poly_st){ 0, 1, 2, 0 };
+}
+static void nvnPolygonStateSetCullFace(void *s, int f) { if (s) ((nvn_poly_st *)s)->cull = (uint32_t)f; }
+static void nvnPolygonStateSetFrontFace(void *s, int f) { if (s) ((nvn_poly_st *)s)->front = (uint32_t)f; }
+static void nvnPolygonStateSetPolygonMode(void *s, int m) { if (s) ((nvn_poly_st *)s)->mode = (uint32_t)m; }
+static void nvnPolygonStateSetPolygonOffsetEnables(void *s, int e) {
+    if (s) ((nvn_poly_st *)s)->offset_en = (uint32_t)e;
+}
+static void nvnDepthStencilStateSetDefaults(void *s) {
+    if (!s) return;
+    *(nvn_ds_st *)s = (nvn_ds_st){ .dt = 0, .dw = 1, .df = 2, .st = 0,
+        .sf_f = 8, .sf_b = 8, .fail_f = 1, .zfail_f = 1, .zpass_f = 1,
+        .fail_b = 1, .zfail_b = 1, .zpass_b = 1 };
+}
+static void nvnDepthStencilStateSetDepthTestEnable(void *s, uint32_t e) { if (s) ((nvn_ds_st *)s)->dt = e != 0; }
+static void nvnDepthStencilStateSetDepthWriteEnable(void *s, uint32_t e) { if (s) ((nvn_ds_st *)s)->dw = e != 0; }
+static void nvnDepthStencilStateSetDepthFunc(void *s, int f) { if (s) ((nvn_ds_st *)s)->df = (uint32_t)f; }
+static void nvnDepthStencilStateSetStencilTestEnable(void *s, uint32_t e) { if (s) ((nvn_ds_st *)s)->st = e != 0; }
+static void nvnDepthStencilStateSetStencilFunc(void *s, int f, int fn) {
+    if (!s) return;
+    nvn_ds_st *o = s;
+    if (f & 1) o->sf_f = (uint32_t)fn;
+    if (f & 2) o->sf_b = (uint32_t)fn;
+}
+static void nvnDepthStencilStateSetStencilOp(void *s, int f, int fail, int zfail, int zpass) {
+    if (!s) return;
+    nvn_ds_st *o = s;
+    if (f & 1) { o->fail_f = (uint32_t)fail; o->zfail_f = (uint32_t)zfail; o->zpass_f = (uint32_t)zpass; }
+    if (f & 2) { o->fail_b = (uint32_t)fail; o->zfail_b = (uint32_t)zfail; o->zpass_b = (uint32_t)zpass; }
+}
+
+static void nvnCommandBufferBindBlendState(cb_t *c, const void *s) {
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B') || !s) return;
+    nvn_bind_state_t *b = nvn_cb_bind_state(c);
+    if (b) { b->rs.blend = *(const nvn_blend_st *)s; nvn_cb_state_event(c); }
+}
+static void nvnCommandBufferBindColorState(cb_t *c, const void *s) {
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B') || !s) return;
+    nvn_bind_state_t *b = nvn_cb_bind_state(c);
+    if (b) { b->rs.color = *(const nvn_color_st *)s; nvn_cb_state_event(c); }
+}
+static void nvnCommandBufferBindChannelMaskState(cb_t *c, const void *s) {
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B') || !s) return;
+    nvn_bind_state_t *b = nvn_cb_bind_state(c);
+    if (b) { b->rs.chmask = *(const nvn_chmask_st *)s; nvn_cb_state_event(c); }
+}
+static void nvnCommandBufferBindMultisampleState(cb_t *c, const void *s) {
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B') || !s) return;
+    nvn_bind_state_t *b = nvn_cb_bind_state(c);
+    if (b) { b->rs.ms = *(const nvn_ms_st *)s; nvn_cb_state_event(c); }
+}
+static void nvnCommandBufferBindPolygonState(cb_t *c, const void *s) {
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B') || !s) return;
+    nvn_bind_state_t *b = nvn_cb_bind_state(c);
+    if (b) { b->rs.poly = *(const nvn_poly_st *)s; nvn_cb_state_event(c); }
+}
+static void nvnCommandBufferBindDepthStencilState(cb_t *c, const void *s) {
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B') || !s) return;
+    nvn_bind_state_t *b = nvn_cb_bind_state(c);
+    if (b) { b->rs.ds = *(const nvn_ds_st *)s; nvn_cb_state_event(c); }
+}
+static void nvnCommandBufferSetBlendColor(cb_t *c, const float *v) {
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B') || !v) return;
+    nvn_bind_state_t *b = nvn_cb_bind_state(c);
+    if (b) { memcpy(b->rs.blend_color, v, sizeof b->rs.blend_color); nvn_cb_state_event(c); }
+}
+static void nvnCommandBufferSetStencilRef(cb_t *c, int face, int v) {
+    (void)face;
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) return;
+    nvn_bind_state_t *b = nvn_cb_bind_state(c);
+    if (b) { b->rs.stencil_ref = v; nvn_cb_state_event(c); }
+}
+static void nvnCommandBufferSetStencilMask(cb_t *c, int face, int v) {
+    (void)face;
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) return;
+    nvn_bind_state_t *b = nvn_cb_bind_state(c);
+    if (b) { b->rs.stencil_mask = v; nvn_cb_state_event(c); }
+}
+static void nvnCommandBufferSetStencilValueMask(cb_t *c, int face, int v) {
+    (void)face;
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) return;
+    nvn_bind_state_t *b = nvn_cb_bind_state(c);
+    if (b) { b->rs.stencil_value_mask = v; nvn_cb_state_event(c); }
+}
+static void nvnCommandBufferClearDepthStencil(cb_t *c, float depth, uint32_t dmask,
+                                              int stencil, int smask) {
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) return;
+    nvn_cmd_t *cmd = nvn_cb_cmd(c, NVN_CMD_CLEAR_DEPTH_STENCIL);
+    if (cmd) {
+        cmd->u.clear_ds.depth = depth;
+        cmd->u.clear_ds.dmask = dmask;
+        cmd->u.clear_ds.stencil = stencil;
+        cmd->u.clear_ds.smask = (uint32_t)smask;
+    }
+}
+
 static void nvnCommandBufferSetRenderTargets(cb_t *c, int n, const void *const *t,
                                              const void *const *views,
                                              const void *depth, const void *depth_view) {
     nvn_api("nvnCommandBufferSetRenderTargets");
-    (void)views; (void)depth; (void)depth_view;
+    (void)views; (void)depth_view;
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferSetRenderTargets", "invalid command buffer"); return; }
+    nvn_bind_state_t *bs = nvn_cb_bind_state(c);
+    if (bs) bs->depth_tex = depth;
     if (n < 0 || n > 8 || (!t && n)) { nvn_fail("nvnCommandBufferSetRenderTargets", "invalid target count"); return; }
     nvn_cmd_t *cmd = nvn_cb_cmd(c, NVN_CMD_SET_RENDER_TARGETS);
     if (cmd) { cmd->u.targets.count = n; cmd->u.targets.rt0 = n ? (void *)t[0] : NULL; }
@@ -1879,12 +2162,6 @@ static void nvnCommandBufferClearColorui(cb_t *c, int i, const uint32_t *v, int 
     if (!v) { nvn_fail("nvnCommandBufferClearColorui", "null color"); return; }
     const float f[4] = { (float)v[0], (float)v[1], (float)v[2], (float)v[3] };
     nvnCommandBufferClearColor(c, i, f, mask);
-}
-static void nvnCommandBufferClearDepthStencil(cb_t *c, float d, int dm, int sm, int stencil) {
-    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferClearDepthStencil", "invalid command buffer"); return; }
-    nvn_cmd_t *cmd = nvn_cb_cmd(c, NVN_CMD_CLEAR_DEPTH_STENCIL);
-    if (cmd) { cmd->u.clear.rgba[0] = d; cmd->u.clear.rgba[1] = (float)stencil;
-               cmd->u.clear.mask = (uint32_t)dm | ((uint32_t)sm << 8); }
 }
 static void nvnCommandBufferSetViewport(cb_t *c, int x, int y, int w, int h) {
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferSetViewport", "invalid command buffer"); return; }
@@ -2034,6 +2311,7 @@ static void nvnCommandBufferBindUniformBuffer(cb_t *c, int stage, int i, uint64_
     b->ubo[stage][i].address = address;
     b->ubo[stage][i].size = size;
     b->ubo_mask[stage] |= 1u << i;
+    nvn_cb_desc_event(c, (uint32_t)stage, 0, (uint32_t)i, address, size, 0);
     if (nvn_trace())
         fprintf(stderr, "[totk-nvn] BindUniformBuffer stage=%d index=%d addr=%#llx size=%zu\n",
                 stage, i, (unsigned long long)address, size);
@@ -2049,6 +2327,8 @@ static void nvnCommandBufferBindUniformBuffers(cb_t *c, int stage, int first, in
         b->ubo[stage][first + i].address = r[i * 2];
         b->ubo[stage][first + i].size = (size_t)r[i * 2 + 1];
         b->ubo_mask[stage] |= 1u << (first + i);
+        nvn_cb_desc_event(c, (uint32_t)stage, 0, (uint32_t)(first + i),
+                          r[i * 2], (size_t)r[i * 2 + 1], 0);
     }
     if (nvn_trace())
         fprintf(stderr, "[totk-nvn] BindUniformBuffers stage=%d first=%d count=%d\n",
@@ -2063,6 +2343,7 @@ static void nvnCommandBufferBindStorageBuffer(cb_t *c, int stage, int i, uint64_
     b->ssbo[stage][i].address = address;
     b->ssbo[stage][i].size = size;
     b->ssbo_mask[stage] |= 1u << i;
+    nvn_cb_desc_event(c, (uint32_t)stage, 1, (uint32_t)i, address, size, 0);
     if (nvn_trace())
         fprintf(stderr, "[totk-nvn] BindStorageBuffer stage=%d index=%d addr=%#llx size=%zu\n",
                 stage, i, (unsigned long long)address, size);
@@ -2078,6 +2359,8 @@ static void nvnCommandBufferBindStorageBuffers(cb_t *c, int stage, int first, in
         b->ssbo[stage][first + i].address = r[i * 2];
         b->ssbo[stage][first + i].size = (size_t)r[i * 2 + 1];
         b->ssbo_mask[stage] |= 1u << (first + i);
+        nvn_cb_desc_event(c, (uint32_t)stage, 1, (uint32_t)(first + i),
+                          r[i * 2], (size_t)r[i * 2 + 1], 0);
     }
     if (nvn_trace())
         fprintf(stderr, "[totk-nvn] BindStorageBuffers stage=%d first=%d count=%d\n",
@@ -2092,6 +2375,7 @@ static void nvnCommandBufferBindTexture(cb_t *c, int stage, int i, uint64_t hand
         b->tex[stage][i] = handle;
         if (handle) b->tex_mask[stage][i / 32] |= 1u << (i % 32);
         else b->tex_mask[stage][i / 32] &= ~(1u << (i % 32));
+        nvn_cb_desc_event(c, (uint32_t)stage, 2, (uint32_t)i, 0, 0, handle);
     }
     if (nvn_trace()) {
         int tid = (int)(handle & 0xfffff), sid = (int)((handle >> 20) & 0xfff);
@@ -2112,6 +2396,7 @@ static void nvnCommandBufferBindTextures(cb_t *c, int stage, int first, int n, c
             b->tex[stage][index] = handles[i];
             if (handles[i]) b->tex_mask[stage][index / 32] |= 1u << (index % 32);
             else b->tex_mask[stage][index / 32] &= ~(1u << (index % 32));
+            nvn_cb_desc_event(c, (uint32_t)stage, 2, (uint32_t)index, 0, 0, handles[i]);
         }
     }
     if (nvn_trace()) {
@@ -2149,6 +2434,14 @@ typedef struct {
     char spv_path[RUNTIME_SHADER_STAGES][RUNTIME_SHADER_PATH_MAX];
     char res_path[RUNTIME_SHADER_STAGES][RUNTIME_SHADER_PATH_MAX];
     char key[RUNTIME_SHADER_STAGES][RUNTIME_SHADER_KEY_MAX + 1];
+    RuntimeShaderIdentity id[RUNTIME_SHADER_STAGES];
+    /* Bind-state variant (<key>-<suffix>.spv), loaded lazily at submit. */
+    uint8_t *vspv[2];
+    size_t vspv_size[2];
+    char vspv_path[2][RUNTIME_SHADER_PATH_MAX];
+    char vres_path[2][RUNTIME_SHADER_PATH_MAX];
+    char variant[192];
+    uint64_t variant_sig;
     unsigned loaded;                 /* bit per stage with a loaded module */
     GfxReflectedPipeline *pipeline;  /* lazy, keyed by (vs, ps, target format) */
     int pipeline_format;
@@ -2166,6 +2459,16 @@ static void prog_stage_clear(prog_shader_state_t *s, unsigned stage) {
     s->spv_path[stage][0] = 0;
     s->res_path[stage][0] = 0;
     s->key[stage][0] = 0;
+    memset(&s->id[stage], 0, sizeof s->id[stage]);
+    if (stage < 2) {
+        free(s->vspv[stage]);
+        s->vspv[stage] = NULL;
+        s->vspv_size[stage] = 0;
+        s->vspv_path[stage][0] = 0;
+        s->vres_path[stage][0] = 0;
+        s->variant[0] = 0;
+        s->variant_sig = 0;
+    }
     s->loaded &= ~(1u << stage);
     if (s->pipeline) {
         gfx_backend_reflected_pipeline_destroy(s->pipeline);
@@ -2204,6 +2507,38 @@ static void nvnProgramFinalize(prog_t *p) {
     p->magic = 0;
 }
 static void nvnProgramSetDebugLabel(prog_t *p, const char *l) { (void)p; (void)l; }
+
+/* Optional offline capture: write the exact control/code pair the game binds
+ * so a host-side totk_xlate run can produce its SPIR-V.  Game-derived bytes
+ * stay in TOTK_ANDROID_SHADER_DUMP, normally under /data/local/tmp. */
+static void nvn_dump_shader(const RuntimeShaderIdentity *id, const void *control,
+                            const void *code) {
+    const char *dir = getenv("TOTK_ANDROID_SHADER_DUMP");
+    if (!dir || !*dir || !id || !control || !code) return;
+    if (!id->control_key_bytes || !id->code_bytes) return;
+    char path[RUNTIME_SHADER_PATH_MAX];
+    struct stat st;
+    snprintf(path, sizeof path, "%s/%s.ctl", dir, id->key);
+    if (stat(path, &st) == 0) return;
+    mkdir(dir, 0755);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    if (fwrite(control, 1, id->control_key_bytes, f) != id->control_key_bytes) {
+        fclose(f); unlink(path); return;
+    }
+    fclose(f);
+    snprintf(path, sizeof path, "%s/%s.code", dir, id->key);
+    f = fopen(path, "wb");
+    if (!f) return;
+    if (fwrite(code, 1, id->code_bytes, f) != id->code_bytes) {
+        fclose(f); unlink(path); return;
+    }
+    fclose(f);
+    if (getenv("TOTK_ANDROID_TRACE_NVN"))
+        fprintf(stderr, "[totk-nvn] dumped shader %s %s ctl=%u code=%u\n",
+                runtime_shader_stage_name(id->stage), id->key,
+                id->control_key_bytes, id->code_bytes);
+}
 
 static uint32_t nvn_program_set_shaders(prog_t *p, int n, const void *shaders,
                                         size_t stride, const char *what) {
@@ -2250,6 +2585,7 @@ static uint32_t nvn_program_set_shaders(prog_t *p, int n, const void *shaders,
             memcpy(s->spv_path[id.stage], mod.spv_path, sizeof mod.spv_path);
             memcpy(s->res_path[id.stage], mod.res_path, sizeof mod.res_path);
             memcpy(s->key[id.stage], id.key, sizeof id.key);
+            s->id[id.stage] = id;
             s->loaded |= 1u << id.stage;
             unsigned hit = __atomic_add_fetch(&g_shader_cache_hits, 1, __ATOMIC_RELAXED);
             if (hit <= 16 || nvn_trace())
@@ -2257,6 +2593,7 @@ static uint32_t nvn_program_set_shaders(prog_t *p, int n, const void *shaders,
                         hit, runtime_shader_stage_name(id.stage), id.key, id.code_bytes,
                         mod.res_path[0] ? " +res.json" : "");
         } else {
+            nvn_dump_shader(&id, control, (const void *)(uintptr_t)data);
             prog_stage_clear(s, id.stage);
             unsigned miss = __atomic_add_fetch(&g_shader_cache_misses, 1, __ATOMIC_RELAXED);
             if (miss <= 32 || nvn_trace())
@@ -2400,9 +2737,102 @@ static uint32_t nvn_window_format(const win_t *w) {
 /* Create (or reuse) the host pipeline for a program whose VS/PS came from the
  * offline cache.  The target format is part of the identity: the same program
  * can be drawn to the handheld and docked windows. */
+static char nvn_attr_class(uint32_t f) {
+    switch (f) {
+    case 0x03: case 0x08: case 0x0B: case 0x0F: case 0x14: case 0x17:
+    case 0x1B: case 0x20: case 0x23: case 0x27: case 0x2C: case 0x2F:
+        return 'u';
+    case 0x04: case 0x09: case 0x0C: case 0x10: case 0x15: case 0x18:
+    case 0x1C: case 0x21: case 0x24: case 0x28: case 0x2D: case 0x30:
+        return 's';
+    default:
+        return 'f';
+    }
+}
+
+static uint64_t nvn_variant_sig(const char *v) {
+    if (!v || !*v) return 0;
+    uint64_t h = 1469598103934665603ull;
+    for (const unsigned char *p = (const unsigned char *)v; *p; p++) {
+        h ^= *p; h *= 1099511628211ull;
+    }
+    return h ? h : 1;
+}
+
+static const char *nvn_tex_target_name(int target) {
+    switch (target) {
+    case 0: return "1d";
+    case 2: return "3d";
+    case 3: return "1da";
+    case 4: return "2da";
+    case 5: return "2dms";
+    case 6: return "2dmsa";
+    case 8: return "cube";
+    case 9: return "cubearr";
+    case 10: return "buf";
+    default: return "2d";
+    }
+}
+
+/* Bind-state suffix shared with the offline packer:
+ *   a<16 chars: f/u/s/_>  [-t<slot>_<target>[d]]...
+ * Only emitted when the cache actually contains <key>-*.spv.  The offline
+ * translator must be run with the matching attr/tex answers. */
+static void nvn_variant_suffix(prog_t *p, const cb_t *cb, char *out, size_t cap) {
+    out[0] = 0;
+    prog_shader_state_t *s = p ? p->shader_state : NULL;
+    if (!s || !cb || !cb->bind_state) return;
+    if (!runtime_shader_cache_has_variants(runtime_shader_cache_root(), &s->id[0]) &&
+        !runtime_shader_cache_has_variants(runtime_shader_cache_root(), &s->id[1]))
+        return;
+    const nvn_bind_state_t *b = cb->bind_state;
+    size_t pos = 0;
+    int any = 0;
+    char attr[18];
+    attr[0] = 'a';
+    for (int i = 0; i < 16; i++) {
+        char c = '_';
+        if ((b->va_mask & (1u << i)) && (b->va[i] & 0xffu))
+            c = nvn_attr_class(b->va[i] & 0xffu);
+        attr[1 + i] = c;
+        if (c != '_') any = 1;
+    }
+    attr[17] = 0;
+    if (any && pos + 17 < cap) {
+        memcpy(out + pos, attr, 17);
+        pos += 17;
+        out[pos] = 0;
+    }
+    GfxBindingSpec pss[64];
+    unsigned nps = gfx_reflect_full(s->res_path[1][0] ? s->res_path[1] : NULL,
+                                    s->spv_path[1], 1, pss, 64);
+    uint32_t seen_slots[4] = { 0, 0, 0, 0 };
+    for (unsigned i = 0; i < nps; i++) {
+        const GfxBindingSpec *sp = &pss[i];
+        if (sp->kind != GFX_BIND_COMBINED_IMAGE_SAMPLER &&
+            sp->kind != GFX_BIND_SAMPLED_IMAGE) continue;
+        if (sp->nvn_slot < 0 || sp->nvn_slot >= 128) continue;
+        int sbit = sp->nvn_slot;
+        if (seen_slots[sbit / 32] & (1u << (sbit % 32))) continue;
+        uint64_t handle = b->tex[1][sp->nvn_slot];
+        if (!handle) continue;
+        int tid = (int)(handle & 0xfffff);
+        const tex_t *t = cb->tex_pool ? nvn_tex_pool_lookup(cb->tex_pool, tid) : NULL;
+        if (!t) continue;
+        seen_slots[sbit / 32] |= 1u << (sbit % 32);
+        const char *tn = nvn_tex_target_name((int)t->d.target);
+        int depth = t->d.format >= 0x32 && t->d.format <= 0x36;
+        int n = snprintf(out + pos, cap - pos, "%st%d_%s%s", pos ? "-" : "",
+                         sp->nvn_slot, tn, depth ? "d" : "");
+        if (n < 0 || (size_t)n >= cap - pos) { out[0] = 0; return; }
+        pos += (size_t)n;
+    }
+}
+
 static GfxReflectedPipeline *nvn_program_cached_pipeline(prog_t *p, uint32_t nvn_format,
                                                          const GfxVertexLayout *input,
-                                                         uint64_t vertex_sig) {
+                                                         uint64_t vertex_sig,
+                                                         const char *variant) {
     pthread_mutex_lock(&g_prog_lock);
     prog_shader_state_t *s = p->shader_state;
     if (!s || (s->loaded & ((1u << 0) | (1u << 1))) != ((1u << 0) | (1u << 1))) {
@@ -2414,31 +2844,67 @@ static GfxReflectedPipeline *nvn_program_cached_pipeline(prog_t *p, uint32_t nvn
         pthread_mutex_unlock(&g_prog_lock);
         return NULL;
     }
-    if (s->pipeline && s->pipeline_format == fmt && s->vertex_sig == vertex_sig) {
+    uint64_t variant_sig = nvn_variant_sig(variant);
+    if (s->pipeline && s->pipeline_format == fmt && s->vertex_sig == vertex_sig &&
+        s->variant_sig == variant_sig) {
         GfxReflectedPipeline *ready = s->pipeline;
         pthread_mutex_unlock(&g_prog_lock);
         return ready;
+    }
+    if (s->pipeline && s->variant_sig != variant_sig) {
+        gfx_backend_reflected_pipeline_destroy(s->pipeline);
+        s->pipeline = NULL;
+    }
+    if (strcmp(s->variant, variant ? variant : "")) {
+        for (unsigned st = 0; st < 2; st++) {
+            free(s->vspv[st]);
+            s->vspv[st] = NULL;
+            s->vspv_size[st] = 0;
+            s->vspv_path[st][0] = 0;
+            s->vres_path[st][0] = 0;
+            if (!variant || !*variant || !(s->loaded & (1u << st))) continue;
+            RuntimeShaderModule vm;
+            if (!runtime_shader_cache_load_variant(runtime_shader_cache_root(), &s->id[st],
+                                                   variant, &vm)) continue;
+            if (strcmp(vm.spv_path, s->spv_path[st]) != 0) {
+                s->vspv[st] = vm.spv;
+                s->vspv_size[st] = vm.spv_size;
+                memcpy(s->vspv_path[st], vm.spv_path, sizeof s->vspv_path[st]);
+                memcpy(s->vres_path[st], vm.res_path, sizeof s->vres_path[st]);
+            } else {
+                runtime_shader_cache_module_free(&vm);
+            }
+        }
+        snprintf(s->variant, sizeof s->variant, "%s", variant ? variant : "");
     }
     if (s->pipeline) {
         gfx_backend_reflected_pipeline_destroy(s->pipeline);
         s->pipeline = NULL;
     }
+    const uint8_t *uspv[2] = { s->vspv[0] ? s->vspv[0] : s->spv[0],
+                               s->vspv[1] ? s->vspv[1] : s->spv[1] };
+    size_t usize[2] = { s->vspv[0] ? s->vspv_size[0] : s->spv_size[0],
+                        s->vspv[1] ? s->vspv_size[1] : s->spv_size[1] };
+    const char *ures[2] = { s->vres_path[0][0] ? s->vres_path[0] : s->res_path[0],
+                            s->vres_path[1][0] ? s->vres_path[1] : s->res_path[1] };
+    const char *upath[2] = { s->vspv[0] ? s->vspv_path[0] : s->spv_path[0],
+                             s->vspv[1] ? s->vspv_path[1] : s->spv_path[1] };
     GfxBindingSpec vss[64], pss[64];
-    unsigned nvs = gfx_reflect_full(s->res_path[0][0] ? s->res_path[0] : NULL,
-                                    s->spv_path[0], 0, vss, 64);
-    unsigned nps = gfx_reflect_full(s->res_path[1][0] ? s->res_path[1] : NULL,
-                                    s->spv_path[1], 1, pss, 64);
+    unsigned nvs = gfx_reflect_full(ures[0][0] ? ures[0] : NULL, upath[0], 0, vss, 64);
+    unsigned nps = gfx_reflect_full(ures[1][0] ? ures[1] : NULL, upath[1], 1, pss, 64);
     unsigned created = __atomic_add_fetch(&g_pipelines_created, 1, __ATOMIC_RELAXED);
     if (created <= 32 || nvn_trace())
         fprintf(stderr, "[totk-nvn] program=%p create pipeline from cache #%u vs=%s(%u) ps=%s(%u)"
-                        " format=%#x attrs=%u streams=%u\n",
+                        " format=%#x attrs=%u streams=%u variant=%s\n",
                 (void *)p, created, s->key[0], nvs, s->key[1], nps, nvn_format,
-                input ? input->nattributes : 0, input ? input->nbindings : 0);
+                input ? input->nattributes : 0, input ? input->nbindings : 0,
+                variant && *variant ? variant : "-");
     s->pipeline = gfx_backend_reflected_pipeline_create_ex(
-        s->spv[0], s->spv_size[0], s->spv[1], s->spv_size[1], fmt, vss, nvs, pss, nps, input);
+        uspv[0], usize[0], uspv[1], usize[1], fmt, vss, nvs, pss, nps, input);
     if (s->pipeline) {
         s->pipeline_format = fmt;
         s->vertex_sig = vertex_sig;
+        s->variant_sig = variant_sig;
     }
     GfxReflectedPipeline *ready = s->pipeline;
     pthread_mutex_unlock(&g_prog_lock);
@@ -2582,11 +3048,44 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp, cb_t *cb) 
 
 /* Translate the recorded NVN command order to the backend's clear/viewport/
  * scissor/draw list.  Resource binds stay in the reflected descriptor sets. */
+static void nvn_state_to_gfx(const nvn_render_state_t *rs, GfxPipelineState *o) {
+    memset(o, 0, sizeof *o);
+    o->blend_enable = rs->color.blend_en & 1;
+    o->blend_src_rgb = rs->blend.src_rgb;
+    o->blend_dst_rgb = rs->blend.dst_rgb;
+    o->blend_src_a = rs->blend.src_a;
+    o->blend_dst_a = rs->blend.dst_a;
+    o->blend_eq_rgb = rs->blend.eq_rgb;
+    o->blend_eq_a = rs->blend.eq_a;
+    o->color_write_mask = rs->chmask.mask & 0xf;
+    o->depth_test = rs->ds.dt;
+    o->depth_write = rs->ds.dw;
+    o->depth_func = rs->ds.df;
+    o->stencil_test = rs->ds.st;
+    o->stencil_func_front = rs->ds.sf_f;
+    o->stencil_func_back = rs->ds.sf_b;
+    o->stencil_fail_front = rs->ds.fail_f;
+    o->stencil_zfail_front = rs->ds.zfail_f;
+    o->stencil_pass_front = rs->ds.zpass_f;
+    o->stencil_fail_back = rs->ds.fail_b;
+    o->stencil_zfail_back = rs->ds.zfail_b;
+    o->stencil_pass_back = rs->ds.zpass_b;
+    o->cull_mode = rs->poly.cull;                  /* VkCullModeFlags values match */
+    o->front_face = rs->poly.front ? 0 : 1;        /* CCW=0, CW=1 in Vulkan */
+    o->polygon_mode = rs->poly.mode == 2 ? 0 : rs->poly.mode == 1 ? 1 : 2;
+    o->stencil_ref = (uint32_t)rs->stencil_ref;
+    memcpy(o->blend_color, rs->blend_color, sizeof o->blend_color);
+}
+
 static uint32_t nvn_translate_commands(const cb_t *cb, GfxCmd *out, uint32_t max,
                                        float clear[4], int *has_clear) {
     uint32_t n = 0;
     *has_clear = 0;
     if (!cb) return 0;
+    nvn_render_state_t defaults;
+    nvn_render_state_defaults(&defaults);
+    GfxPipelineState cur_state;
+    nvn_state_to_gfx(&defaults, &cur_state);
     for (uint32_t i = 0; i < cb->ncmds && n < max; i++) {
         const nvn_cmd_t *c = &cb->cmds[i];
         switch (c->kind) {
@@ -2615,6 +3114,39 @@ static uint32_t nvn_translate_commands(const cb_t *cb, GfxCmd *out, uint32_t max
             out[n].u.rect.height = c->u.rect.height;
             n++;
             break;
+        case NVN_CMD_BIND_STATE:
+            nvn_state_to_gfx(&c->u.state.rs, &cur_state);
+            break;
+        case NVN_CMD_CLEAR_DEPTH_STENCIL:
+            out[n].kind = GFX_CMD_CLEAR_DEPTH_STENCIL;
+            out[n].u.clear_depth.depth = c->u.clear_ds.depth;
+            out[n].u.clear_depth.dmask = c->u.clear_ds.dmask;
+            out[n].u.clear_depth.stencil = c->u.clear_ds.stencil;
+            out[n].u.clear_depth.smask = c->u.clear_ds.smask;
+            n++;
+            break;
+        case NVN_CMD_BIND_DESC: {
+            out[n].kind = GFX_CMD_BIND_DESC;
+            out[n].u.bind.stage = c->u.desc.stage;
+            out[n].u.bind.kind = c->u.desc.kind;
+            out[n].u.bind.slot = c->u.desc.slot;
+            if (c->u.desc.kind == 2) {
+                uint64_t h = c->u.desc.handle;
+                int tid = (int)(h & 0xfffff);
+                int sid = (int)((h >> 20) & 0xfff);
+                const tex_t *t = (h && tid != 0xfffff && cb->tex_pool)
+                    ? nvn_tex_pool_lookup(cb->tex_pool, tid) : NULL;
+                const samp_t *sp = (h && cb->samp_pool)
+                    ? nvn_samp_pool_lookup(cb->samp_pool, sid) : NULL;
+                out[n].u.bind.texture = t ? nvn_texture_gfx_ready(t) : NULL;
+                out[n].u.bind.sampler = sp ? nvn_sampler_gfx(sp) : NULL;
+            } else {
+                out[n].u.bind.data = (const void *)(uintptr_t)c->u.desc.address;
+                out[n].u.bind.size = c->u.desc.size;
+            }
+            n++;
+            break;
+        }
         case NVN_CMD_DRAW:
             if (c->u.draw.instances > 1)
                 nvn_fail("nvnQueueSubmitCommands", "instanced draw uses one instance for now");
@@ -2622,6 +3154,8 @@ static uint32_t nvn_translate_commands(const cb_t *cb, GfxCmd *out, uint32_t max
             out[n].u.draw.primitive = c->u.draw.primitive;
             out[n].u.draw.first = c->u.draw.first;
             out[n].u.draw.count = c->u.draw.count;
+            out[n].u.draw.state = cur_state;
+            out[n].u.draw.has_state = 1;
             n++;
             break;
         case NVN_CMD_DRAW_INDEXED:
@@ -2634,10 +3168,11 @@ static uint32_t nvn_translate_commands(const cb_t *cb, GfxCmd *out, uint32_t max
             out[n].u.draw_indexed.index_size = (size_t)c->u.draw_indexed.count *
                 (c->u.draw_indexed.index_type == 2 ? 4 :
                  c->u.draw_indexed.index_type == 1 ? 2 : 1);
+            out[n].u.draw_indexed.state = cur_state;
+            out[n].u.draw_indexed.has_state = 1;
             n++;
             break;
         case NVN_CMD_SET_RENDER_TARGETS:
-        case NVN_CMD_CLEAR_DEPTH_STENCIL:
         default:
             break;
         }
@@ -2668,9 +3203,13 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
         nvn_build_vertex_layout(cb, &input, &vertex_sig);
         GfxReflectedPipeline *reflected = has_program
             ? (GfxReflectedPipeline *)p->gfx_reflected_pipeline : NULL;
-        if (!reflected && has_program)
+        if (!reflected && has_program) {
+            char variant[192];
+            nvn_variant_suffix(p, cb, variant, sizeof variant);
             reflected = nvn_program_cached_pipeline(p, nvn_window_format(w),
-                                                    input.nattributes ? &input : NULL, vertex_sig);
+                                                    input.nattributes ? &input : NULL,
+                                                    vertex_sig, variant);
+        }
 
         int drew = 0;
         if (reflected) {
@@ -3010,6 +3549,15 @@ fail:
     return 0;
 }
 
+/* Reset descriptor state between probe sub-tests while keeping the NVN render
+ * state defaults (a raw memset would disable the colour write mask). */
+static void nvn_probe_cb_reset(cb_t *cb) {
+    if (!cb || !cb->bind_state) return;
+    nvn_bind_state_t *b = cb->bind_state;
+    memset(b, 0, sizeof *b);
+    nvn_render_state_defaults(&b->rs);
+}
+
 static int nvn_probe_check(const char *what, const uint8_t px[4],
                            int r_lo, int r_hi, int g_lo, int g_hi, int b_lo, int b_hi) {
     int ok = px[0] >= r_lo && px[0] <= r_hi &&
@@ -3067,7 +3615,7 @@ int runtime_nvn_state_selftest(const char *screenshot, int frames) {
         } else {
             float color[4] = { 0.25f, 0.5f, 0.75f, 1.0f };
             for (int i = 0; i < frames; i++) {
-                if (cb.bind_state) memset(cb.bind_state, 0, sizeof(nvn_bind_state_t));
+                nvn_probe_cb_reset(&cb);
                 cb.tex_pool = NULL;
                 cb.draw_count = 0;
                 nvnCommandBufferBeginRecording(&cb);
@@ -3086,6 +3634,56 @@ int runtime_nvn_state_selftest(const char *screenshot, int frames) {
             }
             runtime_native_window_read_pixel(nw, 640, 360, center);
             ok &= nvn_probe_check("ubo", center, 0x3c, 0x44, 0x7c, 0x84, 0xbb, 0xc3);
+        }
+        nvnProgramFinalize(&p);
+        nvn_probe_pair_free(&pair);
+    }
+
+    /* 1b. Two UBO epochs in one command buffer: the first draw must keep the
+     * red constants even after the second draw binds blue. */
+    {
+        const uint8_t *vs = NULL, *ps = NULL;
+        size_t vs_size = 0, ps_size = 0;
+        gfx_backend_builtin_ubo_modules(&vs, &vs_size, &ps, &ps_size);
+        prog_t p;
+        memset(&p, 0, sizeof p);
+        nvn_probe_pair_t pair;
+        memset(&pair, 0, sizeof pair);
+        if (!nvnProgramInitialize(&p, &d)
+            || !nvn_probe_pair_load(&p, vs, vs_size, ps, ps_size, NULL,
+                                    "{\"cbufs\":[{\"binding\":0,\"slot\":0}],"
+                                    "\"sbufs\":[],\"textures\":[],\"images\":[]}",
+                                    0x70, &pair)) {
+            ok = 0;
+        } else {
+            float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+            float blue[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+            for (int i = 0; i < frames; i++) {
+                nvn_probe_cb_reset(&cb);
+                cb.tex_pool = NULL;
+                cb.draw_count = 0;
+                nvnCommandBufferBeginRecording(&cb);
+                nvnCommandBufferBindProgram(&cb, &p, -1);
+                nvnCommandBufferSetWindow(&cb, &w);
+                const float clear[4] = { 0.05f, 0.08f, 0.12f, 1.0f };
+                nvnCommandBufferClearColor(&cb, 0, clear, 0xf);
+                nvnCommandBufferSetViewport(&cb, 0, 0, 1280, 720);
+                nvnCommandBufferSetScissor(&cb, 0, 0, 1280, 720);
+                nvnCommandBufferBindUniformBuffer(&cb, 1, 0, (uint64_t)(uintptr_t)red, sizeof red);
+                nvnCommandBufferDrawArrays(&cb, NVN_DRAW_TRIANGLES, 0, 3);
+                nvnCommandBufferBindUniformBuffer(&cb, 1, 0, (uint64_t)(uintptr_t)blue, sizeof blue);
+                nvnCommandBufferSetViewport(&cb, 0, 0, 640, 720);
+                nvnCommandBufferSetScissor(&cb, 0, 0, 640, 720);
+                nvnCommandBufferDrawArrays(&cb, NVN_DRAW_TRIANGLES, 0, 3);
+                uint64_t h = nvnCommandBufferEndRecording(&cb);
+                nvnQueueSubmitCommands(&q, 1, &h);
+                nvnQueuePresentTexture(&q, &w, 0);
+            }
+            uint8_t left[4] = { 0 };
+            runtime_native_window_read_pixel(nw, 320, 360, left);
+            runtime_native_window_read_pixel(nw, 760, 360, center);
+            ok &= nvn_probe_check("orderL", left, 0x00, 0x0f, 0x00, 0x0f, 0xf0, 0xff);
+            ok &= nvn_probe_check("orderR", center, 0xf0, 0xff, 0x00, 0x0f, 0x00, 0x0f);
         }
         nvnProgramFinalize(&p);
         nvn_probe_pair_free(&pair);
@@ -3124,8 +3722,8 @@ int runtime_nvn_state_selftest(const char *screenshot, int frames) {
             have_tex = nvnTextureInitialize(&tex, &tb) != 0;
         }
         static const uint8_t checker[16] = {
-            255, 0, 0, 255,   0, 255, 0, 255,
-            0, 0, 255, 255,   255, 255, 255, 255,
+            255, 0, 255, 255,   255, 0, 255, 255,
+            255, 0, 255, 255,   255, 0, 255, 255,
         };
         if (have_tex) {
             int sw = runtime_guest_texture_swizzle(tex.mem, checker, 8, tex.d.target, tex.d.format,
@@ -3137,7 +3735,7 @@ int runtime_nvn_state_selftest(const char *screenshot, int frames) {
         }
         if (have_tex)
             have_tex = nvnTexturePoolInitialize(&tp, &pool, 0, 4) != 0;
-        if (have_tex) nvnTexturePoolRegisterTexture(&tp, 0, &tex, NULL);
+        if (have_tex) nvnTexturePoolRegisterTexture(&tp, 1, &tex, NULL);
         prog_t p;
         memset(&p, 0, sizeof p);
         nvn_probe_pair_t pair;
@@ -3152,7 +3750,7 @@ int runtime_nvn_state_selftest(const char *screenshot, int frames) {
             ok = 0;
         } else {
             for (int i = 0; i < frames; i++) {
-                if (cb.bind_state) memset(cb.bind_state, 0, sizeof(nvn_bind_state_t));
+                nvn_probe_cb_reset(&cb);
                 cb.draw_count = 0;
                 nvnCommandBufferBeginRecording(&cb);
                 nvnCommandBufferBindProgram(&cb, &p, -1);
@@ -3162,14 +3760,14 @@ int runtime_nvn_state_selftest(const char *screenshot, int frames) {
                 nvnCommandBufferClearColor(&cb, 0, clear, 0xf);
                 nvnCommandBufferSetViewport(&cb, 0, 0, 1280, 720);
                 nvnCommandBufferSetScissor(&cb, 0, 0, 1280, 720);
-                nvnCommandBufferBindTexture(&cb, 1, 0, 0);
+                nvnCommandBufferBindTexture(&cb, 1, 0, 1);
                 nvnCommandBufferDrawArrays(&cb, NVN_DRAW_TRIANGLES, 0, 3);
                 uint64_t h = nvnCommandBufferEndRecording(&cb);
                 nvnQueueSubmitCommands(&q, 1, &h);
                 nvnQueuePresentTexture(&q, &w, 0);
             }
             runtime_native_window_read_pixel(nw, 640, 360, center);
-            ok &= nvn_probe_check("texture", center, 0x70, 0x90, 0x70, 0x90, 0x70, 0x90);
+            ok &= nvn_probe_check("texture", center, 0xf0, 0xff, 0x00, 0x0f, 0xf0, 0xff);
         }
         nvnProgramFinalize(&p);
         nvn_probe_pair_free(&pair);
@@ -3178,6 +3776,286 @@ int runtime_nvn_state_selftest(const char *screenshot, int frames) {
             nvnTextureFinalize(&tex);
         }
         free(pool_mem);
+    }
+
+    /* 2b. Combined texture handle selects the sampler-pool entry: the default
+     * texture sampler is linear, so nearest must produce a corner texel. */
+    {
+        const uint8_t *vs = NULL, *ps = NULL;
+        size_t vs_size = 0, ps_size = 0;
+        gfx_backend_builtin_texture_modules(&vs, &vs_size, &ps, &ps_size);
+        uint8_t *pool_mem = calloc(1, 0x10000);
+        pool_t pool;
+        pool_builder_t pb;
+        tex_builder_t tb;
+        tex_t tex;
+        tex_pool_t tp;
+        samp_builder_t sb;
+        samp_t samp;
+        samp_pool_t sp;
+        memset(&pool, 0, sizeof pool);
+        memset(&pb, 0, sizeof pb);
+        memset(&tex, 0, sizeof tex);
+        memset(&tp, 0, sizeof tp);
+        memset(&samp, 0, sizeof samp);
+        memset(&sp, 0, sizeof sp);
+        int have_tex = 0, have_samp = 0;
+        if (pool_mem) {
+            pb.dev = &d; pb.mem = pool_mem; pb.size = 0x10000; pb.flags = 1;
+            have_tex = nvnMemoryPoolInitialize(&pool, &pb) != 0;
+        }
+        if (have_tex) {
+            nvnTextureBuilderSetDefaults(&tb);
+            tb.dev = &d;
+            nvnTextureBuilderSetSize2D(&tb, 2, 2);
+            nvnTextureBuilderSetFormat(&tb, 0x25);
+            nvnTextureBuilderSetLevels(&tb, 1);
+            nvnTextureBuilderSetStorage(&tb, &pool, 0);
+            have_tex = nvnTextureInitialize(&tex, &tb) != 0;
+        }
+        static const uint8_t checker[16] = {
+            255, 0, 0, 255,   0, 255, 0, 255,
+            0, 0, 255, 255,   255, 255, 255, 255,
+        };
+        if (have_tex) {
+            int sw = runtime_guest_texture_swizzle(tex.mem, checker, 8, tex.d.target, tex.d.format,
+                                                   tex.d.flags, tex.d.samples, tex.d.width,
+                                                   tex.d.height, tex.d.depth, tex.d.levels,
+                                                   tex.d.stride, tex.d.pkg_block_h);
+            have_tex = sw == 0 && runtime_nvn_texture_upload_guest(&tex) && nvn_texture_gfx(&tex);
+        }
+        if (have_tex) have_tex = nvnTexturePoolInitialize(&tp, &pool, 0, 4) != 0;
+        if (have_tex) nvnTexturePoolRegisterTexture(&tp, 1, &tex, NULL);
+        if (have_tex) {
+            nvnSamplerBuilderSetDefaults(&sb);
+            sb.dev = &d;
+            nvnSamplerBuilderSetMinMagFilter(&sb, 0, 0);   /* NEAREST / NEAREST */
+            nvnSamplerBuilderSetWrapMode(&sb, 7, 7, 7);    /* CLAMP_TO_EDGE */
+            have_samp = nvnSamplerInitialize(&samp, &sb) != 0;
+        }
+        if (have_samp)
+            have_samp = nvnSamplerPoolInitialize(&sp, &pool, 0x1000, 4) != 0;
+        if (have_samp) nvnSamplerPoolRegisterSampler(&sp, 1, &samp);
+        prog_t p;
+        memset(&p, 0, sizeof p);
+        nvn_probe_pair_t pair;
+        memset(&pair, 0, sizeof pair);
+        if (!have_tex || !have_samp || !nvnProgramInitialize(&p, &d) ||
+            !nvn_probe_pair_load(&p, vs, vs_size, ps, ps_size, NULL,
+                                 "{\"cbufs\":[],\"sbufs\":[],"
+                                 "\"textures\":[{\"binding\":0,\"slot\":0,\"type\":3,"
+                                 "\"format\":\"R8G8B8A8Unorm\",\"array\":1,"
+                                 "\"separate\":false,\"flags\":0}],\"images\":[]}",
+                                 0x90, &pair)) {
+            ok = 0;
+        } else {
+            for (int i = 0; i < frames; i++) {
+                nvn_probe_cb_reset(&cb);
+                cb.draw_count = 0;
+                nvnCommandBufferBeginRecording(&cb);
+                nvnCommandBufferBindProgram(&cb, &p, -1);
+                nvnCommandBufferSetWindow(&cb, &w);
+                nvnCommandBufferSetTexturePool(&cb, &tp);
+                nvnCommandBufferSetSamplerPool(&cb, &sp);
+                const float clear[4] = { 0.05f, 0.08f, 0.12f, 1.0f };
+                nvnCommandBufferClearColor(&cb, 0, clear, 0xf);
+                nvnCommandBufferSetViewport(&cb, 0, 0, 1280, 720);
+                nvnCommandBufferSetScissor(&cb, 0, 0, 1280, 720);
+                nvnCommandBufferBindTexture(&cb, 1, 0, (1u << 20) | 1u);
+                nvnCommandBufferDrawArrays(&cb, NVN_DRAW_TRIANGLES, 0, 3);
+                uint64_t h = nvnCommandBufferEndRecording(&cb);
+                nvnQueueSubmitCommands(&q, 1, &h);
+                nvnQueuePresentTexture(&q, &w, 0);
+            }
+            runtime_native_window_read_pixel(nw, 640, 360, center);
+            int nearest = (center[0] == 0 || center[0] == 255) &&
+                          (center[1] == 0 || center[1] == 255) &&
+                          (center[2] == 0 || center[2] == 255) &&
+                          (center[0] + center[1] + center[2] >= 255);
+            fprintf(stderr, "[totk-nvn] state probe sampler center=%02x%02x%02x%02x ok=%d\n",
+                    center[0], center[1], center[2], center[3], nearest);
+            ok &= nearest;
+        }
+        nvnProgramFinalize(&p);
+        nvn_probe_pair_free(&pair);
+        if (have_samp) nvnSamplerPoolFinalize(&sp);
+        if (have_tex) {
+            nvnTexturePoolFinalize(&tp);
+            nvnTextureFinalize(&tex);
+        }
+        if (have_samp) nvnSamplerFinalize(&samp);
+        free(pool_mem);
+    }
+
+    /* 2c. Depth test: a farther triangle must not overwrite a nearer one. */
+    {
+        const uint8_t *vs = NULL, *ps = NULL;
+        size_t vs_size = 0, ps_size = 0;
+        gfx_backend_builtin_depth_modules(&vs, &vs_size, &ps, &ps_size);
+        struct ZVert { float x, y, z; };
+        static const struct ZVert verts[9] = {
+            { -0.65f, -0.65f, 0.50f }, { 0.65f, -0.65f, 0.50f }, { 0.0f, 0.65f, 0.50f },
+            { -0.65f, -0.65f, 0.75f }, { 0.65f, -0.65f, 0.75f }, { 0.0f, 0.65f, 0.75f },
+            { -0.65f, -0.65f, 0.25f }, { 0.65f, -0.65f, 0.25f }, { 0.0f, 0.65f, 0.25f },
+        };
+        uint32_t va[2] = {
+            (uint32_t)0x16 | (0u << 8) | (0u << 27),
+            (uint32_t)0x0A | (8u << 8) | (0u << 27),
+        };
+        uint32_t vstream[2] = { (uint32_t)sizeof(struct ZVert), 0 };
+        nvn_ds_st ds;
+        nvnDepthStencilStateSetDefaults(&ds);
+        nvnDepthStencilStateSetDepthTestEnable(&ds, 1);
+        nvnDepthStencilStateSetDepthWriteEnable(&ds, 1);
+        nvnDepthStencilStateSetDepthFunc(&ds, 2);   /* LESS */
+        prog_t p;
+        memset(&p, 0, sizeof p);
+        nvn_probe_pair_t pair;
+        memset(&pair, 0, sizeof pair);
+        if (!nvnProgramInitialize(&p, &d) ||
+            !nvn_probe_pair_load(&p, vs, vs_size, ps, ps_size, NULL,
+                                 "{\"cbufs\":[{\"binding\":0,\"slot\":0}],"
+                                 "\"sbufs\":[],\"textures\":[],\"images\":[]}",
+                                 0x30, &pair)) {
+            ok = 0;
+        } else {
+            float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+            float green[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
+            float blue[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+            for (int frame = 0; frame < 2; frame++) {
+                nvn_probe_cb_reset(&cb);
+                cb.tex_pool = NULL;
+                cb.draw_count = 0;
+                nvnCommandBufferBeginRecording(&cb);
+                nvnCommandBufferBindProgram(&cb, &p, -1);
+                nvnCommandBufferSetWindow(&cb, &w);
+                const float clear[4] = { 0.05f, 0.08f, 0.12f, 1.0f };
+                nvnCommandBufferClearColor(&cb, 0, clear, 0xf);
+                nvnCommandBufferClearDepthStencil(&cb, 1.0f, 1, 0, 0);
+                nvnCommandBufferSetViewport(&cb, 0, 0, 1280, 720);
+                nvnCommandBufferSetScissor(&cb, 0, 0, 1280, 720);
+                nvnCommandBufferBindVertexBuffer(&cb, 0, (uint64_t)(uintptr_t)verts, sizeof verts);
+                nvnCommandBufferBindVertexAttribState(&cb, 2, va);
+                nvnCommandBufferBindVertexStreamState(&cb, 1, vstream);
+                nvnCommandBufferBindDepthStencilState(&cb, &ds);
+                nvnCommandBufferBindUniformBuffer(&cb, 1, 0, (uint64_t)(uintptr_t)red, sizeof red);
+                nvnCommandBufferDrawArrays(&cb, NVN_DRAW_TRIANGLES, 0, 3);
+                nvnCommandBufferBindUniformBuffer(&cb, 1, 0, (uint64_t)(uintptr_t)
+                                                  (frame ? blue : green),
+                                                  sizeof red);
+                nvnCommandBufferDrawArrays(&cb, NVN_DRAW_TRIANGLES, frame ? 6 : 3, 3);
+                uint64_t h = nvnCommandBufferEndRecording(&cb);
+                nvnQueueSubmitCommands(&q, 1, &h);
+                nvnQueuePresentTexture(&q, &w, 0);
+                runtime_native_window_read_pixel(nw, 640, 360, center);
+                if (frame == 0)
+                    ok &= nvn_probe_check("depth", center, 0xf0, 0xff, 0x00, 0x0f, 0x00, 0x0f);
+                else
+                    ok &= nvn_probe_check("depthN", center, 0x00, 0x0f, 0x00, 0x0f, 0xf0, 0xff);
+            }
+        }
+        nvnProgramFinalize(&p);
+        nvn_probe_pair_free(&pair);
+    }
+
+    /* 2d. Blend applies only to the second draw (per-draw pipeline variant). */
+    {
+        const uint8_t *vs = NULL, *ps = NULL;
+        size_t vs_size = 0, ps_size = 0;
+        gfx_backend_builtin_ubo_modules(&vs, &vs_size, &ps, &ps_size);
+        nvn_color_st color;
+        nvn_blend_st blend;
+        nvnColorStateSetDefaults(&color);
+        nvnBlendStateSetDefaults(&blend);
+        nvnColorStateSetBlendEnable(&color, 0, 1);
+        nvnBlendStateSetBlendFunc(&blend, 5, 6, 5, 6);   /* SRC_ALPHA / 1-SRC_ALPHA */
+        nvnBlendStateSetBlendEquation(&blend, 1, 1);     /* ADD */
+        prog_t p;
+        memset(&p, 0, sizeof p);
+        nvn_probe_pair_t pair;
+        memset(&pair, 0, sizeof pair);
+        if (!nvnProgramInitialize(&p, &d) ||
+            !nvn_probe_pair_load(&p, vs, vs_size, ps, ps_size, NULL,
+                                 "{\"cbufs\":[{\"binding\":0,\"slot\":0}],"
+                                 "\"sbufs\":[],\"textures\":[],\"images\":[]}",
+                                 0x40, &pair)) {
+            ok = 0;
+        } else {
+            float green[4] = { 0.0f, 1.0f, 0.0f, 0.5f };
+            float red[4] = { 1.0f, 0.0f, 0.0f, 0.5f };
+            for (int i = 0; i < frames; i++) {
+                nvn_probe_cb_reset(&cb);
+                cb.tex_pool = NULL;
+                cb.draw_count = 0;
+                nvnCommandBufferBeginRecording(&cb);
+                nvnCommandBufferBindProgram(&cb, &p, -1);
+                nvnCommandBufferSetWindow(&cb, &w);
+                const float clear[4] = { 0.05f, 0.08f, 0.12f, 1.0f };
+                nvnCommandBufferClearColor(&cb, 0, clear, 0xf);
+                nvnCommandBufferSetViewport(&cb, 0, 0, 1280, 720);
+                nvnCommandBufferSetScissor(&cb, 0, 0, 1280, 720);
+                nvnCommandBufferBindUniformBuffer(&cb, 1, 0, (uint64_t)(uintptr_t)green, sizeof green);
+                nvnCommandBufferDrawArrays(&cb, NVN_DRAW_TRIANGLES, 0, 3);
+                nvnCommandBufferBindColorState(&cb, &color);
+                nvnCommandBufferBindBlendState(&cb, &blend);
+                nvnCommandBufferSetBlendColor(&cb, red);
+                nvnCommandBufferBindUniformBuffer(&cb, 1, 0, (uint64_t)(uintptr_t)red, sizeof red);
+                nvnCommandBufferDrawArrays(&cb, NVN_DRAW_TRIANGLES, 0, 3);
+                uint64_t h = nvnCommandBufferEndRecording(&cb);
+                nvnQueueSubmitCommands(&q, 1, &h);
+                nvnQueuePresentTexture(&q, &w, 0);
+            }
+            runtime_native_window_read_pixel(nw, 640, 360, center);
+            ok &= nvn_probe_check("blend", center, 0x78, 0x88, 0x78, 0x88, 0x00, 0x08);
+        }
+        nvnProgramFinalize(&p);
+        nvn_probe_pair_free(&pair);
+    }
+
+    /* 2e. Raster cull: front-facing CCW triangle with front-face culling. */
+    {
+        const uint8_t *vs = NULL, *ps = NULL;
+        size_t vs_size = 0, ps_size = 0;
+        gfx_backend_builtin_ubo_modules(&vs, &vs_size, &ps, &ps_size);
+        nvn_poly_st poly;
+        nvnPolygonStateSetDefaults(&poly);
+        nvnPolygonStateSetCullFace(&poly, 2);    /* BACK */
+        nvnPolygonStateSetFrontFace(&poly, 1);   /* CCW */
+        prog_t p;
+        memset(&p, 0, sizeof p);
+        nvn_probe_pair_t pair;
+        memset(&pair, 0, sizeof pair);
+        if (!nvnProgramInitialize(&p, &d) ||
+            !nvn_probe_pair_load(&p, vs, vs_size, ps, ps_size, NULL,
+                                 "{\"cbufs\":[{\"binding\":0,\"slot\":0}],"
+                                 "\"sbufs\":[],\"textures\":[],\"images\":[]}",
+                                 0x50, &pair)) {
+            ok = 0;
+        } else {
+            float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+            for (int i = 0; i < frames; i++) {
+                nvn_probe_cb_reset(&cb);
+                cb.tex_pool = NULL;
+                cb.draw_count = 0;
+                nvnCommandBufferBeginRecording(&cb);
+                nvnCommandBufferBindProgram(&cb, &p, -1);
+                nvnCommandBufferSetWindow(&cb, &w);
+                const float clear[4] = { 0.05f, 0.08f, 0.12f, 1.0f };
+                nvnCommandBufferClearColor(&cb, 0, clear, 0xf);
+                nvnCommandBufferSetViewport(&cb, 0, 0, 1280, 720);
+                nvnCommandBufferSetScissor(&cb, 0, 0, 1280, 720);
+                nvnCommandBufferBindPolygonState(&cb, &poly);
+                nvnCommandBufferBindUniformBuffer(&cb, 1, 0, (uint64_t)(uintptr_t)red, sizeof red);
+                nvnCommandBufferDrawArrays(&cb, NVN_DRAW_TRIANGLES, 0, 3);
+                uint64_t h = nvnCommandBufferEndRecording(&cb);
+                nvnQueueSubmitCommands(&q, 1, &h);
+                nvnQueuePresentTexture(&q, &w, 0);
+            }
+            runtime_native_window_read_pixel(nw, 640, 360, center);
+            ok &= nvn_probe_check("cull", center, 0x0d, 0x14, 0x14, 0x1f, 0x1f, 0x24);
+        }
+        nvnProgramFinalize(&p);
+        nvn_probe_pair_free(&pair);
     }
 
     /* 3. Guest vertex stream + attributes + indexed draw. */
@@ -3206,7 +4084,7 @@ int runtime_nvn_state_selftest(const char *screenshot, int frames) {
             ok = 0;
         } else {
             for (int i = 0; i < frames; i++) {
-                if (cb.bind_state) memset(cb.bind_state, 0, sizeof(nvn_bind_state_t));
+                nvn_probe_cb_reset(&cb);
                 cb.tex_pool = NULL;
                 cb.draw_count = 0;
                 nvnCommandBufferBeginRecording(&cb);
@@ -3777,12 +4655,32 @@ static const nvn_entry nvn_entries[] = {
     NVN_E(nvnCommandBufferBindProgram), NVN_E(nvnCommandBufferBindVertexBuffer),
     NVN_E(nvnCommandBufferBindVertexBuffers), NVN_E(nvnCommandBufferBindVertexAttribState),
     NVN_E(nvnCommandBufferBindVertexStreamState), NVN_E(nvnCommandBufferSetPrimitiveRestart),
+    NVN_E(nvnCommandBufferBindBlendState), NVN_E(nvnCommandBufferBindColorState),
+    NVN_E(nvnCommandBufferBindChannelMaskState), NVN_E(nvnCommandBufferBindMultisampleState),
+    NVN_E(nvnCommandBufferBindPolygonState), NVN_E(nvnCommandBufferBindDepthStencilState),
+    NVN_E(nvnCommandBufferSetBlendColor), NVN_E(nvnCommandBufferSetStencilRef),
+    NVN_E(nvnCommandBufferSetStencilMask), NVN_E(nvnCommandBufferSetStencilValueMask),
     NVN_E(nvnCommandBufferSetTexturePool),
     NVN_E(nvnCommandBufferSetSamplerPool), NVN_E(nvnCommandBufferBindUniformBuffer),
     NVN_E(nvnCommandBufferBindUniformBuffers), NVN_E(nvnCommandBufferBindStorageBuffer),
     NVN_E(nvnCommandBufferBindStorageBuffers), NVN_E(nvnCommandBufferBindTexture),
     NVN_E(nvnCommandBufferBindTextures), NVN_E(nvnCommandBufferBindImage),
     NVN_E(nvnCommandBufferBindImages),
+    NVN_E(nvnBlendStateSetDefaults), NVN_E(nvnBlendStateSetBlendTarget),
+    NVN_E(nvnBlendStateSetBlendFunc), NVN_E(nvnBlendStateSetBlendEquation),
+    NVN_E(nvnColorStateSetDefaults), NVN_E(nvnColorStateSetBlendEnable),
+    NVN_E(nvnChannelMaskStateSetDefaults), NVN_E(nvnChannelMaskStateSetChannelMask),
+    NVN_E(nvnMultisampleStateSetDefaults), NVN_E(nvnMultisampleStateSetMultisampleEnable),
+    NVN_E(nvnMultisampleStateSetSamples), NVN_E(nvnMultisampleStateSetAlphaToCoverageEnable),
+    NVN_E(nvnMultisampleStateSetSampleLocationsEnable),
+    NVN_E(nvnMultisampleStateSetSampleLocations),
+    NVN_E(nvnPolygonStateSetDefaults), NVN_E(nvnPolygonStateSetCullFace),
+    NVN_E(nvnPolygonStateSetFrontFace), NVN_E(nvnPolygonStateSetPolygonMode),
+    NVN_E(nvnPolygonStateSetPolygonOffsetEnables),
+    NVN_E(nvnDepthStencilStateSetDefaults), NVN_E(nvnDepthStencilStateSetDepthTestEnable),
+    NVN_E(nvnDepthStencilStateSetDepthWriteEnable), NVN_E(nvnDepthStencilStateSetDepthFunc),
+    NVN_E(nvnDepthStencilStateSetStencilTestEnable), NVN_E(nvnDepthStencilStateSetStencilFunc),
+    NVN_E(nvnDepthStencilStateSetStencilOp),
     NVN_E(nvnProgramInitialize), NVN_E(nvnProgramFinalize), NVN_E(nvnProgramSetDebugLabel),
     NVN_E(nvnProgramSetShaders), NVN_E(nvnProgramSetShadersExt),
     NVN_E(nvnProgramSetSampleShading), NVN_E(nvnProgramGetSubtileSize),

@@ -43,6 +43,7 @@ typedef struct {
     VkInstance instance;
     VkPhysicalDevice phys;
     VkPhysicalDeviceProperties props;
+    VkFormat depth_format;
     VkDevice dev;
     VkQueue queue;
     uint32_t family;
@@ -74,6 +75,10 @@ struct GfxOffscreenTarget {
     VkBuffer readback;
     VkDeviceMemory readback_mem;
     VkFormat format;
+    VkImage depth_image;
+    VkDeviceMemory depth_mem;
+    VkImageView depth_view;
+    VkFormat depth_format;
     uint32_t width;
     uint32_t height;
     uint32_t bpp;
@@ -248,6 +253,10 @@ static int vk_init_locked(void) {
     }
     if (!g.phys) { vk_reset_locked(); return 0; }
     vkGetPhysicalDeviceProperties(g.phys, &g.props);
+    VkFormatProperties dfp;
+    vkGetPhysicalDeviceFormatProperties(g.phys, VK_FORMAT_D24_UNORM_S8_UINT, &dfp);
+    g.depth_format = (dfp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
+                         ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT;
     vkGetPhysicalDeviceMemoryProperties(g.phys, &g.mem);
     g.has_swapchain_ext = 0;
     if (g.has_surface_ext && g.has_android_ext) {
@@ -708,6 +717,36 @@ GfxOffscreenTarget *gfx_backend_offscreen_create(uint32_t width, uint32_t height
     };
     if (!vk_ok(vkCreateImageView(g.dev, &vci, NULL, &t->view), "vkCreateImageView")) goto fail;
 
+    t->depth_format = g.depth_format;
+    VkImageCreateInfo dci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = t->depth_format,
+        .extent = { width, height, 1 },
+        .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    if (!vk_ok(vkCreateImage(g.dev, &dci, NULL, &t->depth_image), "vkCreateImage(depth)")) goto fail;
+    vkGetImageMemoryRequirements(g.dev, t->depth_image, &req);
+    if (!vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &mt) &&
+        !vk_mem_type(req.memoryTypeBits, 0, &mt)) goto fail;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = mt;
+    if (!vk_ok(vkAllocateMemory(g.dev, &mai, NULL, &t->depth_mem), "vkAllocateMemory(depth)")) goto fail;
+    if (!vk_ok(vkBindImageMemory(g.dev, t->depth_image, t->depth_mem, 0), "vkBindImageMemory(depth)")) goto fail;
+    VkImageViewCreateInfo dvci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = t->depth_image, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = t->depth_format,
+        .subresourceRange = {
+            .aspectMask = t->depth_format == VK_FORMAT_D24_UNORM_S8_UINT
+                              ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                              : VK_IMAGE_ASPECT_DEPTH_BIT,
+            .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 } };
+    if (!vk_ok(vkCreateImageView(g.dev, &dvci, NULL, &t->depth_view), "vkCreateImageView(depth)")) goto fail;
+
     VkBufferCreateInfo bci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = t->pixels_size,
@@ -744,6 +783,9 @@ void gfx_backend_offscreen_destroy(GfxOffscreenTarget *t) {
     if (g.dev) {
         if (t->readback) vkDestroyBuffer(g.dev, t->readback, NULL);
         if (t->readback_mem) vkFreeMemory(g.dev, t->readback_mem, NULL);
+        if (t->depth_view) vkDestroyImageView(g.dev, t->depth_view, NULL);
+        if (t->depth_image) vkDestroyImage(g.dev, t->depth_image, NULL);
+        if (t->depth_mem) vkFreeMemory(g.dev, t->depth_mem, NULL);
         if (t->view) vkDestroyImageView(g.dev, t->view, NULL);
         if (t->image) vkDestroyImage(g.dev, t->image, NULL);
         if (t->image_mem) vkFreeMemory(g.dev, t->image_mem, NULL);
@@ -1497,6 +1539,14 @@ void gfx_backend_builtin_attr_modules(const uint8_t **vs, size_t *vs_size,
     if (ps_size) *ps_size = triangle_attr_frag_spv_size;
 }
 
+void gfx_backend_builtin_depth_modules(const uint8_t **vs, size_t *vs_size,
+                                       const uint8_t **ps, size_t *ps_size) {
+    if (vs) *vs = (const uint8_t *)triangle_z_vert_spv;
+    if (vs_size) *vs_size = triangle_z_vert_spv_size;
+    if (ps) *ps = (const uint8_t *)reflect_ubo_frag_spv;
+    if (ps_size) *ps_size = reflect_ubo_frag_spv_size;
+}
+
 
 struct GfxTexture {
     VkImage image;
@@ -1865,6 +1915,7 @@ int gfx_backend_textured_draw(GfxTexturedPipeline *p, GfxTexture *tex, GfxOffscr
 
 #define GFX_REFLECT_MAX_BINDINGS 64
 #define GFX_REFLECT_RUNTIME_ARRAY 32
+#define GFX_DESC_MAX_EPOCHS 512
 
 struct GfxReflectedPipeline {
     VkShaderModule vs, ps;
@@ -1903,8 +1954,29 @@ struct GfxReflectedPipeline {
     GfxBindingSpec spec[2][GFX_REFLECT_MAX_BINDINGS];
     uint32_t nspec[2];
     int32_t bind_buf[2][GFX_REFLECT_MAX_BINDINGS];
+    int32_t bind_tex[2][GFX_REFLECT_MAX_BINDINGS];
+    int32_t bind_sampler[2][GFX_REFLECT_MAX_BINDINGS];
+    int32_t bind_img[2][GFX_REFLECT_MAX_BINDINGS];
+    int32_t bind_view[2][GFX_REFLECT_MAX_BINDINGS];
     VkDeviceSize buf_size[GFX_REFLECT_MAX_BINDINGS];
+    /* Per-draw descriptor epochs.  Each UBO/SSBO binding gets a host-visible
+     * arena; the epoch selects a 256-byte-aligned slice through a dynamic
+     * offset, so UBOs can change between draws in one command buffer. */
+    VkDescriptorPool dpool_draw;
+    VkBuffer dyn_buf[2][GFX_REFLECT_MAX_BINDINGS];
+    VkDeviceMemory dyn_mem[2][GFX_REFLECT_MAX_BINDINGS];
+    size_t dyn_cap[2][GFX_REFLECT_MAX_BINDINGS];
+    size_t dyn_stride[2][GFX_REFLECT_MAX_BINDINGS];
     GfxVertexLayout input;
+    VkVertexInputBindingDescription vib[16];
+    VkVertexInputAttributeDescription via[16];
+    uint32_t nb, na;
+    struct {
+        uint64_t sig;
+        GfxPipelineState state;
+        VkPipeline pipe;
+    } variants[64];
+    unsigned nvariants;
 };
 
 static int vk_make_buffer_usage(uint32_t size, VkBufferUsageFlags usage,
@@ -1947,6 +2019,89 @@ static int vk_make_sampler(VkSampler *sampler) {
     };
     return vk_ok(vkCreateSampler(g.dev, &sci, NULL, sampler),
                  "vkCreateSampler(reflection)");
+}
+
+struct GfxSampler {
+    VkSampler sampler;
+    GfxSamplerDesc desc;
+};
+
+static VkFilter vk_nvn_filter(uint32_t f) {
+    return f == 1 || f == 3 || f == 5 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+}
+
+static VkSamplerMipmapMode vk_nvn_mipmap(uint32_t f) {
+    return f >= 4 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+}
+
+static VkSamplerAddressMode vk_nvn_wrap(uint32_t w) {
+    switch (w) {
+    case 0: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    case 1: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    case 2: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+    case 3: return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+    case 4: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    case 5: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    case 6: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+    case 7: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    default: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    }
+}
+
+static VkCompareOp vk_nvn_compare(uint32_t f) {
+    switch (f) {
+    case 1: return VK_COMPARE_OP_NEVER;
+    case 2: return VK_COMPARE_OP_LESS;
+    case 3: return VK_COMPARE_OP_EQUAL;
+    case 4: return VK_COMPARE_OP_LESS_OR_EQUAL;
+    case 5: return VK_COMPARE_OP_GREATER;
+    case 6: return VK_COMPARE_OP_NOT_EQUAL;
+    case 7: return VK_COMPARE_OP_GREATER_OR_EQUAL;
+    case 8:
+    default: return VK_COMPARE_OP_ALWAYS;
+    }
+}
+
+GfxSampler *gfx_backend_sampler_create(const GfxSamplerDesc *d) {
+    if (!d) return NULL;
+    pthread_mutex_lock(&g_lock);
+    if (!g.ready) { pthread_mutex_unlock(&g_lock); return NULL; }
+    GfxSampler *s = calloc(1, sizeof *s);
+    if (!s) { pthread_mutex_unlock(&g_lock); return NULL; }
+    s->desc = *d;
+    float max_lod = d->lod_max > 0.0f ? d->lod_max : VK_LOD_CLAMP_NONE;
+    float min_lod = d->lod_min > 0.0f ? d->lod_min : 0.0f;
+    VkSamplerCreateInfo sci = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = vk_nvn_filter(d->mag_filter),
+        .minFilter = vk_nvn_filter(d->min_filter),
+        .mipmapMode = vk_nvn_mipmap(d->min_filter),
+        .addressModeU = vk_nvn_wrap(d->wrap_s),
+        .addressModeV = vk_nvn_wrap(d->wrap_t),
+        .addressModeW = vk_nvn_wrap(d->wrap_r),
+        .mipLodBias = d->lod_bias,
+        .minLod = min_lod,
+        .maxLod = max_lod,
+        .compareEnable = d->compare_enable ? VK_TRUE : VK_FALSE,
+        .compareOp = vk_nvn_compare(d->compare_op),
+        .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+        .unnormalizedCoordinates = VK_FALSE,
+    };
+    if (!vk_ok(vkCreateSampler(g.dev, &sci, NULL, &s->sampler), "vkCreateSampler(nvn sampler)")) {
+        free(s);
+        pthread_mutex_unlock(&g_lock);
+        return NULL;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return s;
+}
+
+void gfx_backend_sampler_destroy(GfxSampler *s) {
+    if (!s) return;
+    pthread_mutex_lock(&g_lock);
+    if (g.dev && s->sampler) vkDestroySampler(g.dev, s->sampler, NULL);
+    pthread_mutex_unlock(&g_lock);
+    free(s);
 }
 
 static VkFormat vk_reflect_texel_format(const GfxBindingSpec *spec, int storage) {
@@ -2019,7 +2174,7 @@ static void vk_spirv_move_set(uint8_t *code, size_t size, uint32_t from, uint32_
 
 static VkDescriptorType reflect_vk_type(GfxBindingKind kind) {
     switch (kind) {
-    case GFX_BIND_SSBO: return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    case GFX_BIND_SSBO: return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
     case GFX_BIND_SAMPLER: return VK_DESCRIPTOR_TYPE_SAMPLER;
     case GFX_BIND_SAMPLED_IMAGE: return VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     case GFX_BIND_COMBINED_IMAGE_SAMPLER: return VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -2027,8 +2182,170 @@ static VkDescriptorType reflect_vk_type(GfxBindingKind kind) {
     case GFX_BIND_UNIFORM_TEXEL_BUFFER: return VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
     case GFX_BIND_STORAGE_TEXEL_BUFFER: return VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
     case GFX_BIND_UBO:
-    default: return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    default: return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     }
+}
+
+static VkBlendFactor vk_nvn_blend_factor(uint32_t f) {
+    switch (f) {
+    case 1: return VK_BLEND_FACTOR_ZERO;
+    case 2: return VK_BLEND_FACTOR_ONE;
+    case 3: return VK_BLEND_FACTOR_SRC_COLOR;
+    case 4: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+    case 5: return VK_BLEND_FACTOR_SRC_ALPHA;
+    case 6: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    case 7: return VK_BLEND_FACTOR_DST_ALPHA;
+    case 8: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+    case 9: return VK_BLEND_FACTOR_DST_COLOR;
+    case 10: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+    case 11: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+    case 16: return VK_BLEND_FACTOR_SRC1_COLOR;
+    case 17: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
+    case 18: return VK_BLEND_FACTOR_SRC1_ALPHA;
+    case 19: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+    case 0x61: return VK_BLEND_FACTOR_CONSTANT_COLOR;
+    case 0x62: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+    case 0x63: return VK_BLEND_FACTOR_CONSTANT_ALPHA;
+    case 0x64: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+    default: return VK_BLEND_FACTOR_ONE;
+    }
+}
+
+static VkBlendOp vk_nvn_blend_op(uint32_t e) {
+    switch (e) {
+    case 2: return VK_BLEND_OP_SUBTRACT;
+    case 3: return VK_BLEND_OP_REVERSE_SUBTRACT;
+    case 4: return VK_BLEND_OP_MIN;
+    case 5: return VK_BLEND_OP_MAX;
+    case 1:
+    default: return VK_BLEND_OP_ADD;
+    }
+}
+
+static VkCompareOp vk_nvn_depth_op(uint32_t f) {
+    switch (f) {
+    case 1: return VK_COMPARE_OP_NEVER;
+    case 3: return VK_COMPARE_OP_EQUAL;
+    case 4: return VK_COMPARE_OP_LESS_OR_EQUAL;
+    case 5: return VK_COMPARE_OP_GREATER;
+    case 6: return VK_COMPARE_OP_NOT_EQUAL;
+    case 7: return VK_COMPARE_OP_GREATER_OR_EQUAL;
+    case 8: return VK_COMPARE_OP_ALWAYS;
+    case 2:
+    default: return VK_COMPARE_OP_LESS;
+    }
+}
+
+static VkStencilOp vk_nvn_stencil_op(uint32_t o) {
+    switch (o) {
+    case 2: return VK_STENCIL_OP_ZERO;
+    case 3: return VK_STENCIL_OP_REPLACE;
+    case 4: return VK_STENCIL_OP_INCREMENT_AND_CLAMP;
+    case 5: return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
+    case 6: return VK_STENCIL_OP_INVERT;
+    case 7: return VK_STENCIL_OP_INCREMENT_AND_WRAP;
+    case 8: return VK_STENCIL_OP_DECREMENT_AND_WRAP;
+    case 1:
+    default: return VK_STENCIL_OP_KEEP;
+    }
+}
+
+static uint64_t reflect_state_sig(const GfxPipelineState *st) {
+    const uint8_t *p = (const uint8_t *)st;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < sizeof *st; i++) { h ^= p[i]; h *= 1099511628211ull; }
+    return h ? h : 1;
+}
+
+static int reflect_create_pipeline(GfxReflectedPipeline *p, const GfxPipelineState *st,
+                                   VkPipeline *out) {
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = p->vs, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = p->ps, .pName = "main" },
+    };
+    VkPipelineVertexInputStateCreateInfo vi = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = p->nb, .pVertexBindingDescriptions = p->vib,
+        .vertexAttributeDescriptionCount = p->na, .pVertexAttributeDescriptions = p->via };
+    VkPipelineInputAssemblyStateCreateInfo ia = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+    VkPipelineViewportStateCreateInfo vp = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1, .scissorCount = 1 };
+    VkPipelineRasterizationStateCreateInfo rast = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = st ? (VkPolygonMode)st->polygon_mode : VK_POLYGON_MODE_FILL,
+        .cullMode = st ? st->cull_mode : VK_CULL_MODE_NONE,
+        .frontFace = st ? (VkFrontFace)st->front_face : VK_FRONT_FACE_COUNTER_CLOCKWISE,
+        .lineWidth = 1.0f };
+    VkPipelineMultisampleStateCreateInfo ms = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+    VkPipelineColorBlendAttachmentState cba = {
+        .blendEnable = st && (st->blend_enable & 1) ? VK_TRUE : VK_FALSE,
+        .srcColorBlendFactor = st ? vk_nvn_blend_factor(st->blend_src_rgb) : VK_BLEND_FACTOR_ONE,
+        .dstColorBlendFactor = st ? vk_nvn_blend_factor(st->blend_dst_rgb) : VK_BLEND_FACTOR_ZERO,
+        .colorBlendOp = st ? vk_nvn_blend_op(st->blend_eq_rgb) : VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = st ? vk_nvn_blend_factor(st->blend_src_a) : VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = st ? vk_nvn_blend_factor(st->blend_dst_a) : VK_BLEND_FACTOR_ZERO,
+        .alphaBlendOp = st ? vk_nvn_blend_op(st->blend_eq_a) : VK_BLEND_OP_ADD,
+        .colorWriteMask = st ? (st->color_write_mask & 0xf) : 0xf };
+    VkPipelineColorBlendStateCreateInfo cb = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = 1, .pAttachments = &cba };
+    VkPipelineDepthStencilStateCreateInfo dss = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable = st && st->depth_test ? VK_TRUE : VK_FALSE,
+        .depthWriteEnable = st && st->depth_write ? VK_TRUE : VK_FALSE,
+        .depthCompareOp = st ? vk_nvn_depth_op(st->depth_func) : VK_COMPARE_OP_LESS,
+        .stencilTestEnable = st && st->stencil_test ? VK_TRUE : VK_FALSE,
+        .front = { .failOp = st ? vk_nvn_stencil_op(st->stencil_fail_front) : VK_STENCIL_OP_KEEP,
+                   .passOp = st ? vk_nvn_stencil_op(st->stencil_pass_front) : VK_STENCIL_OP_KEEP,
+                   .depthFailOp = st ? vk_nvn_stencil_op(st->stencil_zfail_front) : VK_STENCIL_OP_KEEP,
+                   .compareOp = st ? vk_nvn_depth_op(st->stencil_func_front) : VK_COMPARE_OP_ALWAYS,
+                   .compareMask = 0xff, .writeMask = 0xff, .reference = 0 },
+        .back = { .failOp = st ? vk_nvn_stencil_op(st->stencil_fail_back) : VK_STENCIL_OP_KEEP,
+                  .passOp = st ? vk_nvn_stencil_op(st->stencil_pass_back) : VK_STENCIL_OP_KEEP,
+                  .depthFailOp = st ? vk_nvn_stencil_op(st->stencil_zfail_back) : VK_STENCIL_OP_KEEP,
+                  .compareOp = st ? vk_nvn_depth_op(st->stencil_func_back) : VK_COMPARE_OP_ALWAYS,
+                  .compareMask = 0xff, .writeMask = 0xff, .reference = 0 } };
+    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                             VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+                             VK_DYNAMIC_STATE_STENCIL_REFERENCE };
+    VkPipelineDynamicStateCreateInfo ds = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = 4, .pDynamicStates = dyn };
+    VkGraphicsPipelineCreateInfo gpci = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 2, .pStages = stages, .pVertexInputState = &vi,
+        .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rast,
+        .pMultisampleState = &ms, .pColorBlendState = &cb, .pDepthStencilState = &dss,
+        .pDynamicState = &ds, .layout = p->layout, .renderPass = p->pass };
+    return vk_ok(vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &gpci, NULL, out),
+                 "vkCreateGraphicsPipelines(reflected variant)");
+}
+
+static VkPipeline reflect_pipeline_for_state(GfxReflectedPipeline *p, const GfxPipelineState *st) {
+    if (!st) return p->pipe;
+    uint64_t sig = reflect_state_sig(st);
+    for (unsigned i = 0; i < p->nvariants; i++)
+        if (p->variants[i].sig == sig &&
+            !memcmp(&p->variants[i].state, st, sizeof *st)) return p->variants[i].pipe;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    if (!reflect_create_pipeline(p, st, &pipe)) return p->pipe;
+    if (p->nvariants >= sizeof p->variants / sizeof p->variants[0]) {
+        vk_log("ERROR reflected pipeline variant cache full; using base pipeline");
+        vkDestroyPipeline(g.dev, pipe, NULL);
+        return p->pipe;
+    }
+    p->variants[p->nvariants].sig = sig;
+    p->variants[p->nvariants].state = *st;
+    p->variants[p->nvariants].pipe = pipe;
+    p->nvariants++;
+    return pipe;
 }
 
 GfxReflectedPipeline *gfx_backend_reflected_pipeline_create(const uint8_t *vs, size_t vs_size,
@@ -2083,6 +2400,10 @@ GfxReflectedPipeline *gfx_backend_reflected_pipeline_create_ex(
             p->spec[s][i] = sets[s][i];
             p->spec[s][i].set = s;
             p->bind_buf[s][i] = -1;
+            p->bind_tex[s][i] = -1;
+            p->bind_sampler[s][i] = -1;
+            p->bind_img[s][i] = -1;
+            p->bind_view[s][i] = -1;
         }
     }
     VkDescriptorPoolSize pool[8] = {0};
@@ -2118,6 +2439,16 @@ GfxReflectedPipeline *gfx_backend_reflected_pipeline_create_ex(
                                         .maxSets = 2, .poolSizeCount = npool, .pPoolSizes = pool };
     if (!vk_ok(vkCreateDescriptorPool(g.dev, &dpci, NULL, &p->dpool), "vkCreateDescriptorPool(reflected)")) goto fail;
     vk_log("reflected step: pool (%u sizes)", npool);
+    VkDescriptorPoolSize draw_pool[8];
+    for (uint32_t i = 0; i < npool; i++) {
+        draw_pool[i] = pool[i];
+        draw_pool[i].descriptorCount *= GFX_DESC_MAX_EPOCHS;
+    }
+    VkDescriptorPoolCreateInfo ddpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 2 * GFX_DESC_MAX_EPOCHS, .poolSizeCount = npool, .pPoolSizes = draw_pool };
+    if (!vk_ok(vkCreateDescriptorPool(g.dev, &ddpci, NULL, &p->dpool_draw),
+               "vkCreateDescriptorPool(reflected draw)")) goto fail;
+    vk_log("reflected step: draw pool (%u sizes x %u epochs)", npool, GFX_DESC_MAX_EPOCHS);
     for (unsigned s = 0; s < 2; s++) {
         VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                                              .descriptorPool = p->dpool, .descriptorSetCount = 1, .pSetLayouts = &p->dsl[s] };
@@ -2169,12 +2500,14 @@ GfxReflectedPipeline *gfx_backend_reflected_pipeline_create_ex(
                         .imageLayout = VK_IMAGE_LAYOUT_UNDEFINED };
                 w.pImageInfo = &iinfo[niinfo];
                 niinfo += count;
+                p->bind_sampler[s][i] = (int32_t)p->nsampler;
                 p->nsampler++;
             } else if (spec->kind == GFX_BIND_SAMPLED_IMAGE ||
                        spec->kind == GFX_BIND_COMBINED_IMAGE_SAMPLER) {
                 if (p->ntex >= GFX_REFLECT_MAX_BINDINGS) goto cleanup_fail;
                 GfxTexture *tex = texture_create_rgba8_locked(2, 2, checker);
                 if (!tex) goto cleanup_fail;
+                p->bind_tex[s][i] = (int32_t)p->ntex;
                 p->tex[p->ntex++] = tex;
                 for (uint32_t k = 0; k < count; k++)
                     iinfo[niinfo + k] = (VkDescriptorImageInfo){
@@ -2194,6 +2527,7 @@ GfxReflectedPipeline *gfx_backend_reflected_pipeline_create_ex(
                         .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
                 w.pImageInfo = &iinfo[niinfo];
                 niinfo += count;
+                p->bind_img[s][i] = (int32_t)p->nimg;
                 p->nimg++;
             } else { /* UNIFORM_TEXEL_BUFFER / STORAGE_TEXEL_BUFFER */
                 if (p->nbuf >= GFX_REFLECT_MAX_BINDINGS ||
@@ -2206,6 +2540,7 @@ GfxReflectedPipeline *gfx_backend_reflected_pipeline_create_ex(
                 for (uint32_t k = 0; k < count; k++) texel_views[ntexel + k] = p->buf_view[p->nbuf_view];
                 w.pTexelBufferView = &texel_views[ntexel];
                 ntexel += count;
+                p->bind_view[s][i] = (int32_t)p->nbuf_view;
                 p->nbuf++;
                 p->nbuf_view++;
             }
@@ -2225,19 +2560,33 @@ cleanup_fail:
 
 descriptors_done:;
 
-    VkAttachmentDescription att = { .format = fmt, .samples = VK_SAMPLE_COUNT_1_BIT,
-        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_GENERAL };
+    VkAttachmentDescription att[2] = {
+        { .format = fmt, .samples = VK_SAMPLE_COUNT_1_BIT,
+          .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+          .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+          .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_GENERAL },
+        { .format = g.depth_format, .samples = VK_SAMPLE_COUNT_1_BIT,
+          .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+          .stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE,
+          .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+          .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL },
+    };
     VkAttachmentReference ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkAttachmentReference dref = { 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
     VkSubpassDescription sub = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                 .colorAttachmentCount = 1, .pColorAttachments = &ref };
+                                 .colorAttachmentCount = 1, .pColorAttachments = &ref,
+                                 .pDepthStencilAttachment = &dref };
     VkSubpassDependency dep = { .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
-        .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT };
+        .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT };
     VkRenderPassCreateInfo rpci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-        .attachmentCount = 1, .pAttachments = &att, .subpassCount = 1, .pSubpasses = &sub,
+        .attachmentCount = 2, .pAttachments = att, .subpassCount = 1, .pSubpasses = &sub,
         .dependencyCount = 1, .pDependencies = &dep };
     if (!vk_ok(vkCreateRenderPass(g.dev, &rpci, NULL, &p->pass), "vkCreateRenderPass(reflected)")) goto fail;
     VkDescriptorSetLayout layouts[2] = { p->dsl[0], p->dsl[1] };
@@ -2245,57 +2594,22 @@ descriptors_done:;
                                        .setLayoutCount = 2, .pSetLayouts = layouts };
     if (!vk_ok(vkCreatePipelineLayout(g.dev, &lci, NULL, &p->layout), "vkCreatePipelineLayout(reflected)")) goto fail;
     vk_log("reflected step: pipeline layout");
-    VkPipelineShaderStageCreateInfo stages[2] = {
-        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-          .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = p->vs, .pName = "main" },
-        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = p->ps, .pName = "main" },
-    };
-    VkVertexInputBindingDescription vib[16];
-    VkVertexInputAttributeDescription via[16];
-    uint32_t nb = 0, na = 0;
-    if (input) {
-        nb = input->nbindings < 16 ? input->nbindings : 16;
-        na = input->nattributes < 16 ? input->nattributes : 16;
-        for (uint32_t i = 0; i < nb; i++)
-            vib[i] = (VkVertexInputBindingDescription){
-                .binding = input->bindings[i].binding,
-                .stride = input->bindings[i].stride,
-                .inputRate = input->bindings[i].input_rate ? VK_VERTEX_INPUT_RATE_INSTANCE
-                                                           : VK_VERTEX_INPUT_RATE_VERTEX };
-        for (uint32_t i = 0; i < na; i++)
-            via[i] = (VkVertexInputAttributeDescription){
-                .location = input->attributes[i].location,
-                .binding = input->attributes[i].binding,
-                .format = (VkFormat)input->attributes[i].format,
-                .offset = input->attributes[i].offset };
-    }
-    VkPipelineVertexInputStateCreateInfo vi = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .vertexBindingDescriptionCount = nb, .pVertexBindingDescriptions = vib,
-        .vertexAttributeDescriptionCount = na, .pVertexAttributeDescriptions = via };
-    VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-                                                  .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
-    VkPipelineViewportStateCreateInfo vp = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-                                             .viewportCount = 1, .scissorCount = 1 };
-    VkPipelineRasterizationStateCreateInfo rast = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE,
-        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
-    VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-                                                .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
-    VkPipelineColorBlendAttachmentState cba = { .blendEnable = VK_FALSE, .colorWriteMask = 0xf };
-    VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-                                               .attachmentCount = 1, .pAttachments = &cba };
-    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-                                            .dynamicStateCount = 2, .pDynamicStates = dyn };
-    VkGraphicsPipelineCreateInfo gpci = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .stageCount = 2, .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
-        .pViewportState = &vp, .pRasterizationState = &rast, .pMultisampleState = &ms,
-        .pColorBlendState = &cb, .pDynamicState = &ds, .layout = p->layout, .renderPass = p->pass };
+    p->nb = input ? (input->nbindings < 16 ? input->nbindings : 16) : 0;
+    p->na = input ? (input->nattributes < 16 ? input->nattributes : 16) : 0;
+    for (uint32_t i = 0; i < p->nb; i++)
+        p->vib[i] = (VkVertexInputBindingDescription){
+            .binding = input->bindings[i].binding,
+            .stride = input->bindings[i].stride,
+            .inputRate = input->bindings[i].input_rate ? VK_VERTEX_INPUT_RATE_INSTANCE
+                                                       : VK_VERTEX_INPUT_RATE_VERTEX };
+    for (uint32_t i = 0; i < p->na; i++)
+        p->via[i] = (VkVertexInputAttributeDescription){
+            .location = input->attributes[i].location,
+            .binding = input->attributes[i].binding,
+            .format = (VkFormat)input->attributes[i].format,
+            .offset = input->attributes[i].offset };
     vk_log("reflected step: vkCreateGraphicsPipelines begin");
-    if (!vk_ok(vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &gpci, NULL, &p->pipe),
-               "vkCreateGraphicsPipelines(reflected)")) goto fail;
+    if (!reflect_create_pipeline(p, NULL, &p->pipe)) goto fail;
     vk_log("reflected step: vkCreateGraphicsPipelines end");
     pthread_mutex_unlock(&g_lock);
     vk_log("reflected pipeline ready vs=%u ps=%u bindings format=%s", nvs, nps, vk_format_name(fmt));
@@ -2327,6 +2641,12 @@ void gfx_backend_reflected_pipeline_destroy(GfxReflectedPipeline *p) {
             if (p->vbuf[i]) vkDestroyBuffer(g.dev, p->vbuf[i], NULL);
             if (p->vbuf_mem[i]) vkFreeMemory(g.dev, p->vbuf_mem[i], NULL);
         }
+        for (unsigned s = 0; s < 2; s++)
+            for (unsigned i = 0; i < GFX_REFLECT_MAX_BINDINGS; i++) {
+                if (p->dyn_buf[s][i]) vkDestroyBuffer(g.dev, p->dyn_buf[s][i], NULL);
+                if (p->dyn_mem[s][i]) vkFreeMemory(g.dev, p->dyn_mem[s][i], NULL);
+            }
+        if (p->dpool_draw) vkDestroyDescriptorPool(g.dev, p->dpool_draw, NULL);
         if (p->index_buf) vkDestroyBuffer(g.dev, p->index_buf, NULL);
         if (p->index_mem) vkFreeMemory(g.dev, p->index_mem, NULL);
         if (p->fb) vkDestroyFramebuffer(g.dev, p->fb, NULL);
@@ -2621,6 +2941,140 @@ static VkIndexType vk_reflect_index_type(uint32_t type) {
     return type == 2 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
 }
 
+/* ---- per-draw descriptor epochs ---------------------------------------- */
+
+#define REFLECT_ALIGN 256
+static size_t reflect_align(size_t v) { return (v + REFLECT_ALIGN - 1) & ~(size_t)(REFLECT_ALIGN - 1); }
+
+typedef struct {
+    size_t ubo_off[2][GFX_REFLECT_MAX_BINDINGS];
+    size_t ssbo_off[2][GFX_REFLECT_MAX_BINDINGS];
+    uint8_t dyn[2][GFX_REFLECT_MAX_BINDINGS];
+    const GfxTexture *tex[2][GFX_REFLECT_MAX_BINDINGS];
+    const GfxSampler *samp[2][GFX_REFLECT_MAX_BINDINGS];
+} ReflectEpochState;
+
+/* Find the reflected binding for an NVN stage/slot.  The .res.json nvn_slot is
+ * authoritative; the built-in test shaders fall back to binding == slot. */
+static int reflect_find_bind_spec(GfxReflectedPipeline *p, uint32_t stage, uint32_t slot,
+                                  uint32_t kind) {
+    int set = stage == 0 ? 0 : stage == 1 ? 1 : -1;
+    if (set < 0) return -1;
+    int fallback = -1;
+    for (uint32_t i = 0; i < p->nspec[set]; i++) {
+        const GfxBindingSpec *sp = &p->spec[set][i];
+        int match = kind == GFX_DESC_UBO ? sp->kind == GFX_BIND_UBO
+                  : kind == GFX_DESC_SSBO ? sp->kind == GFX_BIND_SSBO
+                  : (sp->kind == GFX_BIND_COMBINED_IMAGE_SAMPLER ||
+                     sp->kind == GFX_BIND_SAMPLED_IMAGE);
+        if (!match) continue;
+        if (sp->nvn_slot == (int32_t)slot) return (int)i;
+        if (fallback < 0 && (sp->nvn_slot <= 0) && sp->binding == slot) fallback = (int)i;
+    }
+    return fallback;
+}
+
+static int reflect_arena_ensure(GfxReflectedPipeline *p, int set, int idx, size_t need) {
+    if (need < REFLECT_ALIGN) need = REFLECT_ALIGN;
+    if (!vk_reflect_ensure_buffer(&p->dyn_buf[set][idx], &p->dyn_mem[set][idx],
+                                  &p->dyn_cap[set][idx], need,
+                                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
+        vk_log("ERROR reflected arena set=%d idx=%d size=%zu", set, idx, need);
+        return 0;
+    }
+    return 1;
+}
+
+static void reflect_write_epoch_set(GfxReflectedPipeline *p, uint32_t s, VkDescriptorSet dset,
+                                    const ReflectEpochState *st) {
+    VkDescriptorImageInfo ii[GFX_REFLECT_MAX_BINDINGS];
+    for (uint32_t i = 0; i < p->nspec[s]; i++) {
+        const GfxBindingSpec *sp = &p->spec[s][i];
+        uint32_t count = sp->count ? sp->count : GFX_REFLECT_RUNTIME_ARRAY;
+        if (count > GFX_REFLECT_MAX_BINDINGS) count = GFX_REFLECT_MAX_BINDINGS;
+        VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = dset, .dstBinding = sp->binding, .descriptorCount = count,
+            .descriptorType = reflect_vk_type(sp->kind) };
+        if (sp->kind == GFX_BIND_UBO || sp->kind == GFX_BIND_SSBO) {
+            int use_dyn = st->dyn[s][i] && p->dyn_buf[s][i];
+            int32_t b = use_dyn ? (int32_t)i : p->bind_buf[s][i];
+            if (b < 0) continue;
+            VkBuffer buffer = use_dyn ? p->dyn_buf[s][i] : p->buf[b];
+            VkDeviceSize range = use_dyn ? (VkDeviceSize)p->dyn_stride[s][i] : VK_WHOLE_SIZE;
+            VkDescriptorBufferInfo bi = { .buffer = buffer, .offset = 0, .range = range };
+            w.descriptorCount = 1;
+            w.pBufferInfo = &bi;
+            vkUpdateDescriptorSets(g.dev, 1, &w, 0, NULL);
+        } else if (sp->kind == GFX_BIND_SAMPLER) {
+            int32_t si = p->bind_sampler[s][i];
+            VkSampler sampler = si >= 0 ? p->sampler[si] : VK_NULL_HANDLE;
+            for (uint32_t k = 0; k < count; k++)
+                ii[k] = (VkDescriptorImageInfo){ .sampler = sampler, .imageView = VK_NULL_HANDLE,
+                                                 .imageLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+            w.pImageInfo = ii;
+            vkUpdateDescriptorSets(g.dev, 1, &w, 0, NULL);
+        } else if (sp->kind == GFX_BIND_SAMPLED_IMAGE ||
+                   sp->kind == GFX_BIND_COMBINED_IMAGE_SAMPLER) {
+            const GfxTexture *t = st->tex[s][i];
+            if (!t && p->bind_tex[s][i] >= 0) t = p->tex[p->bind_tex[s][i]];
+            if (!t) continue;
+            VkSampler sampler = VK_NULL_HANDLE;
+            if (sp->kind == GFX_BIND_COMBINED_IMAGE_SAMPLER) {
+                sampler = st->samp[s][i] ? st->samp[s][i]->sampler : t->sampler;
+            }
+            for (uint32_t k = 0; k < count; k++)
+                ii[k] = (VkDescriptorImageInfo){ .sampler = sampler, .imageView = t->view,
+                                                 .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            w.pImageInfo = ii;
+            vkUpdateDescriptorSets(g.dev, 1, &w, 0, NULL);
+        } else if (sp->kind == GFX_BIND_STORAGE_IMAGE) {
+            int32_t ii_idx = p->bind_img[s][i];
+            if (ii_idx < 0) continue;
+            for (uint32_t k = 0; k < count; k++)
+                ii[k] = (VkDescriptorImageInfo){ .sampler = VK_NULL_HANDLE,
+                                                 .imageView = p->img_view[ii_idx],
+                                                 .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+            w.pImageInfo = ii;
+            vkUpdateDescriptorSets(g.dev, 1, &w, 0, NULL);
+        } else {
+            int32_t vi = p->bind_view[s][i];
+            if (vi < 0) continue;
+            VkBufferView views[GFX_REFLECT_MAX_BINDINGS];
+            for (uint32_t k = 0; k < count; k++) views[k] = p->buf_view[vi];
+            w.pTexelBufferView = views;
+            vkUpdateDescriptorSets(g.dev, 1, &w, 0, NULL);
+        }
+    }
+}
+
+static void reflect_apply_draw_state(VkCommandBuffer cmd, GfxReflectedPipeline *p,
+                                     const GfxPipelineState *st) {
+    VkPipeline pipe = reflect_pipeline_for_state(p, st);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe ? pipe : p->pipe);
+    float zero[4] = { 0, 0, 0, 0 };
+    vkCmdSetBlendConstants(cmd, st ? st->blend_color : zero);
+    vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, st ? st->stencil_ref : 0);
+}
+
+static void reflect_bind_epoch_sets(VkCommandBuffer cmd, GfxReflectedPipeline *p,
+                                    const VkDescriptorSet sets[2],
+                                    const ReflectEpochState *st) {
+    uint32_t offsets[2 * GFX_REFLECT_MAX_BINDINGS];
+    uint32_t n = 0;
+    for (uint32_t s = 0; s < 2; s++)
+        for (uint32_t i = 0; i < p->nspec[s]; i++) {
+            if (p->spec[s][i].kind != GFX_BIND_UBO && p->spec[s][i].kind != GFX_BIND_SSBO)
+                continue;
+            size_t off = p->spec[s][i].kind == GFX_BIND_UBO ? st->ubo_off[s][i]
+                                                           : st->ssbo_off[s][i];
+            offsets[n++] = (uint32_t)off;
+        }
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, 2, sets,
+                            n, n ? offsets : NULL);
+}
+
+
 int gfx_backend_reflected_execute(GfxReflectedPipeline *p, GfxOffscreenTarget *t,
                                   const GfxCmd *cmds, uint32_t count,
                                   const float default_clear[4]) {
@@ -2634,17 +3088,58 @@ int gfx_backend_reflected_execute_ex(GfxReflectedPipeline *p, GfxOffscreenTarget
     if (!p || !t) return 0;
     pthread_mutex_lock(&g_lock);
     if (!g.ready || t->format != p->format || t->bpp != 4) { pthread_mutex_unlock(&g_lock); return 0; }
+    if (!t->depth_view) { pthread_mutex_unlock(&g_lock); return 0; }
     if (!p->fb || p->fb_view != t->view || p->fb_w != t->width || p->fb_h != t->height) {
         if (p->fb) vkDestroyFramebuffer(g.dev, p->fb, NULL);
-        VkImageView view = t->view;
+        VkImageView views[2] = { t->view, t->depth_view };
         VkFramebufferCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-            .renderPass = p->pass, .attachmentCount = 1, .pAttachments = &view,
+            .renderPass = p->pass, .attachmentCount = 2, .pAttachments = views,
             .width = t->width, .height = t->height, .layers = 1 };
         if (!vk_ok(vkCreateFramebuffer(g.dev, &fci, NULL, &p->fb), "vkCreateFramebuffer(reflected)")) {
             pthread_mutex_unlock(&g_lock); return 0;
         }
         p->fb_view = t->view; p->fb_w = t->width; p->fb_h = t->height;
     }
+
+    /* Pre-scan descriptor binds: one arena slice per change, and one set pair
+     * per epoch.  UBO/SSBO slices are selected by dynamic offsets, so two
+     * draws in the same command buffer can see different constant data. */
+    uint32_t changes[2][GFX_REFLECT_MAX_BINDINGS];
+    memset(changes, 0, sizeof changes);
+    uint32_t nbinds = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const GfxCmd *c = &cmds[i];
+        if (c->kind != GFX_CMD_BIND_DESC) continue;
+        nbinds++;
+        if (c->u.bind.kind != GFX_DESC_UBO && c->u.bind.kind != GFX_DESC_SSBO) continue;
+        int idx = reflect_find_bind_spec(p, c->u.bind.stage, c->u.bind.slot, c->u.bind.kind);
+        if (idx < 0) continue;
+        int set = c->u.bind.stage == 0 ? 0 : 1;
+        size_t stride = reflect_align(c->u.bind.size ? c->u.bind.size : 1);
+        if (stride > p->dyn_stride[set][idx]) p->dyn_stride[set][idx] = stride;
+        changes[set][idx]++;
+    }
+    for (uint32_t s = 0; s < 2; s++)
+        for (uint32_t i = 0; i < p->nspec[s]; i++) {
+            if (!changes[s][i]) continue;
+            size_t stride = p->dyn_stride[s][i] ? p->dyn_stride[s][i] : REFLECT_ALIGN;
+            size_t need = stride * (changes[s][i] + 1);
+            if (need > (64u << 20) || !reflect_arena_ensure(p, (int)s, (int)i, need)) {
+                vk_log("ERROR reflected arena too large/alloc failed set=%u binding=%u need=%zu",
+                       s, p->spec[s][i].binding, need);
+                changes[s][i] = 0;
+            }
+        }
+    if (nbinds) vkResetDescriptorPool(g.dev, p->dpool_draw, 0);
+    ReflectEpochState *st = calloc(1, sizeof *st);
+    if (!st) { pthread_mutex_unlock(&g_lock); return 0; }
+    for (uint32_t s = 0; s < 2; s++)
+        for (uint32_t i = 0; i < p->nspec[s]; i++)
+            st->dyn[s][i] = changes[s][i] ? 1 : 0;
+    VkDescriptorSet cur_sets[2] = { p->dset[0], p->dset[1] };
+    uint32_t cur_epochs = 0;
+    uint32_t used[2][GFX_REFLECT_MAX_BINDINGS];
+    memset(used, 0, sizeof used);
 
     /* Upload the guest stream ranges before recording.  These buffers are
      * host-visible and are rebuilt only when the bound range grows. */
@@ -2656,13 +3151,14 @@ int gfx_backend_reflected_execute_ex(GfxReflectedPipeline *p, GfxOffscreenTarget
                                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) ||
             !vk_reflect_upload(p->vbuf_mem[binding], 0, streams[s].data, streams[s].size)) {
             vk_log("ERROR reflected vertex stream upload binding=%u size=%zu", binding, streams[s].size);
+            free(st);
             pthread_mutex_unlock(&g_lock);
             return 0;
         }
     }
 
     size_t *index_offsets = calloc(count ? count : 1, sizeof *index_offsets);
-    if (!index_offsets) { pthread_mutex_unlock(&g_lock); return 0; }
+    if (!index_offsets) { free(st); pthread_mutex_unlock(&g_lock); return 0; }
     size_t index_total = 0;
     for (uint32_t i = 0; i < count; i++) {
         if (cmds[i].kind != GFX_CMD_DRAW_INDEXED) continue;
@@ -2678,6 +3174,7 @@ int gfx_backend_reflected_execute_ex(GfxReflectedPipeline *p, GfxOffscreenTarget
         if (!vk_reflect_ensure_buffer(&p->index_buf, &p->index_mem, &p->index_cap,
                                       index_total, VK_BUFFER_USAGE_INDEX_BUFFER_BIT)) {
             free(index_offsets);
+            free(st);
             pthread_mutex_unlock(&g_lock);
             return 0;
         }
@@ -2690,19 +3187,31 @@ int gfx_backend_reflected_execute_ex(GfxReflectedPipeline *p, GfxOffscreenTarget
             if (it == 0) {
                 size_t n = c->u.draw_indexed.count;
                 uint16_t *wide = malloc(n * 2);
-                if (!wide) { free(index_offsets); pthread_mutex_unlock(&g_lock); return 0; }
+                if (!wide) { free(index_offsets); free(st); pthread_mutex_unlock(&g_lock); return 0; }
                 const uint8_t *in = c->u.draw_indexed.indices;
                 for (size_t k = 0; k < n; k++) wide[k] = in[k];
                 int ok = vk_reflect_upload(p->index_mem, index_offsets[i], wide, n * 2);
                 free(wide);
-                if (!ok) { free(index_offsets); pthread_mutex_unlock(&g_lock); return 0; }
+                if (!ok) { free(index_offsets); free(st); pthread_mutex_unlock(&g_lock); return 0; }
             } else if (!vk_reflect_upload(p->index_mem, index_offsets[i],
                                           c->u.draw_indexed.indices, src)) {
                 free(index_offsets);
+                free(st);
                 pthread_mutex_unlock(&g_lock);
                 return 0;
             }
         }
+    }
+
+    /* Create state variants before recording; some drivers dislike pipeline
+     * creation inside an active render pass. */
+    for (uint32_t i = 0; i < count; i++) {
+        const GfxPipelineState *ps = NULL;
+        if (cmds[i].kind == GFX_CMD_DRAW && cmds[i].u.draw.has_state)
+            ps = &cmds[i].u.draw.state;
+        else if (cmds[i].kind == GFX_CMD_DRAW_INDEXED && cmds[i].u.draw_indexed.has_state)
+            ps = &cmds[i].u.draw_indexed.state;
+        if (ps) (void)reflect_pipeline_for_state(p, ps);
     }
 
     float clear[4] = { 0.05f, 0.08f, 0.12f, 1.0f };
@@ -2715,16 +3224,23 @@ int gfx_backend_reflected_execute_ex(GfxReflectedPipeline *p, GfxOffscreenTarget
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     if (!vk_ok(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer(reflected-execute)")) {
         free(index_offsets);
+        free(st);
         pthread_mutex_unlock(&g_lock); return 0;
     }
-    VkClearValue cv = { .color = { .float32 = { clear[0], clear[1], clear[2], clear[3] } } };
+    VkClearValue cv[2] = {
+        { .color = { .float32 = { clear[0], clear[1], clear[2], clear[3] } } },
+        { .depthStencil = { 1.0f, 0 } },
+    };
     VkRenderPassBeginInfo rp = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .renderPass = p->pass, .framebuffer = p->fb,
-        .renderArea = { { 0, 0 }, { t->width, t->height } }, .clearValueCount = 1, .pClearValues = &cv };
+        .renderArea = { { 0, 0 }, { t->width, t->height } }, .clearValueCount = 2, .pClearValues = cv };
     vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pipe);
-    VkDescriptorSet sets[2] = { p->dset[0], p->dset[1] };
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, 2, sets, 0, NULL);
+    {
+        const float zero[4] = { 0, 0, 0, 0 };
+        vkCmdSetBlendConstants(cmd, zero);
+        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+    }
     for (uint32_t s = 0; s < nstreams; s++) {
         uint32_t binding = streams[s].binding;
         if (binding >= 16 || !streams[s].data || !streams[s].size) continue;
@@ -2751,6 +3267,17 @@ int gfx_backend_reflected_execute_ex(GfxReflectedPipeline *p, GfxOffscreenTarget
             vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
             break;
         }
+        case GFX_CMD_CLEAR_DEPTH_STENCIL: {
+            VkClearAttachment ca = { .clearValue = { .depthStencil = {
+                c->u.clear_depth.depth, (uint32_t)c->u.clear_depth.stencil } } };
+            if (c->u.clear_depth.dmask) ca.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+            if (c->u.clear_depth.smask) ca.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            if (ca.aspectMask) {
+                VkClearRect cr = { { { 0, 0 }, { t->width, t->height } }, 0, 1 };
+                vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
+            }
+            break;
+        }
         case GFX_CMD_SET_VIEWPORT:
             viewport = (VkViewport){ (float)c->u.rect.x, (float)c->u.rect.y,
                                      (float)c->u.rect.width, (float)c->u.rect.height, 0, 1 };
@@ -2764,10 +3291,55 @@ int gfx_backend_reflected_execute_ex(GfxReflectedPipeline *p, GfxOffscreenTarget
                 vkCmdSetScissor(cmd, 0, 1, &scissor);
             }
             break;
+        case GFX_CMD_BIND_DESC: {
+            const GfxCmd *b = c;
+            int idx = reflect_find_bind_spec(p, b->u.bind.stage, b->u.bind.slot, b->u.bind.kind);
+            if (idx < 0) break;
+            int set = b->u.bind.stage == 0 ? 0 : 1;
+            if (b->u.bind.kind == GFX_DESC_UBO || b->u.bind.kind == GFX_DESC_SSBO) {
+                if (!st->dyn[set][idx] || !p->dyn_buf[set][idx]) break;
+                size_t stride = p->dyn_stride[set][idx];
+                used[set][idx]++;
+                size_t off = stride * used[set][idx];
+                if (off + b->u.bind.size > p->dyn_cap[set][idx] ||
+                    !vk_reflect_upload(p->dyn_mem[set][idx], off, b->u.bind.data, b->u.bind.size)) {
+                    vk_log("ERROR reflected binding upload set=%d slot=%u size=%zu",
+                           set, b->u.bind.slot, b->u.bind.size);
+                    break;
+                }
+                if (b->u.bind.kind == GFX_DESC_UBO) st->ubo_off[set][idx] = off;
+                else st->ssbo_off[set][idx] = off;
+            } else {
+                st->tex[set][idx] = b->u.bind.texture;
+                st->samp[set][idx] = b->u.bind.sampler;
+            }
+            if (cur_epochs < GFX_DESC_MAX_EPOCHS) {
+                VkDescriptorSetLayout layouts[2] = { p->dsl[0], p->dsl[1] };
+                VkDescriptorSetAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                    .descriptorPool = p->dpool_draw, .descriptorSetCount = 2, .pSetLayouts = layouts };
+                VkDescriptorSet ns[2];
+                if (vkAllocateDescriptorSets(g.dev, &ai, ns) == VK_SUCCESS) {
+                    cur_sets[0] = ns[0]; cur_sets[1] = ns[1];
+                    reflect_write_epoch_set(p, 0, ns[0], st);
+                    reflect_write_epoch_set(p, 1, ns[1], st);
+                    cur_epochs++;
+                } else {
+                    vk_log("ERROR reflected epoch set allocation failed at %u", cur_epochs);
+                }
+            } else {
+                static unsigned epoch_full_logged;
+                if (epoch_full_logged++ < 4)
+                    vk_log("ERROR reflected descriptor epoch limit (%u) reached; reusing last set",
+                           GFX_DESC_MAX_EPOCHS);
+            }
+            break;
+        }
         case GFX_CMD_DRAW: {
             uint32_t prim = c->u.draw.primitive;
             if (vk_reflect_topology(prim) != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
                 vk_log("reflected execute: primitive %u uses the TRIANGLE_LIST pipeline", prim);
+            reflect_bind_epoch_sets(cmd, p, cur_sets, st);
+            reflect_apply_draw_state(cmd, p, c->u.draw.has_state ? &c->u.draw.state : NULL);
             vkCmdDraw(cmd, c->u.draw.count, 1, c->u.draw.first, 0);
             break;
         }
@@ -2775,6 +3347,9 @@ int gfx_backend_reflected_execute_ex(GfxReflectedPipeline *p, GfxOffscreenTarget
             uint32_t prim = c->u.draw_indexed.primitive;
             if (vk_reflect_topology(prim) != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
                 vk_log("reflected execute: indexed primitive %u uses the TRIANGLE_LIST pipeline", prim);
+            reflect_bind_epoch_sets(cmd, p, cur_sets, st);
+            reflect_apply_draw_state(cmd, p, c->u.draw_indexed.has_state
+                                              ? &c->u.draw_indexed.state : NULL);
             vkCmdBindIndexBuffer(cmd, p->index_buf, index_offsets[i],
                                  vk_reflect_index_type(c->u.draw_indexed.index_type));
             vkCmdDrawIndexed(cmd, c->u.draw_indexed.count, 1, 0,
@@ -2797,17 +3372,20 @@ int gfx_backend_reflected_execute_ex(GfxReflectedPipeline *p, GfxOffscreenTarget
                          0, 0, NULL, 1, &bb, 0, NULL);
     if (!vk_submit_and_wait(cmd, "reflected-execute")) {
         free(index_offsets);
+        free(st);
         pthread_mutex_unlock(&g_lock); return 0;
     }
     t->layout = VK_IMAGE_LAYOUT_GENERAL;
     void *mapped = NULL;
     if (!vk_ok(vkMapMemory(g.dev, t->readback_mem, 0, VK_WHOLE_SIZE, 0, &mapped), "vkMapMemory(reflected-execute)")) {
         free(index_offsets);
+        free(st);
         pthread_mutex_unlock(&g_lock); return 0;
     }
     memcpy(t->pixels, mapped, t->pixels_size);
     vkUnmapMemory(g.dev, t->readback_mem);
     free(index_offsets);
+    free(st);
     pthread_mutex_unlock(&g_lock);
     return 1;
 }
@@ -2815,7 +3393,10 @@ int gfx_backend_reflected_execute_ex(GfxReflectedPipeline *p, GfxOffscreenTarget
 int gfx_backend_reflected_draw(GfxReflectedPipeline *p, GfxOffscreenTarget *t,
                                float r, float g_, float b, float a) {
     const float clear[4] = { r, g_, b, a };
-    GfxCmd cmd = { .kind = GFX_CMD_DRAW, .u.draw = { 4, 0, 3 } };
+    GfxCmd cmd = { .kind = GFX_CMD_DRAW };
+    cmd.u.draw.primitive = 4;
+    cmd.u.draw.first = 0;
+    cmd.u.draw.count = 3;
     return gfx_backend_reflected_execute(p, t, &cmd, 1, clear);
 }
 

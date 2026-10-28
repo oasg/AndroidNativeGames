@@ -56,6 +56,11 @@ typedef struct {
  * at the call site, not here. */
 int runtime_shader_cache_load(const char *root, const RuntimeShaderIdentity *id,
                               RuntimeShaderModule *out);
+/* Load <key>-<suffix>.spv, falling back to the canonical <key>.spv. */
+int runtime_shader_cache_load_variant(const char *root, const RuntimeShaderIdentity *id,
+                                      const char *suffix, RuntimeShaderModule *out);
+/* 1 when at least one <key>-*.spv exists (cheap directory scan). */
+int runtime_shader_cache_has_variants(const char *root, const RuntimeShaderIdentity *id);
 void runtime_shader_cache_module_free(RuntimeShaderModule *module);
 
 /* Persist one translated module.  Used by the cache probe and by host-side
