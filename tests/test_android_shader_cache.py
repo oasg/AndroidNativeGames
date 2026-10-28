@@ -1,20 +1,58 @@
-"""The Android shader-cache packer writes the runtime key + stage layout."""
+"""The Android shader-cache packer writes the runtime key + stage layout.
+
+Also covers the offline answer/variant naming shared by shader_spike.py,
+translate_dump.py and nvn_variant_suffix() in nvn_android.c.
+"""
 import json
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-TOOL = ROOT/'games/totk/android/tools/prepare_shader_cache.py'
+TOOLS = ROOT/'games/totk/android/tools'
+PACKER = TOOLS/'prepare_shader_cache.py'
+TRANSLATE_DUMP = TOOLS/'translate_dump.py'
 MAGIC = b'\x03\x02\x23\x07'
 VS_KEY = 'a'*64
 PS_KEY = 'b'*64
 
+sys.path.insert(0, str(TOOLS))
+import prepare_shader_cache as pack  # noqa: E402
+
 
 def spv(tag=b'\x01'):
     return MAGIC + tag*16
+
+
+def control_bytes(stage=0, length=0x100):
+    control = bytearray(0x880)
+    struct.pack_into('<I', control, 0x20, 0x880)
+    struct.pack_into('<II', control, 0x700, 0, length)
+    struct.pack_into('<I', control, 0x714, stage)
+    return bytes(control)
+
+
+FAKE_TRANSLATOR = '''#!/usr/bin/env python3
+import json, pathlib, sys
+jobs = json.loads(pathlib.Path(sys.argv[1]).read_text())
+out = pathlib.Path(sys.argv[2])
+out.mkdir(parents=True, exist_ok=True)
+MAGIC = b'\\x03\\x02\\x23\\x07'
+for job in jobs:
+    key = job['key']
+    if key.startswith('bad'):
+        (out/(key+'.spv')).write_bytes(b'not spirv')
+        continue
+    tag = key.encode()[:16].ljust(16, b'\\x00')
+    (out/(key+'.spv')).write_bytes(MAGIC + tag)
+    (out/(key+'.res.json')).write_text(json.dumps(dict(
+        key=key, stage=job['stage'], cbufs=[], sbufs=[],
+        textures=[dict(binding=1, slot=8, array=1, handle=8)] if job['stage'] == 'ps' else [],
+        images=[])))
+'''
 
 
 class AndroidShaderCachePacker(unittest.TestCase):
@@ -36,7 +74,7 @@ class AndroidShaderCachePacker(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_tool(self, out, *args):
-        return subprocess.run([sys.executable, str(TOOL), '--spike', str(self.spike),
+        return subprocess.run([sys.executable, str(PACKER), '--spike', str(self.spike),
                                '--out', str(out), *args],
                               capture_output=True, text=True)
 
@@ -49,6 +87,7 @@ class AndroidShaderCachePacker(unittest.TestCase):
         self.assertEqual((out/'ps'/(PS_KEY+'.spv')).read_bytes(), spv(b'\x02'))
         meta = json.loads((out/'cache.json').read_text())
         self.assertEqual(meta['modules'], 2)
+        self.assertEqual(meta['canonical'], 2)
         self.assertFalse(meta['skipped'])
 
     def test_bad_modules_are_skipped_not_packed(self):
@@ -71,9 +110,24 @@ class AndroidShaderCachePacker(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         variant = out/'vs'/(VS_KEY+'-aff_______________.spv')
         self.assertEqual(variant.read_bytes(), spv())
+        self.assertTrue((out/'vs'/(VS_KEY+'-aff_______________.res.json')).is_file())
         self.assertTrue((out/'vs'/(VS_KEY+'.spv')).is_file())
         meta = json.loads((out/'cache.json').read_text())
         self.assertEqual(meta['modules'], 3)
+        self.assertEqual(meta['variants'], 1)
+
+    def test_variant_without_canonical_is_reported(self):
+        (self.spike/'spike-report.json').write_text(json.dumps(dict(modules=[
+            dict(key='system-vs-deadbeef', nvn_key=VS_KEY, stage='vs',
+                 variant='af_______________'),
+        ])))
+        out = self.root/'cache'
+        r = self.run_tool(out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((out/'vs'/(VS_KEY+'-af_______________.spv')).is_file())
+        self.assertIn('no canonical', r.stderr)
+        meta = json.loads((out/'cache.json').read_text())
+        self.assertEqual(meta['missing_canonical'], [VS_KEY])
 
     def test_clean_removes_stale_entries(self):
         out = self.root/'cache'
@@ -87,6 +141,134 @@ class AndroidShaderCachePacker(unittest.TestCase):
         (self.spike/'spike-report.json').write_text(json.dumps(dict(modules=[])))
         r = self.run_tool(self.root/'cache')
         self.assertNotEqual(r.returncode, 0)
+
+
+class AnswerSuffix(unittest.TestCase):
+    def test_nvn_vertex_format_classes(self):
+        self.assertEqual(pack.nvn_attr_class(0x22), 'f')   # R32G32B32A32Float
+        self.assertEqual(pack.nvn_attr_class(0x23), 'u')   # R32G32B32A32Uint
+        self.assertEqual(pack.nvn_attr_class(0x24), 's')   # R32G32B32A32Sint
+        self.assertEqual(pack.nvn_attr_class(0x01), 'f')
+
+    def test_attr_suffix_from_formats(self):
+        suffix = pack.answer_suffix(dict(formats=[0x22, 0x24, 0x23]))
+        self.assertEqual(suffix, 'afsu' + '_'*13)
+        self.assertFalse(pack.answer_suffix(dict(formats=[])))
+
+    def test_tex_rows_keep_reflection_order(self):
+        suffix = pack.answer_suffix(dict(
+            attr={'0': 'float', '1': 'uint'},
+            tex={'10': '2d', '8': '2d'}))
+        self.assertEqual(suffix, 'afu______________-t10_2d-t8_2d')
+
+    def test_tex_targets_and_depth(self):
+        self.assertEqual(pack.answer_suffix(dict(tex={'3': 'cube_depth'})),
+                         't3_cubed')
+        self.assertEqual(pack.answer_suffix(dict(tex={'10': '2darray'})),
+                         't10_2da')
+        self.assertEqual(pack.answer_suffix(dict(tex={'0': '1darray'})),
+                         't0_1da')
+
+    def test_explicit_name_wins_and_attr_normalizes(self):
+        self.assertEqual(pack.answer_suffix(dict(name='aff_______________')), 
+                         'aff_______________')
+        self.assertEqual(pack.answer_attr(dict(formats=[0x22, 0x24, 0x23])),
+                         {'0': 'float', '1': 'sint', '2': 'uint'})
+
+
+class TranslateDump(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.dump = self.root/'dump'
+        self.dump.mkdir()
+        self.translator = self.root/'fake-xlate'
+        self.translator.write_text(FAKE_TRANSLATOR)
+        self.translator.chmod(0o755)
+        self.add_shader(VS_KEY, stage=0)
+        self.add_shader(PS_KEY, stage=1)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def add_shader(self, key, stage):
+        (self.dump/(key+'.ctl')).write_bytes(control_bytes(stage))
+        (self.dump/(key+'.code')).write_bytes(bytes(0x200))
+
+    def run_tool(self, out, *args):
+        return subprocess.run([sys.executable, str(TRANSLATE_DUMP),
+                               '--dump', str(self.dump), '--out', str(out),
+                               '--translator', str(self.translator), *args],
+                              capture_output=True, text=True)
+
+    def test_canonical_always_written(self):
+        out = self.root/'cache'
+        r = self.run_tool(out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((out/'vs'/(VS_KEY+'.spv')).is_file())
+        self.assertTrue((out/'ps'/(PS_KEY+'.res.json')).is_file())
+        report = json.loads((out/'translation-report.json').read_text())
+        self.assertEqual(report['summary']['canonical'], 2)
+        self.assertEqual(report['summary']['variants'], 0)
+
+    def test_answers_add_variants_and_keep_canonical(self):
+        answers = self.root/'answers.json'
+        answers.write_text(json.dumps([
+            dict(attr={'0': 'float', '1': 'uint'}, tex={'10': '2d', '8': '2d'}),
+            dict(formats=[0x22, 0x24]),
+        ]))
+        out = self.root/'cache'
+        r = self.run_tool(out, '--answers', str(answers))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((out/'vs'/(VS_KEY+'.spv')).is_file())
+        self.assertTrue((out/'ps'/(PS_KEY+'.spv')).is_file())
+        suffix = 'afu______________-t10_2d-t8_2d'
+        self.assertTrue((out/'vs'/(VS_KEY+'-'+suffix+'.spv')).is_file())
+        self.assertTrue((out/'ps'/(PS_KEY+'-'+suffix+'.res.json')).is_file())
+        self.assertTrue((out/'vs'/(VS_KEY+'-afs______________.spv')).is_file())
+        report = json.loads((out/'translation-report.json').read_text())
+        self.assertEqual(report['summary']['canonical'], 2)
+        self.assertEqual(report['summary']['variants'], 4)
+        row = next(x for x in report['keys'] if x['key'] == VS_KEY)
+        self.assertEqual(len(row['variants']), 2)
+
+    def test_auto_answers_use_the_canonical_reflection(self):
+        out = self.root/'cache'
+        r = self.run_tool(out, '--answers', 'auto')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # The fake PS reflection names texture slot 8, so the derived suffix is
+        # exactly what nvn_variant_suffix() would build for that bind state.
+        self.assertTrue((out/'ps'/(PS_KEY+'-t8_2d.spv')).is_file())
+        self.assertTrue((out/'ps'/(PS_KEY+'.spv')).is_file())
+
+    def test_missing_answers_file_fails(self):
+        r = self.run_tool(self.root/'cache', '--answers', str(self.root/'nope.json'))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('answers file not found', r.stderr)
+
+    def test_empty_answer_row_fails(self):
+        answers = self.root/'answers.json'
+        answers.write_text(json.dumps([{}]))
+        r = self.run_tool(self.root/'cache', '--answers', str(answers))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('no name/attr/formats/tex', r.stderr)
+
+    def test_bad_module_is_skipped(self):
+        self.add_shader('bad'+('0'*61), stage=0)
+        out = self.root/'cache'
+        r = self.run_tool(out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse((out/'vs'/('bad'+('0'*61)+'.spv')).exists())
+        report = json.loads((out/'translation-report.json').read_text())
+        self.assertTrue(any('bad' in x['key'] for x in report['skipped']))
+
+    def test_clean_removes_stale_entries(self):
+        out = self.root/'cache'
+        out.mkdir()
+        (out/'stale.spv').write_bytes(spv())
+        r = self.run_tool(out, '--clean')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse((out/'stale.spv').exists())
 
 
 if __name__ == '__main__':
