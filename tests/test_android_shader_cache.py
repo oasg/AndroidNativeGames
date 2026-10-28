@@ -308,5 +308,113 @@ class ShaderSpikeAnswers(unittest.TestCase):
             self.assertIn('non-empty JSON list', r.stderr)
 
 
+class LowAddressResolver(unittest.TestCase):
+    """Compile the pure resolver and exercise a synthetic BAHS pool."""
+
+    TEST_C = r'''
+#include "shader_cache_android.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+
+static void put32(void *p, uint32_t v) { memcpy(p, &v, 4); }
+
+int main(void) {
+    static unsigned char region[0x8000];
+    const size_t h = 0x1000, rec = 0x100, pool = 0x2000, pool_size = 0x3000;
+    memset(region, 0, sizeof region);
+    memcpy(region + h, "BAHS", 4);
+    put32(region + h + 20, (uint32_t)rec);
+    put32(region + h + 24, (uint32_t)pool_size);
+    put32(region + h + 28, (uint32_t)pool);
+
+    unsigned char *control = region + 0x2000;
+    put32(control + 0x20, 0x880);
+    put32(control + 0x700, 0x100);       /* c1 */
+    put32(control + 0x704, 0x100);       /* length */
+    put32(control + 0x714, 0);           /* stage = vs */
+
+    unsigned char *code = region + h + pool + 0x400;
+    put32(code, 0x12345678u);
+    put32(code + 0x30, 0xfe0007e1u);     /* Maxwell instruction */
+
+    RuntimeShaderResolveInfo info;
+    const void *out = NULL;
+    if (!runtime_shader_resolve_in_region(region, sizeof region, control, 0x400,
+                                          &out, &info) ||
+        out != code || strcmp(info.why, "bahs-pool") != 0) {
+        printf("FAIL bahs-pool out=%p want=%p why=%s\n", out, (void *)code,
+               info.why ? info.why : "?");
+        return 1;
+    }
+    printf("ok bahs-pool\n");
+
+    /* A genuine pointer is passed through. */
+    out = NULL;
+    if (!runtime_shader_resolve_in_region(region, sizeof region, control, 0x100000,
+                                          &out, &info) ||
+        out != (const void *)(uintptr_t)0x100000 || strcmp(info.why, "pointer") != 0) {
+        printf("FAIL pointer why=%s\n", info.why ? info.why : "?");
+        return 1;
+    }
+    printf("ok pointer\n");
+
+    /* Corrupt code magic: the pool candidate must be rejected. */
+    put32(code, 0);
+    out = NULL;
+    if (runtime_shader_resolve_in_region(region, sizeof region, control, 0x400,
+                                         &out, &info) || out != NULL ||
+        strcmp(info.why, "bahs-pool-bad-code") != 0) {
+        printf("FAIL miss out=%p why=%s\n", out, info.why ? info.why : "?");
+        return 1;
+    }
+    printf("ok miss\n");
+
+    /* No BAHS: an absolute mapping-base offset still validates. */
+    memset(region, 0, sizeof region);
+    code = region + 0x400;
+    put32(code, 0x12345678u);
+    put32(code + 0x30, 0xfe0007e1u);
+    control = region + 0x2000;
+    put32(control + 0x20, 0x880);
+    put32(control + 0x700, 0x100);
+    put32(control + 0x704, 0x100);
+    put32(control + 0x714, 0);
+    out = NULL;
+    if (!runtime_shader_resolve_in_region(region, sizeof region, control, 0x400,
+                                          &out, &info) ||
+        out != code || strcmp(info.why, "mapping-absolute") != 0) {
+        printf("FAIL absolute out=%p why=%s\n", out, info.why ? info.why : "?");
+        return 1;
+    }
+    printf("ok absolute\n");
+    return 0;
+}
+'''
+
+    def test_low_offset_resolves_to_the_package_code_pool(self):
+        import shutil
+        cc = shutil.which('cc') or shutil.which('clang')
+        if not cc:
+            self.skipTest('no C compiler')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root/'resolve_test.c'
+            src.write_text(self.TEST_C)
+            exe = root/'resolve_test'
+            r = subprocess.run([
+                cc, '-std=c11', '-O1', '-I', str(ROOT/'games/totk/android'),
+                str(src), str(ROOT/'games/totk/android/shader_cache_android.c'),
+                str(ROOT/'games/totk/android/sha256.c'), '-o', str(exe)],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            run = subprocess.run([str(exe)], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            self.assertIn('ok bahs-pool', run.stdout)
+            self.assertIn('ok pointer', run.stdout)
+            self.assertIn('ok miss', run.stdout)
+            self.assertIn('ok absolute', run.stdout)
+
+
 if __name__ == '__main__':
     unittest.main()

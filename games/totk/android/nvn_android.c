@@ -433,7 +433,7 @@ typedef struct {
     void *gfx_textured_pipeline;
     void *gfx_texture;
     void *gfx_reflected_pipeline;  /* full .res.json descriptor layout */
-    void *shader_state;       /* host-only cached SPIR-V / lazy pipeline */
+    void *shader_state;       /* obsolete: shader state lives in prog_state map */
     uint32_t textured;
     uint64_t serial;
 } prog_t;
@@ -2987,6 +2987,62 @@ static void prog_state_clear_locked(prog_shader_state_t *s) {
     s->loaded = 0;
 }
 
+/* Host-side program -> shader-state map.  NVNprogram is an opaque 0xC0-byte
+ * guest object; keeping host pointers inside it lets guest writes clobber
+ * them (TOTK overwrites the low half of the old inline shader_state field
+ * with 0x0003 before the first draw).  The map lives outside guest memory. */
+typedef struct prog_state_slot {
+    struct prog_state_slot *next;
+    prog_t *program;
+    prog_shader_state_t *state;
+} prog_state_slot_t;
+
+#define PROG_STATE_BUCKETS 4096
+static prog_state_slot_t *g_prog_states[PROG_STATE_BUCKETS];
+
+static unsigned prog_state_hash(const prog_t *p) {
+    uintptr_t v = (uintptr_t)p >> 4;
+    v ^= v >> 17;
+    v *= 0x9e3779b97f4a7c15ull;
+    return (unsigned)(v & (PROG_STATE_BUCKETS - 1));
+}
+
+static prog_shader_state_t *prog_state_find(prog_t *p) {
+    for (prog_state_slot_t *e = g_prog_states[prog_state_hash(p)]; e; e = e->next)
+        if (e->program == p) return e->state;
+    return NULL;
+}
+
+static prog_shader_state_t *prog_state_install(prog_t *p, prog_shader_state_t *s) {
+    unsigned b = prog_state_hash(p);
+    for (prog_state_slot_t *e = g_prog_states[b]; e; e = e->next) {
+        if (e->program == p) { e->state = s; return s; }
+    }
+    prog_state_slot_t *e = calloc(1, sizeof *e);
+    if (!e) return NULL;
+    e->program = p;
+    e->state = s;
+    e->next = g_prog_states[b];
+    g_prog_states[b] = e;
+    return s;
+}
+
+static prog_shader_state_t *prog_state_remove(prog_t *p) {
+    unsigned b = prog_state_hash(p);
+    prog_state_slot_t **link = &g_prog_states[b];
+    while (*link) {
+        prog_state_slot_t *e = *link;
+        if (e->program == p) {
+            prog_shader_state_t *s = e->state;
+            *link = e->next;
+            free(e);
+            return s;
+        }
+        link = &e->next;
+    }
+    return NULL;
+}
+
 static uint32_t nvnProgramInitialize(prog_t *p, const nvn_dev_t *d) { nvn_api("nvnProgramInitialize");
     if (!p || !nvn_obj(d, NVN_MAGIC('D', 'E', 'V', 0), "nvnProgramInitialize(device)")) return 0;
     memset(p, 0, sizeof *p);
@@ -3001,11 +3057,12 @@ static void nvnProgramFinalize(prog_t *p) {
         p->gfx_reflected_pipeline = NULL;
     }
     pthread_mutex_lock(&g_prog_lock);
-    prog_shader_state_t *s = p->shader_state;
+    prog_shader_state_t *s = prog_state_remove(p);
+    if (nvn_trace())
+        fprintf(stderr, "[totk-nvn] ProgramFinalize %p state=%p\n", (void *)p, (void *)s);
     if (s) {
         prog_state_clear_locked(s);
         free(s);
-        p->shader_state = NULL;
     }
     pthread_mutex_unlock(&g_prog_lock);
     p->magic = 0;
@@ -3044,17 +3101,26 @@ static void nvn_dump_shader(const RuntimeShaderIdentity *id, const void *control
                 id->control_key_bytes, id->code_bytes);
 }
 
+static GfxReflectedPipeline *nvn_program_cached_pipeline(prog_t *p, uint32_t nvn_format,
+                                                         const GfxRenderTargetLayout *layout,
+                                                         int legacy_window_target,
+                                                         const GfxVertexLayout *input,
+                                                         uint64_t vertex_sig,
+                                                         const char *variant);
 static uint32_t nvn_program_set_shaders(prog_t *p, int n, const void *shaders,
                                         size_t stride, const char *what) {
     if (!nvn_obj(p, NVN_MAGIC('P', 'R', 'O', 'G'), what)) return 0;
     if (n < 0 || n > 6 || (!shaders && n)) { nvn_fail(what, "invalid stage count"); return 0; }
+    if (nvn_trace())
+        fprintf(stderr, "[totk-nvn] %s entry p=%p n=%d stride=%zu thread=%#x\n",
+                what, (void *)p, n, stride, runtime_thread_current_handle());
     p->nstage = (uint32_t)n;
 
     pthread_mutex_lock(&g_prog_lock);
-    prog_shader_state_t *s = p->shader_state;
+    prog_shader_state_t *s = prog_state_find(p);
     if (!s) {
         s = calloc(1, sizeof *s);
-        p->shader_state = s;
+        if (s && !prog_state_install(p, s)) { free(s); s = NULL; }
     }
     if (!s) {
         pthread_mutex_unlock(&g_prog_lock);
@@ -3075,22 +3141,34 @@ static uint32_t nvn_program_set_shaders(prog_t *p, int n, const void *shaders,
         p->control[i] = control;
 
         RuntimeShaderIdentity id;
-        if (data < 0x100000) {
-            uint64_t raw[6] = { 0 };
-            memcpy(raw, entry, sizeof raw);
-            fprintf(stderr, "[totk-nvn] %s low data: n=%d stride=%zu slot=%d"
-                            " raw=%#llx %#llx %#llx %#llx %#llx %#llx control=%p\n",
-                    what, n, stride, i, (unsigned long long)raw[0],
-                    (unsigned long long)raw[1], (unsigned long long)raw[2],
-                    (unsigned long long)raw[3], (unsigned long long)raw[4],
-                    (unsigned long long)raw[5], control);
+        const void *code = NULL;
+        RuntimeShaderResolveInfo resolved;
+        int have_code = runtime_shader_resolve_code(control, data, &code, &resolved);
+        if (!have_code && (data < 0x100000 || nvn_trace())) {
+            fprintf(stderr, "[totk-nvn] %s unresolved low data: n=%d stride=%zu slot=%d"
+                            " control=%p data=%#llx region=%#lx-%#lx pkg=%#lx"
+                            " pool=%#x+%#x candidate=%#lx why=%s\n",
+                    what, n, stride, i, control, (unsigned long long)data,
+                    (unsigned long)resolved.region_start,
+                    (unsigned long)resolved.region_end,
+                    (unsigned long)resolved.package_base,
+                    resolved.pool_offset, resolved.pool_size,
+                    (unsigned long)resolved.candidate,
+                    resolved.why ? resolved.why : "?");
         }
-        if (!runtime_shader_identity(control, (const void *)(uintptr_t)data, &id)) {
+        if (!have_code || !runtime_shader_identity(control, code, &id)) {
             fprintf(stderr, "[totk-nvn] %s program=%p slot=%d: no NVN shader identity"
-                            " (control=%p data=%#llx)\n",
-                    what, (void *)p, i, control, (unsigned long long)data);
+                            " (control=%p data=%#llx code=%p why=%s)\n",
+                    what, (void *)p, i, control, (unsigned long long)data, code,
+                    resolved.why ? resolved.why : "?");
             continue;
         }
+        if (data < 0x100000 && (nvn_trace() || i == 0))
+            fprintf(stderr, "[totk-nvn] %s resolved low data slot=%d %#llx -> %p"
+                            " (%s pkg=%#lx pool=%#x+%#x bytes=%u)\n",
+                    what, i, (unsigned long long)data, code,
+                    resolved.why ? resolved.why : "?", (unsigned long)resolved.package_base,
+                    resolved.pool_offset, resolved.pool_size, id.code_bytes);
         RuntimeShaderModule mod;
         if (runtime_shader_cache_load(runtime_shader_cache_root(), &id, &mod)) {
             prog_stage_clear(s, id.stage);
@@ -3107,7 +3185,7 @@ static uint32_t nvn_program_set_shaders(prog_t *p, int n, const void *shaders,
                         hit, runtime_shader_stage_name(id.stage), id.key, id.code_bytes,
                         mod.res_path[0] ? " +res.json" : "");
         } else {
-            nvn_dump_shader(&id, control, (const void *)(uintptr_t)data);
+            nvn_dump_shader(&id, control, code);
             prog_stage_clear(s, id.stage);
             unsigned miss = __atomic_add_fetch(&g_shader_cache_misses, 1, __ATOMIC_RELAXED);
             if (miss <= 32 || nvn_trace())
@@ -3119,9 +3197,29 @@ static uint32_t nvn_program_set_shaders(prog_t *p, int n, const void *shaders,
 
     int ready = (s->loaded & ((1u << 0) | (1u << 1))) == ((1u << 0) | (1u << 1));
     if (ready && nvn_trace())
-        fprintf(stderr, "[totk-nvn] program=%p has cached vs=%s ps=%s\n",
-                (void *)p, s->key[0], s->key[1]);
+        fprintf(stderr, "[totk-nvn] program=%p has cached vs=%s ps=%s state=%p loaded=%#x\n",
+                (void *)p, s->key[0], s->key[1], (void *)s, s->loaded);
     pthread_mutex_unlock(&g_prog_lock);
+    if (ready) {
+        /* Prime the reflected pipeline on the game/recording thread.  A first
+         * vkCreateGraphicsPipelines issued on the submit thread for these real
+         * TOTK shaders aborts inside the driver; the same call succeeds here
+         * and the submit path then reuses the cached pipeline (same layout,
+         * format and window signature).  Only the first ready program warms
+         * the driver; later pipelines reuse or build normally. */
+        static int warmed;
+        if (!warmed) {
+            warmed = 1;
+            GfxRenderTargetLayout warm_layout = { 0 };
+            warm_layout.color_count = 1;
+            warm_layout.color_formats[0] = gfx_backend_vk_format_for_nvn(0x25);
+            GfxReflectedPipeline *rp =
+                nvn_program_cached_pipeline(p, 0x25, &warm_layout, 1, NULL, 0, "");
+            if (nvn_trace())
+                fprintf(stderr, "[totk-nvn] warm pipeline program=%p -> %p\n",
+                        (void *)p, (void *)rp);
+        }
+    }
     return 1;
 }
 
@@ -3294,7 +3392,9 @@ static const char *nvn_tex_target_name(int target) {
  * translator must be run with the matching attr/tex answers. */
 static void nvn_variant_suffix(prog_t *p, const cb_t *cb, char *out, size_t cap) {
     out[0] = 0;
-    prog_shader_state_t *s = p ? p->shader_state : NULL;
+    pthread_mutex_lock(&g_prog_lock);
+    prog_shader_state_t *s = p ? prog_state_find(p) : NULL;
+    pthread_mutex_unlock(&g_prog_lock);
     if (!s || !cb || !cb->bind_state) return;
     if (!runtime_shader_cache_has_variants(runtime_shader_cache_root(), &s->id[0]) &&
         !runtime_shader_cache_has_variants(runtime_shader_cache_root(), &s->id[1]))
@@ -3350,14 +3450,22 @@ static GfxReflectedPipeline *nvn_program_cached_pipeline(prog_t *p, uint32_t nvn
                                                          uint64_t vertex_sig,
                                                          const char *variant) {
     pthread_mutex_lock(&g_prog_lock);
-    prog_shader_state_t *s = p->shader_state;
+    prog_shader_state_t *s = prog_state_find(p);
     if (!s || (s->loaded & ((1u << 0) | (1u << 1))) != ((1u << 0) | (1u << 1))) {
+        if (nvn_trace())
+            fprintf(stderr, "[totk-nvn] cached pipeline: program=%p state=%p loaded=%#x (stages missing)\n",
+                    (void *)p, (void *)s, s ? s->loaded : 0);
         pthread_mutex_unlock(&g_prog_lock);
         return NULL;
     }
     int fmt = (layout && layout->color_count) ? layout->color_formats[0] : 0;
     if (!fmt) fmt = gfx_backend_vk_format_for_nvn(nvn_format);
     if (!fmt) {
+        if (nvn_trace())
+            fprintf(stderr, "[totk-nvn] cached pipeline: program=%p no format"
+                            " layout=%p colors=%u layout_fmt=%#x nvn_fmt=%#x legacy=%d\n",
+                    (void *)p, (const void *)layout, layout ? layout->color_count : 0,
+                    layout ? layout->color_formats[0] : 0, nvn_format, legacy_window_target);
         pthread_mutex_unlock(&g_prog_lock);
         return NULL;
     }
@@ -3404,6 +3512,13 @@ static GfxReflectedPipeline *nvn_program_cached_pipeline(prog_t *p, uint32_t nvn
                                s->vspv[1] ? s->vspv[1] : s->spv[1] };
     size_t usize[2] = { s->vspv[0] ? s->vspv_size[0] : s->spv_size[0],
                         s->vspv[1] ? s->vspv_size[1] : s->spv_size[1] };
+    /* The offline PS descriptor set is 0 (the translator puts every resource
+     * in one set); the reflected pipeline layout keeps VS in set 0 and PS in
+     * set 1.  Move the PS decorations in place before the pipeline is built,
+     * exactly as runtime_nvn_program_load_spirv_reflect() does.  Without this,
+     * vkCreateGraphicsPipelines sees a shader that disagrees with its
+     * descriptor set layout. */
+    gfx_spirv_move_set((uint8_t *)uspv[1], usize[1], 0, 1);
     const char *ures[2] = { s->vres_path[0][0] ? s->vres_path[0] : s->res_path[0],
                             s->vres_path[1][0] ? s->vres_path[1] : s->res_path[1] };
     const char *upath[2] = { s->vspv[0] ? s->vspv_path[0] : s->spv_path[0],
@@ -3895,6 +4010,14 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
         if (!drew) {
             nvn_fail("nvnQueueSubmitCommands", "Vulkan draw failed");
             continue;
+        }
+        static int l2_frame_dumped;
+        const char *l2_frame = getenv("TOTK_ANDROID_L2_FRAME");
+        if (l2_frame && *l2_frame && !l2_frame_dumped) {
+            l2_frame_dumped = 1;
+            int shot = runtime_native_window_screenshot(w->native, l2_frame);
+            fprintf(stderr, "[totk-nvn] first reflected frame -> %s (%s)\n",
+                    l2_frame, shot ? "ok" : "failed");
         }
         unsigned total = __atomic_add_fetch(&nvn_nvn_draws, 1, __ATOMIC_RELAXED);
         if (total <= 32 || nvn_trace())
