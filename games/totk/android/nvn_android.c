@@ -54,6 +54,10 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n);
 static void nvn_warm_recording(void *cb);
 static int nvn_gpu_drain(const char *what);
 static void nvn_host_rt_clear(void);
+static void nvn_pool_forget(const void *pool);
+static void nvn_pipe_ubo_set(GfxReflectedPipeline *rp,
+                             const GfxBindingSpec *vss, uint32_t nvs,
+                             const GfxBindingSpec *pss, uint32_t nps);
 
 #define NVN_MAGIC(a, b, c, d) \
     ((uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24)
@@ -215,6 +219,39 @@ typedef struct {
     const void *depth_tex;
 } nvn_bind_state_t;
 
+/* Last uniform buffer bound by any command buffer, per (stage, slot).  NVN
+ * state is queue-scoped on hardware: a bind recorded on one command buffer is
+ * still live for a later submission unless another bind replaced it.  The
+ * per-CB state is merged over this snapshot at submit time. */
+typedef struct {
+    uint64_t address;
+    size_t size;
+    uint32_t valid;
+} nvn_global_ubo_t;
+static nvn_global_ubo_t g_global_ubo[6][16];
+static pthread_mutex_t g_global_ubo_lock = PTHREAD_MUTEX_INITIALIZER;
+static void nvn_global_ubo_set(int stage, int index, uint64_t address, size_t size) {
+    if (stage < 0 || stage >= 6 || index < 0 || index >= 16) return;
+    pthread_mutex_lock(&g_global_ubo_lock);
+    g_global_ubo[stage][index].address = address;
+    g_global_ubo[stage][index].size = size;
+    g_global_ubo[stage][index].valid = 1;
+    pthread_mutex_unlock(&g_global_ubo_lock);
+}
+static int nvn_global_ubo_get(int stage, int index, uint64_t *address, size_t *size) {
+    int ok = 0;
+    if (stage < 0 || stage >= 6 || index < 0 || index >= 16) return 0;
+    pthread_mutex_lock(&g_global_ubo_lock);
+    if (g_global_ubo[stage][index].valid) {
+        *address = g_global_ubo[stage][index].address;
+        *size = g_global_ubo[stage][index].size;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&g_global_ubo_lock);
+    return ok;
+}
+
+
 static const char *g_last_api = "none";
 static char g_last_proc[80] = "none";
 static int nvn_trace(void);
@@ -236,6 +273,13 @@ static int nvn_trace(void) {
     static int on = -1;
     if (on < 0) on = getenv("TOTK_ANDROID_TRACE_NVN") != NULL ||
                    getenv("TOTK_ANDROID_TRACE_FRAME") != NULL;
+    return on;
+}
+/* Focused first-frame state trace: records the command-buffer sequence that
+ * registers build a first draw from, without the full per-call NVN trace. */
+static int nvn_trace_first(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("TOTK_ANDROID_TRACE_FIRST") != NULL;
     return on;
 }
 
@@ -797,6 +841,7 @@ static uint32_t nvnQueueInitialize(queue_t *q, const queue_builder_t *b) { nvn_a
 static void nvnQueueFinalize(queue_t *q) { if (q) q->magic = 0; }
 static void nvnQueueSetDebugLabel(queue_t *q, const char *l) { (void)q; (void)l; }
 static unsigned nvn_gpu_submits, nvn_gpu_presents;
+static unsigned nvn_submit_trace, nvn_map_trace;
 
 /* Explicit CPU/GPU ordering.  The backend submits and waits synchronously, so
  * the moment a submit/present returns the GPU has finished; nvn_gpu_drain
@@ -1146,6 +1191,9 @@ static uint32_t nvnMemoryPoolInitialize(pool_t *p, const pool_builder_t *b) { nv
         p->magic = 0;
         return 0;
     }
+    if (nvn_trace_first() && nvn_map_trace++ < 2048)
+        fprintf(stderr, "[totk-nvn] MemoryPoolInitialize %p mem=%p size=%#llx flags=%#x\n",
+                (void *)p, (void *)p->mem, (unsigned long long)p->size, p->flags);
     if (getenv("TOTK_ANDROID_TRACE_NVN"))
         fprintf(stderr, "[totk-nvn] MemoryPoolInitialize %p mem=%p size=%#llx flags=%#x%s\n",
                 (void *)p, (void *)p->mem, (unsigned long long)p->size, p->flags,
@@ -1242,6 +1290,10 @@ static void *nvnBufferMap(const buf_t *b) { nvn_api("nvnBufferMap");
         return NULL;
     }
     if (!nvn_gpu_drain("nvnBufferMap")) return NULL;
+    if (nvn_trace_first() && nvn_map_trace++ < 2048)
+        fprintf(stderr, "[totk-nvn] BufferMap cb=%p buf=%p -> %p size=%llu\n",
+                NULL, (const void *)b, (void *)(b->pool->mem + b->off),
+                (unsigned long long)b->size);
     if (getenv("TOTK_ANDROID_TRACE_NVN"))
         fprintf(stderr, "[totk-nvn] BufferMap %p pool=%p mem=%p off=%lld size=%llu -> %p thread=%#x\n",
                 (const void *)b, (void *)b->pool, (void *)b->pool->mem,
@@ -1962,7 +2014,7 @@ static uint32_t nvnTexturePoolInitialize(tex_pool_t *p, const pool_t *pool, ptrd
     p->magic = NVN_MAGIC('T', 'P', 'O', 'L'); p->pool = (pool_t *)pool; p->off = off; p->n = (uint32_t)n;
     return 1;
 }
-static void nvnTexturePoolFinalize(tex_pool_t *p) { if (p) { nvn_tex_pool_forget(p); p->magic = 0; } }
+static void nvnTexturePoolFinalize(tex_pool_t *p) { if (p) { nvn_tex_pool_forget(p); nvn_pool_forget(p); p->magic = 0; } }
 static void nvnTexturePoolSetDebugLabel(tex_pool_t *p, const char *l) { (void)p; (void)l; }
 static void nvnTexturePoolRegisterTexture(const tex_pool_t *p, int id, const tex_t *t, const void *v) { nvn_api("nvnTexturePoolRegisterTexture");
     (void)v;
@@ -1984,7 +2036,7 @@ static uint32_t nvnSamplerPoolInitialize(samp_pool_t *p, const pool_t *pool, ptr
     p->magic = NVN_MAGIC('S', 'P', 'O', 'L'); p->pool = (pool_t *)pool; p->off = off; p->n = (uint32_t)n;
     return 1;
 }
-static void nvnSamplerPoolFinalize(samp_pool_t *p) { if (p) { nvn_samp_pool_forget(p); p->magic = 0; } }
+static void nvnSamplerPoolFinalize(samp_pool_t *p) { if (p) { nvn_samp_pool_forget(p); nvn_pool_forget(p); p->magic = 0; } }
 static void nvnSamplerPoolSetDebugLabel(samp_pool_t *p, const char *l) { (void)p; (void)l; }
 static void nvnSamplerPoolRegisterSampler(const samp_pool_t *p, int id, const samp_t *s) { nvn_api("nvnSamplerPoolRegisterSampler");
     if (getenv("TOTK_ANDROID_TRACE_NVN"))
@@ -2036,10 +2088,43 @@ typedef struct {
 } cb_t;
 
 _Static_assert(sizeof(cb_t) <= NVN_COMMAND_BUFFER_SIZE, "command buffer object too large");
+
+/* Texture/sampler pools are queue state: the engine may set the pool on one
+ * command buffer and bind texture handles on another.  Remember the last pool
+ * bound on any command buffer and inherit it for a command buffer that has not
+ * set a pool of its own. */
+static const tex_pool_t *g_last_tex_pool;
+static const samp_pool_t *g_last_samp_pool;
+static pthread_mutex_t g_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static const tex_pool_t *nvn_tex_pool_for(const cb_t *c) {
+    if (c && c->tex_pool) return c->tex_pool;
+    pthread_mutex_lock(&g_pool_lock);
+    const tex_pool_t *p = g_last_tex_pool;
+    pthread_mutex_unlock(&g_pool_lock);
+    return p;
+}
+static const samp_pool_t *nvn_samp_pool_for(const cb_t *c) {
+    if (c && c->samp_pool) return c->samp_pool;
+    pthread_mutex_lock(&g_pool_lock);
+    const samp_pool_t *p = g_last_samp_pool;
+    pthread_mutex_unlock(&g_pool_lock);
+    return p;
+}
+static void nvn_pool_forget(const void *pool) {
+    pthread_mutex_lock(&g_pool_lock);
+    if ((const void *)g_last_tex_pool == pool) g_last_tex_pool = NULL;
+    if ((const void *)g_last_samp_pool == pool) g_last_samp_pool = NULL;
+    pthread_mutex_unlock(&g_pool_lock);
+}
+
 static uint64_t nvn_cb_serial;
 static cb_t **g_cbs;
 static unsigned g_ncbs, g_cbs_cap;
 static unsigned nvn_nvn_draws;
+static unsigned nvn_record_count;   /* BeginRecording calls, for the first-frame trace */
+static unsigned nvn_vtx_trace, nvn_rt_trace, nvn_tex_trace, nvn_draw_trace, nvn_ubo_trace;
+static unsigned nvn_draw_rec_trace, nvn_vaset_trace, nvn_ubo_apply_trace, nvn_tex_apply_trace;
+static unsigned nvn_copy_trace;
 
 /* --- Host render targets (MRT + depth) ------------------------------ */
 /* NVN binds a set of color targets plus depth; the host mirrors that with a
@@ -2121,6 +2206,19 @@ static void nvn_host_rt_clear(void) {
     pthread_mutex_unlock(&g_host_rt_lock);
 }
 
+/* State captured at nvnCommandBufferDraw* time.  NVN records state changes in
+ * command order; applying the command buffer's *final* state to an earlier
+ * draw picks up later unbinds.  Keep the state and render-target snapshot that
+ * were live when the draw was recorded. */
+typedef struct {
+    nvn_bind_state_t state;
+    GfxRenderTargetLayout layout;
+    uint32_t width, height;
+    int have_state;
+    int have_layout;
+    int window_texture;
+} nvn_draw_snap_t;
+
 /* Per-command-buffer resolved render-target state.  Kept out of cb_t so the
  * guest's NVN_COMMAND_BUFFER_SIZE contract does not change. */
 typedef struct {
@@ -2129,6 +2227,8 @@ typedef struct {
     uint32_t width, height;
     int valid;
     int window_texture;   /* color 0 is a registered window swapchain texture */
+    nvn_draw_snap_t *draws;
+    uint32_t ndraws, draws_cap;
 } nvn_cb_target_t;
 static nvn_cb_target_t g_cb_targets[64];
 static pthread_mutex_t g_cb_target_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -2154,8 +2254,45 @@ static void nvn_cb_target_forget(const cb_t *cb) {
     nvn_cb_target_t *slot = nvn_cb_target(cb, 0);
     if (!slot) return;
     pthread_mutex_lock(&g_cb_target_lock);
+    free(slot->draws);
     memset(slot, 0, sizeof *slot);
     pthread_mutex_unlock(&g_cb_target_lock);
+}
+
+/* Snapshot the state that is live at this draw. */
+static void nvn_cb_draw_snapshot(cb_t *c) {
+    if (!c) return;
+    nvn_cb_target_t *t = nvn_cb_target(c, 1);
+    if (!t) return;
+    if (t->ndraws == t->draws_cap) {
+        uint32_t cap = t->draws_cap ? t->draws_cap * 2 : 8;
+        if (cap > 512) return;
+        nvn_draw_snap_t *n = realloc(t->draws, (size_t)cap * sizeof *n);
+        if (!n) return;
+        t->draws = n;
+        t->draws_cap = cap;
+    }
+    nvn_draw_snap_t *d = &t->draws[t->ndraws++];
+    memset(d, 0, sizeof *d);
+    if (c->bind_state) {
+        memcpy(&d->state, c->bind_state, sizeof d->state);
+        d->have_state = 1;
+    }
+    d->layout = t->layout;
+    d->width = t->width;
+    d->height = t->height;
+    d->have_layout = t->valid;
+    d->window_texture = t->window_texture;
+}
+static const nvn_draw_snap_t *nvn_cb_last_draw(const cb_t *cb) {
+    nvn_cb_target_t *t = nvn_cb_target(cb, 0);
+    if (!t || !t->ndraws) return NULL;
+    return &t->draws[t->ndraws - 1];
+}
+static const nvn_bind_state_t *nvn_cb_draw_state(const cb_t *cb) {
+    const nvn_draw_snap_t *d = nvn_cb_last_draw(cb);
+    if (d && d->have_state) return &d->state;
+    return cb ? (const nvn_bind_state_t *)cb->bind_state : NULL;
 }
 
 /* Resolve the NVN texture set to a host layout.  Every color target and the
@@ -2354,28 +2491,44 @@ static size_t nvnCommandBufferGetCommandMemorySize(const cb_t *c) { return c ? c
 static size_t nvnCommandBufferGetCommandMemoryUsed(const cb_t *c) { return c ? c->cmd_used : 0; }
 static void nvnCommandBufferBeginRecording(cb_t *c) {
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferBeginRecording", "invalid command buffer"); return; }
+    nvn_record_count++;
+    if (nvn_trace_first() && nvn_record_count <= 64)
+        fprintf(stderr, "[totk-nvn] BeginRecording #%u cb=%p rec=%u prog=%p win=%p"
+                        " tpool=%p spool=%p\n", nvn_record_count, (void *)c, c->recording,
+                c->prog, c->win, (const void *)c->tex_pool, (const void *)c->samp_pool);
     c->recording = 1;
     c->cmd_used = 0;
     c->ctl_used = 0;
     c->draw_first = 0;
     c->draw_count = 0;
     c->ncmds = 0;
-    nvn_cb_target_forget(c);
-    /* A fresh recording starts with default (unbound) resource/vertex state;
-     * keeping the previous recording's state would re-apply stale guest
-     * pointers on the next submit.  Render state, however, starts from the NVN
-     * defaults (not all-zero: a zero channel-mask would disable colour writes). */
-    if (c->bind_state) {
-        nvn_bind_state_t *b = c->bind_state;
-        memset(b, 0, sizeof *b);
-        nvn_render_state_defaults(&b->rs);
-    }
+    { nvn_cb_target_t *t = nvn_cb_target(c, 0); if (t) t->ndraws = 0; }
+    /* NVN keeps the command buffer's bound state across Begin/EndRecording:
+     * the recording only appends commands.  Do not reset the bind state or the
+     * resolved render targets here, or state the guest bound before
+     * BeginRecording (uniform buffers, vertex layout, pools) disappears from
+     * the next submission.  nvnCommandBufferInitialize is what starts a fresh
+     * command buffer with default state. */
 }
 static uint64_t nvnCommandBufferEndRecording(cb_t *c) {
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferEndRecording", "invalid command buffer"); return 0; }
     c->recording = 0;
     uint64_t h = 0x100000000ull | (c->serial & 0xffffffffull);
     c->handle = h;
+    if (nvn_trace_first() && (nvn_record_count <= 64 || (c->draw_count && nvn_draw_rec_trace++ < 8))) {
+        const nvn_bind_state_t *b = c->bind_state;
+        fprintf(stderr, "[totk-nvn] EndRecording #%u cb=%p bs=%p handle=%#llx cmds=%u draw=%d"
+                        " va_mask=%#x va0=%#x vs_mask=%#x vs0=%#llx vb_mask=%#x ubo=%#x tex0=%#x\n",
+                nvn_record_count, (void *)c, (void *)b, (unsigned long long)h, c->ncmds,
+                c->draw_count, b ? b->va_mask : 0, b ? b->va[0] : 0,
+                b ? b->vs_mask : 0, b ? (unsigned long long)b->vs[0] : 0,
+                b ? b->vb_mask : 0, b ? b->ubo_mask[0] : 0, b ? b->tex_mask[0][0] : 0);
+        if (b) for (int i = 0; i < 16; i++) {
+            if (!(b->va_mask & (1u << i)) && !(b->vs_mask & (1u << i))) continue;
+            fprintf(stderr, "[totk-nvn] EndRecording #%u state[%d] va=%#x vs=%#llx\n",
+                    nvn_record_count, i, b->va[i], (unsigned long long)b->vs[i]);
+        }
+    }
     if (nvn_trace()) fprintf(stderr, "[totk-nvn] CommandBufferEndRecording %p -> handle %#llx (%u cmds)\n",
                              (void *)c, (unsigned long long)h, c->ncmds);
     /* Create the reflected pipeline on the recording thread.  The Adreno
@@ -2390,8 +2543,9 @@ static void nvnCommandBufferBindProgram(cb_t *c, const prog_t *p, int stage_mask
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferBindProgram", "invalid command buffer"); return; }
     if (!nvn_obj(p, NVN_MAGIC('P', 'R', 'O', 'G'), "nvnCommandBufferBindProgram(program)")) return;
     c->prog = (void *)p;
-    if (nvn_trace())
-        fprintf(stderr, "[totk-nvn] BindProgram program=%p stageMask=%#x\n", (const void *)p, stage_mask);
+    if (nvn_trace() || (nvn_trace_first() && nvn_draw_trace++ < 32))
+        fprintf(stderr, "[totk-nvn] BindProgram cb=%p rec=%u program=%p stageMask=%#x\n",
+                (void *)c, c->recording, (const void *)p, stage_mask);
 }
 /* Host bridge used by the self-tests; the guest NVN API is BindProgram. */
 static void nvnCommandBufferSetProgram(cb_t *c, prog_t *p) {
@@ -2401,6 +2555,9 @@ static void nvnCommandBufferSetWindow(cb_t *c, win_t *w) {
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferSetWindow", "invalid command buffer"); return; }
     if (!nvn_obj(w, NVN_MAGIC('W', 'I', 'N', 'D'), "nvnCommandBufferSetWindow(window)")) return;
     c->win = w;
+    if (nvn_trace_first() && nvn_rt_trace++ < 32)
+        fprintf(stderr, "[totk-nvn] SetWindow cb=%p rec=%u win=%p native=%p\n",
+                (void *)c, c->recording, (void *)w, w->native);
 }
 static void nvnCommandBufferDrawArrays(cb_t *c, int mode, int first, int count) {
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) {
@@ -2421,9 +2578,12 @@ static void nvnCommandBufferDrawArrays(cb_t *c, int mode, int first, int count) 
     }
     c->draw_first = first;
     c->draw_count += count;
-    if (nvn_trace())
-        fprintf(stderr, "[totk-nvn] CommandBufferDrawArrays mode=%d first=%d count=%d\n",
-                mode, first, count);
+    nvn_cb_draw_snapshot(c);
+    if (nvn_trace() || (nvn_trace_first() && nvn_draw_trace++ < 32))
+        fprintf(stderr, "[totk-nvn] CommandBufferDrawArrays cb=%p rec=%u mode=%d first=%d count=%d"
+                        " va_mask=%#x vs_mask=%#x\n", (void *)c, c->recording, mode, first, count,
+                c->bind_state ? ((nvn_bind_state_t *)c->bind_state)->va_mask : 0,
+                c->bind_state ? ((nvn_bind_state_t *)c->bind_state)->vs_mask : 0);
 }
 static void nvnCommandBufferDrawArraysInstanced(cb_t *c, int mode, int first, int count,
                                                 int base_instance, int instances) {
@@ -2446,9 +2606,10 @@ static void nvnCommandBufferDrawArraysInstanced(cb_t *c, int mode, int first, in
     }
     c->draw_first = first;
     c->draw_count += count;
-    if (nvn_trace())
-        fprintf(stderr, "[totk-nvn] CommandBufferDrawArraysInstanced mode=%d first=%d count=%d base=%d instances=%d\n",
-                mode, first, count, base_instance, instances);
+    nvn_cb_draw_snapshot(c);
+    if (nvn_trace() || (nvn_trace_first() && nvn_draw_trace++ < 32))
+        fprintf(stderr, "[totk-nvn] DrawArraysInstanced cb=%p rec=%u mode=%d first=%d count=%d base=%d instances=%d\n",
+                (void *)c, c->recording, mode, first, count, base_instance, instances);
 }
 static void nvnCommandBufferSetRenderEnable(cb_t *c, int e) { (void)c; (void)e; }
 #define NVN_ST(T, x) ((T *)(x))
@@ -2534,6 +2695,72 @@ static void nvnDepthStencilStateSetStencilOp(void *s, int f, int fail, int zfail
     nvn_ds_st *o = s;
     if (f & 1) { o->fail_f = (uint32_t)fail; o->zfail_f = (uint32_t)zfail; o->zpass_f = (uint32_t)zpass; }
     if (f & 2) { o->fail_b = (uint32_t)fail; o->zfail_b = (uint32_t)zfail; o->zpass_b = (uint32_t)zpass; }
+}
+
+/* NVNvertexAttribState is 4 packed bytes {fmt:8, offset:19, stream:5} and
+ * NVNvertexStreamState is {stride, divisor}.  The guest fills these through
+ * the setter entry points below before handing them to
+ * nvnCommandBufferBindVertexAttribState/BindVertexStreamState; without the
+ * setters every submitted state stays zero and the vertex input disappears. */
+static void nvnVertexAttribStateSetDefaults(void *s) { if (s) *(uint32_t *)s = 0; }
+static void nvnVertexAttribStateSetFormat(void *s, int format, ptrdiff_t offset) {
+    if (!s) return;
+    if (offset < 0 || offset >= (1 << 19)) {
+        char d[64]; snprintf(d, sizeof d, "offset %lld", (long long)offset);
+        nvn_fail("nvnVertexAttribStateSetFormat", d);
+        if (offset < 0) return;
+    }
+    uint32_t v = *(uint32_t *)s;
+    v = (v & ~0xffu) | ((uint32_t)format & 0xffu);
+    v = (v & ~(0x7ffffu << 8)) | ((uint32_t)offset & 0x7ffffu) << 8;
+    *(uint32_t *)s = v;
+    if (nvn_trace_first() && nvn_vaset_trace++ < 64)
+        fprintf(stderr, "[totk-nvn] AttribStateSetFormat state=%p fmt=%#x off=%lld -> %#x\n",
+                s, (unsigned)format, (long long)offset, v);
+}
+static void nvnVertexAttribStateSetStreamIndex(void *s, int index) {
+    if (!s) return;
+    if (index < 0 || index > 31) { nvn_fail("nvnVertexAttribStateSetStreamIndex", "index out of range"); return; }
+    uint32_t v = *(uint32_t *)s;
+    v = (v & ~(0x1fu << 27)) | ((uint32_t)index & 0x1fu) << 27;
+    *(uint32_t *)s = v;
+}
+static void nvnVertexAttribStateGetFormat(const void *s, int *format, ptrdiff_t *offset) {
+    uint32_t v = s ? *(const uint32_t *)s : 0;
+    if (format) *format = (int)(v & 0xffu);
+    if (offset) *offset = (ptrdiff_t)((v >> 8) & 0x7ffffu);
+}
+static int nvnVertexAttribStateGetStreamIndex(const void *s) {
+    return s ? (int)((*(const uint32_t *)s >> 27) & 0x1fu) : 0;
+}
+static void nvnVertexStreamStateSetDefaults(void *s) { if (s) memset(s, 0, 8); }
+static void nvnVertexStreamStateSetStride(void *s, ptrdiff_t stride) {
+    if (!s) return;
+    if (stride < 0 || (uint64_t)stride > 0xffffffffull) {
+        nvn_fail("nvnVertexStreamStateSetStride", "stride out of range");
+        return;
+    }
+    memcpy(s, &stride, sizeof(uint32_t));
+    if (nvn_trace_first() && nvn_vaset_trace++ < 64)
+        fprintf(stderr, "[totk-nvn] StreamStateSetStride state=%p stride=%lld\n",
+                s, (long long)stride);
+}
+static void nvnVertexStreamStateSetDivisor(void *s, int divisor) {
+    if (!s) return;
+    uint32_t d = (uint32_t)divisor;
+    memcpy((uint8_t *)s + 4, &d, sizeof d);
+    if (nvn_trace_first() && nvn_vaset_trace++ < 64)
+        fprintf(stderr, "[totk-nvn] StreamStateSetDivisor state=%p div=%d\n", s, divisor);
+}
+static ptrdiff_t nvnVertexStreamStateGetStride(const void *s) {
+    uint32_t v = 0;
+    if (s) memcpy(&v, s, sizeof v);
+    return (ptrdiff_t)v;
+}
+static int nvnVertexStreamStateGetDivisor(const void *s) {
+    uint32_t v = 0;
+    if (s) memcpy(&v, (const uint8_t *)s + 4, sizeof v);
+    return (int)v;
 }
 
 static void nvnCommandBufferBindBlendState(cb_t *c, const void *s) {
@@ -2654,6 +2881,13 @@ static void nvnCommandBufferSetRenderTargets(cb_t *c, int n, const void *const *
         win_t *w = nvn_window_for_texture(t[0]);
         if (w) { c->win = w; if (cbt) cbt->window_texture = 1; }
     }
+    if (nvn_trace_first() && nvn_rt_trace++ < 32 && n) {
+        const tex_t *ti = nvn_tex_registry_find(t[0]);
+        fprintf(stderr, "[totk-nvn] SetRenderTargets cb=%p n=%d color0=%p tex=%p fmt=%#x"
+                        " %ux%u depth=%p window=%p\n", (void *)c, n, t[0], (const void *)ti,
+                ti ? ti->d.format : 0, ti ? ti->d.width : 0, ti ? ti->d.height : 0,
+                depth, (void *)c->win);
+    }
     if (nvn_trace() && n) {
         const tex_t *t0 = nvn_tex_registry_find(t[0]);
         const tex_t *dt = nvn_tex_registry_find(depth);
@@ -2723,9 +2957,9 @@ static void nvnCommandBufferBindVertexBuffer(cb_t *c, int index, uint64_t addres
     b->vb[index].address = address;
     b->vb[index].size = size;
     b->vb_mask |= 1u << index;
-    if (nvn_trace())
-        fprintf(stderr, "[totk-nvn] BindVertexBuffer index=%d addr=%#llx size=%zu\n",
-                index, (unsigned long long)address, size);
+    if (nvn_trace() || (nvn_trace_first() && nvn_vtx_trace++ < 8192))
+        fprintf(stderr, "[totk-nvn] BindVertexBuffer cb=%p rec=%u index=%d addr=%#llx size=%zu\n",
+                (void *)c, c->recording, index, (unsigned long long)address, size);
 }
 static void nvnCommandBufferBindVertexBuffers(cb_t *c, int first, int n, const void *ranges) {
     nvn_api("nvnCommandBufferBindVertexBuffers");
@@ -2739,8 +2973,9 @@ static void nvnCommandBufferBindVertexBuffers(cb_t *c, int first, int n, const v
         b->vb[first + i].size = (size_t)r[i * 2 + 1];
         b->vb_mask |= 1u << (first + i);
     }
-    if (nvn_trace())
-        fprintf(stderr, "[totk-nvn] BindVertexBuffers first=%d count=%d\n", first, n);
+    if (nvn_trace() || (nvn_trace_first() && nvn_vtx_trace++ < 8192))
+        fprintf(stderr, "[totk-nvn] BindVertexBuffers cb=%p rec=%u first=%d count=%d\n",
+                (void *)c, c->recording, first, n);
 }
 static void nvnCommandBufferBindVertexAttribState(cb_t *c, int n, const void *states) {
     nvn_api("nvnCommandBufferBindVertexAttribState");
@@ -2754,8 +2989,12 @@ static void nvnCommandBufferBindVertexAttribState(cb_t *c, int n, const void *st
         if (i < n) b->va_mask |= 1u << i;
         else b->va_mask &= ~(1u << i);
     }
-    if (nvn_trace())
-        fprintf(stderr, "[totk-nvn] BindVertexAttribState count=%d\n", n);
+    if (nvn_trace() || (nvn_trace_first() && nvn_vtx_trace++ < 8192)) {
+        fprintf(stderr, "[totk-nvn] BindVertexAttribState cb=%p rec=%u count=%d",
+                (void *)c, c->recording, n);
+        for (int i = 0; i < n; i++) fprintf(stderr, " [%d]=%#x", i, b->va[i]);
+        fprintf(stderr, "\n");
+    }
 }
 static void nvnCommandBufferBindVertexStreamState(cb_t *c, int n, const void *states) {
     nvn_api("nvnCommandBufferBindVertexStreamState");
@@ -2769,11 +3008,132 @@ static void nvnCommandBufferBindVertexStreamState(cb_t *c, int n, const void *st
         if (i < n) b->vs_mask |= 1u << i;
         else b->vs_mask &= ~(1u << i);
     }
-    if (nvn_trace())
-        fprintf(stderr, "[totk-nvn] BindVertexStreamState count=%d\n", n);
+    if (nvn_trace() || (nvn_trace_first() && nvn_vtx_trace++ < 8192)) {
+        fprintf(stderr, "[totk-nvn] BindVertexStreamState cb=%p rec=%u count=%d",
+                (void *)c, c->recording, n);
+        for (int i = 0; i < n; i++)
+            fprintf(stderr, " [%d]=%#llx", i, (unsigned long long)b->vs[i]);
+        fprintf(stderr, "\n");
+    }
 }
-static void nvnCommandBufferSetPrimitiveRestart(cb_t *c, uint32_t enable, int index) {
-    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferSetPrimitiveRestart", "invalid command buffer"); return; }
+/* Buffer copy/clear execute on the host memory the guest handed us.  The
+ * backend is synchronous, so a CPU copy at record time matches the order the
+ * guest asked for and makes GPU-staged constant/style buffers visible to the
+ * draws that follow. */
+static void nvnCommandBufferCopyBufferToBuffer(cb_t *c, uint64_t src, uint64_t dst,
+                                               size_t n, int flags) {
+    nvn_api("nvnCommandBufferCopyBufferToBuffer");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferCopyBufferToBuffer", "invalid command buffer"); return; }
+    (void)flags;
+    if (!src || !dst || !n) { nvn_fail("nvnCommandBufferCopyBufferToBuffer", "null range"); return; }
+    if (n > (256u << 20)) { nvn_fail("nvnCommandBufferCopyBufferToBuffer", "range too large"); return; }
+    if (src != dst) memmove((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, n);
+    if (nvn_trace_first() && nvn_copy_trace++ < 32)
+        fprintf(stderr, "[totk-nvn] CopyBufferToBuffer cb=%p src=%#llx dst=%#llx n=%zu\n",
+                (void *)c, (unsigned long long)src, (unsigned long long)dst, n);
+}
+static void nvnCommandBufferClearBuffer(cb_t *c, uint64_t dst, size_t n, uint32_t value) {
+    nvn_api("nvnCommandBufferClearBuffer");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferClearBuffer", "invalid command buffer"); return; }
+    if (!dst || !n) { nvn_fail("nvnCommandBufferClearBuffer", "null range"); return; }
+    if (n > (256u << 20)) { nvn_fail("nvnCommandBufferClearBuffer", "range too large"); return; }
+    memset((void *)(uintptr_t)dst, (int)(value & 0xffu), n);
+    if (nvn_trace_first() && nvn_copy_trace++ < 32)
+        fprintf(stderr, "[totk-nvn] ClearBuffer cb=%p dst=%#llx n=%zu value=%#x\n",
+                (void *)c, (unsigned long long)dst, n, value);
+}
+static cb_t *nvn_cb_by_handle(uint64_t h) {
+    for (unsigned i = 0; i < g_ncbs; i++) {
+        cb_t *c = g_cbs[i];
+        if (c && c->magic == NVN_MAGIC('C', 'M', 'D', 'B') && c->handle == h) return c;
+    }
+    return NULL;
+}
+
+/* Replay a recorded command buffer into another one (Call/CopyCommands).
+ * Command records are appended in order; the source's final bind state is
+ * merged so the draw that follows sees the resources the copied commands
+ * bound.  NVN applies those binds on the queue in the same order. */
+static void nvn_cb_merge_commands(cb_t *dst, const cb_t *src, const char *what) {
+    if (!dst || !src) return;
+    for (uint32_t i = 0; i < src->ncmds; i++) {
+        nvn_cmd_t *d = nvn_cb_cmd(dst, src->cmds[i].kind);
+        if (!d) break;
+        *d = src->cmds[i];
+    }
+    nvn_bind_state_t *d = nvn_cb_bind_state(dst);
+    const nvn_bind_state_t *s = src->bind_state;
+    if (d && s) {
+        for (int st = 0; st < 6; st++) {
+            for (int i = 0; i < 16; i++) {
+                if (s->ubo_mask[st] & (1u << i)) {
+                    d->ubo[st][i] = s->ubo[st][i];
+                    d->ubo_mask[st] |= 1u << i;
+                }
+                if (s->ssbo_mask[st] & (1u << i)) {
+                    d->ssbo[st][i] = s->ssbo[st][i];
+                    d->ssbo_mask[st] |= 1u << i;
+                }
+            }
+            for (int i = 0; i < 128; i++) {
+                if (!(s->tex_mask[st][i / 32] & (1u << (i % 32)))) continue;
+                d->tex[st][i] = s->tex[st][i];
+                d->tex_mask[st][i / 32] |= 1u << (i % 32);
+            }
+        }
+        if (s->va_mask) { memcpy(d->va, s->va, sizeof d->va); d->va_mask = s->va_mask; }
+        if (s->vs_mask) { memcpy(d->vs, s->vs, sizeof d->vs); d->vs_mask = s->vs_mask; }
+        if (s->vb_mask) {
+            for (int i = 0; i < 16; i++)
+                if (s->vb_mask & (1u << i)) d->vb[i] = s->vb[i];
+            d->vb_mask |= s->vb_mask;
+        }
+        d->rs = s->rs;
+        d->depth_tex = s->depth_tex;
+    }
+    if (src->prog) dst->prog = src->prog;
+    if (src->win) dst->win = src->win;
+    if (src->tex_pool) dst->tex_pool = src->tex_pool;
+    if (src->samp_pool) dst->samp_pool = src->samp_pool;
+    nvn_cb_target_t *st_t = nvn_cb_target(src, 0);
+    nvn_cb_target_t *dt_t = nvn_cb_target(dst, 1);
+    if (st_t && dt_t && st_t->valid) *dt_t = *st_t, dt_t->cb = dst;
+    if (nvn_trace_first() || nvn_trace())
+        fprintf(stderr, "[totk-nvn] %s dst=%p src=%p src_cmds=%u draw=%d"
+                        " ubo=%#x va=%#x tex=%#x\n", what, (void *)dst, (void *)src,
+                src->ncmds, src->draw_count,
+                s ? s->ubo_mask[0] : 0, s ? s->va_mask : 0, s ? s->tex_mask[0][0] : 0);
+}
+static void nvnCommandBufferCallCommands(cb_t *c, int n, const uint64_t *handles) {
+    nvn_api("nvnCommandBufferCallCommands");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferCallCommands", "invalid command buffer"); return; }
+    if (n < 0 || (!handles && n)) { nvn_fail("nvnCommandBufferCallCommands", "null handle array"); return; }
+    for (int i = 0; i < n; i++) {
+        cb_t *src = nvn_cb_by_handle(handles[i]);
+        if (!src) {
+            if (nvn_trace()) fprintf(stderr, "[totk-nvn] CallCommands handle %#llx not live\n",
+                                     (unsigned long long)handles[i]);
+            continue;
+        }
+        nvn_cb_merge_commands(c, src, "CallCommands");
+    }
+}
+static void nvnCommandBufferCopyCommands(cb_t *c, int n, const uint64_t *handles) {
+    nvn_api("nvnCommandBufferCopyCommands");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferCopyCommands", "invalid command buffer"); return; }
+    if (n < 0 || (!handles && n)) { nvn_fail("nvnCommandBufferCopyCommands", "null handle array"); return; }
+    for (int i = 0; i < n; i++) {
+        cb_t *src = nvn_cb_by_handle(handles[i]);
+        if (!src) {
+            if (nvn_trace()) fprintf(stderr, "[totk-nvn] CopyCommands handle %#llx not live\n",
+                                     (unsigned long long)handles[i]);
+            continue;
+        }
+        nvn_cb_merge_commands(c, src, "CopyCommands");
+    }
+}
+
+static void nvnCommandBufferSetPrimitiveRestart(cb_t *c, uint32_t enable, int index) {    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferSetPrimitiveRestart", "invalid command buffer"); return; }
     if (nvn_trace())
         fprintf(stderr, "[totk-nvn] SetPrimitiveRestart enable=%u index=%d\n", enable, index);
 }
@@ -2791,9 +3151,13 @@ static void nvnCommandBufferDrawElements(cb_t *c, int mode, int type, int count,
         cmd->u.draw_indexed.indices = index;
     }
     c->draw_count += count;
-    if (nvn_trace())
-        fprintf(stderr, "[totk-nvn] DrawElements mode=%d type=%d count=%d index=%#llx\n",
-                mode, type, count, (unsigned long long)index);
+    nvn_cb_draw_snapshot(c);
+    if (nvn_trace() || (nvn_trace_first() && nvn_draw_trace++ < 32))
+        fprintf(stderr, "[totk-nvn] DrawElements cb=%p rec=%u mode=%d type=%d count=%d index=%#llx"
+                        " va_mask=%#x vs_mask=%#x\n", (void *)c, c->recording, mode, type, count,
+                (unsigned long long)index,
+                c->bind_state ? ((nvn_bind_state_t *)c->bind_state)->va_mask : 0,
+                c->bind_state ? ((nvn_bind_state_t *)c->bind_state)->vs_mask : 0);
 }
 static void nvnCommandBufferDrawElementsBaseVertex(cb_t *c, int mode, int type, int count,
                                                    uint64_t index, int base_vertex) {
@@ -2824,14 +3188,20 @@ static void nvnCommandBufferSetTexturePool(cb_t *c, const tex_pool_t *p) {
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferSetTexturePool", "invalid command buffer"); return; }
     if (p && p->magic != NVN_MAGIC('T', 'P', 'O', 'L')) { nvn_fail("nvnCommandBufferSetTexturePool", "invalid texture pool"); return; }
     c->tex_pool = p;
-    if (nvn_trace()) fprintf(stderr, "[totk-nvn] SetTexturePool cb=%p pool=%p n=%d\n", (void *)c, (const void *)p, p ? (int)p->n : 0);
+    if (p) { pthread_mutex_lock(&g_pool_lock); g_last_tex_pool = p; pthread_mutex_unlock(&g_pool_lock); }
+    if (nvn_trace() || (nvn_trace_first()))
+        fprintf(stderr, "[totk-nvn] SetTexturePool cb=%p pool=%p n=%d rec=%u\n",
+                (void *)c, (const void *)p, p ? (int)p->n : 0, c->recording);
 }
 static void nvnCommandBufferSetSamplerPool(cb_t *c, const samp_pool_t *p) {
     nvn_api("nvnCommandBufferSetSamplerPool");
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferSetSamplerPool", "invalid command buffer"); return; }
     if (p && p->magic != NVN_MAGIC('S', 'P', 'O', 'L')) { nvn_fail("nvnCommandBufferSetSamplerPool", "invalid sampler pool"); return; }
     c->samp_pool = p;
-    if (nvn_trace()) fprintf(stderr, "[totk-nvn] SetSamplerPool cb=%p pool=%p n=%d\n", (void *)c, (const void *)p, p ? (int)p->n : 0);
+    if (p) { pthread_mutex_lock(&g_pool_lock); g_last_samp_pool = p; pthread_mutex_unlock(&g_pool_lock); }
+    if (nvn_trace() || (nvn_trace_first()))
+        fprintf(stderr, "[totk-nvn] SetSamplerPool cb=%p pool=%p n=%d rec=%u\n",
+                (void *)c, (const void *)p, p ? (int)p->n : 0, c->recording);
 }
 static void nvnCommandBufferBindUniformBuffer(cb_t *c, int stage, int i, uint64_t address, size_t size) {
     nvn_api("nvnCommandBufferBindUniformBuffer");
@@ -2842,10 +3212,15 @@ static void nvnCommandBufferBindUniformBuffer(cb_t *c, int stage, int i, uint64_
     b->ubo[stage][i].address = address;
     b->ubo[stage][i].size = size;
     b->ubo_mask[stage] |= 1u << i;
+    nvn_global_ubo_set(stage, i, address, size);
     nvn_cb_desc_event(c, (uint32_t)stage, 0, (uint32_t)i, address, size, 0);
-    if (nvn_trace())
-        fprintf(stderr, "[totk-nvn] BindUniformBuffer stage=%d index=%d addr=%#llx size=%zu\n",
-                stage, i, (unsigned long long)address, size);
+    if (nvn_trace() || (nvn_trace_first() && nvn_ubo_trace++ < 8192)) {
+        const uint32_t *u = (const uint32_t *)(uintptr_t)address;
+        fprintf(stderr, "[totk-nvn] BindUniformBuffer cb=%p rec=%u stage=%d index=%d addr=%#llx size=%zu",
+                (void *)c, c->recording, stage, i, (unsigned long long)address, size);
+        for (int k = 0; k < 8; k++) fprintf(stderr, " %08x", u[k]);
+        fprintf(stderr, "\n");
+    }
 }
 static void nvnCommandBufferBindUniformBuffers(cb_t *c, int stage, int first, int n, const void *ranges) {
     nvn_api("nvnCommandBufferBindUniformBuffers");
@@ -2858,12 +3233,18 @@ static void nvnCommandBufferBindUniformBuffers(cb_t *c, int stage, int first, in
         b->ubo[stage][first + i].address = r[i * 2];
         b->ubo[stage][first + i].size = (size_t)r[i * 2 + 1];
         b->ubo_mask[stage] |= 1u << (first + i);
+        nvn_global_ubo_set(stage, first + i, r[i * 2], (size_t)r[i * 2 + 1]);
         nvn_cb_desc_event(c, (uint32_t)stage, 0, (uint32_t)(first + i),
                           r[i * 2], (size_t)r[i * 2 + 1], 0);
     }
-    if (nvn_trace())
-        fprintf(stderr, "[totk-nvn] BindUniformBuffers stage=%d first=%d count=%d\n",
-                stage, first, n);
+    if (nvn_trace() || (nvn_trace_first() && nvn_ubo_trace++ < 8192)) {
+        fprintf(stderr, "[totk-nvn] BindUniformBuffers cb=%p rec=%u stage=%d first=%d count=%d",
+                (void *)c, c->recording, stage, first, n);
+        for (int i = 0; i < n; i++)
+            fprintf(stderr, " [%d]=%#llx+%llu", first + i,
+                    (unsigned long long)r[i * 2], (unsigned long long)r[i * 2 + 1]);
+        fprintf(stderr, "\n");
+    }
 }
 static void nvnCommandBufferBindStorageBuffer(cb_t *c, int stage, int i, uint64_t address, size_t size) {
     nvn_api("nvnCommandBufferBindStorageBuffer");
@@ -2908,10 +3289,12 @@ static void nvnCommandBufferBindTexture(cb_t *c, int stage, int i, uint64_t hand
         else b->tex_mask[stage][i / 32] &= ~(1u << (i % 32));
         nvn_cb_desc_event(c, (uint32_t)stage, 2, (uint32_t)i, 0, 0, handle);
     }
-    if (nvn_trace()) {
+    if (nvn_trace() || (nvn_trace_first() && nvn_tex_trace++ < 64)) {
         int tid = (int)(handle & 0xfffff), sid = (int)((handle >> 20) & 0xfff);
-        const tex_t *t = c->tex_pool ? nvn_tex_pool_lookup(c->tex_pool, tid) : NULL;
-        const samp_t *s = c->samp_pool ? nvn_samp_pool_lookup(c->samp_pool, sid) : NULL;
+        const tex_pool_t *tpool = nvn_tex_pool_for(c);
+        const samp_pool_t *spool = nvn_samp_pool_for(c);
+        const tex_t *t = tpool ? nvn_tex_pool_lookup(tpool, tid) : NULL;
+        const samp_t *s = spool ? nvn_samp_pool_lookup(spool, sid) : NULL;
         if (t)
             fprintf(stderr, "[totk-nvn] BindTexture cb=%p tpool=%p spool=%p stage=%d index=%d"
                             " handle=%#llx tex=%d(%p) samp=%d(%p) target=%d format=%#x"
@@ -2990,6 +3373,11 @@ typedef struct {
     uint64_t layout_sig;             /* render-target layout in the cache key */
     GfxRenderTargetLayout pipeline_layout;
     uint64_t vertex_sig;
+    /* Reflection used to build the current pipeline, for the per-submit
+     * slot->binding bridge (especially NVN uniform-buffer index vs shader
+     * constant-bank slot). */
+    GfxBindingSpec specs[2][64];
+    uint32_t nspecs[2];
 } prog_shader_state_t;
 
 static pthread_mutex_t g_prog_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -3472,7 +3860,8 @@ static void nvn_variant_suffix(prog_t *p, const cb_t *cb, char *out, size_t cap)
         uint64_t handle = b->tex[1][sp->nvn_slot];
         if (!handle) continue;
         int tid = (int)(handle & 0xfffff);
-        const tex_t *t = cb->tex_pool ? nvn_tex_pool_lookup(cb->tex_pool, tid) : NULL;
+        const tex_pool_t *tpool = nvn_tex_pool_for(cb);
+        const tex_t *t = tpool ? nvn_tex_pool_lookup(tpool, tid) : NULL;
         if (!t) continue;
         seen_slots[sbit / 32] |= 1u << (sbit % 32);
         const char *tn = nvn_tex_target_name((int)t->d.target);
@@ -3567,6 +3956,10 @@ static GfxReflectedPipeline *nvn_program_cached_pipeline(prog_t *p, uint32_t nvn
     GfxBindingSpec vss[64], pss[64];
     unsigned nvs = gfx_reflect_full(ures[0][0] ? ures[0] : NULL, upath[0], 0, vss, 64);
     unsigned nps = gfx_reflect_full(ures[1][0] ? ures[1] : NULL, upath[1], 1, pss, 64);
+    s->nspecs[0] = nvs > 64 ? 64 : nvs;
+    s->nspecs[1] = nps > 64 ? 64 : nps;
+    if (s->nspecs[0]) memcpy(s->specs[0], vss, s->nspecs[0] * sizeof vss[0]);
+    if (s->nspecs[1]) memcpy(s->specs[1], pss, s->nspecs[1] * sizeof pss[0]);
     unsigned created = __atomic_add_fetch(&g_pipelines_created, 1, __ATOMIC_RELAXED);
     if (created <= 32 || nvn_trace())
         fprintf(stderr, "[totk-nvn] program=%p create pipeline from cache #%u vs=%s(%u) ps=%s(%u)"
@@ -3595,6 +3988,7 @@ static GfxReflectedPipeline *nvn_program_cached_pipeline(prog_t *p, uint32_t nvn
         s->layout_sig = layout_sig;
         if (layout) s->pipeline_layout = *layout;
         else memset(&s->pipeline_layout, 0, sizeof s->pipeline_layout);
+        nvn_pipe_ubo_set(s->pipeline, vss, nvs, pss, nps);
     }
     GfxReflectedPipeline *ready = s->pipeline;
     pthread_mutex_unlock(&g_prog_lock);
@@ -3619,10 +4013,9 @@ static uint64_t nvn_vertex_signature(const GfxVertexLayout *layout) {
 
 /* Decode the recorded NVN attribute/stream state.  `va_st` is packed as
  * {fmt:8, offset:19, stream:5}; `vs_st` is {stride, divisor}. */
-static void nvn_build_vertex_layout(const cb_t *cb, GfxVertexLayout *out, uint64_t *sig) {
+static void nvn_build_vertex_layout(const nvn_bind_state_t *b, GfxVertexLayout *out, uint64_t *sig) {
     memset(out, 0, sizeof *out);
     *sig = 0;
-    const nvn_bind_state_t *b = cb ? cb->bind_state : NULL;
     if (!b || !b->va_mask) return;
     uint32_t used_streams = 0;
     uint32_t valid_streams = 0;
@@ -3679,8 +4072,7 @@ static void nvn_build_vertex_layout(const cb_t *cb, GfxVertexLayout *out, uint64
     *sig = nvn_vertex_signature(out);
 }
 
-static uint32_t nvn_build_vertex_streams(const cb_t *cb, GfxVertexStream *out, uint32_t max) {
-    const nvn_bind_state_t *b = cb ? cb->bind_state : NULL;
+static uint32_t nvn_build_vertex_streams(const nvn_bind_state_t *b, GfxVertexStream *out, uint32_t max) {
     if (!b) return 0;
     uint32_t n = 0;
     for (int i = 0; i < 16 && n < max; i++) {
@@ -3698,36 +4090,136 @@ static uint32_t nvn_build_vertex_streams(const cb_t *cb, GfxVertexStream *out, u
 
 /* Apply the last UBO/SSBO/texture state recorded by the command buffer.  This
  * is a per-submit state model; NVN games normally bind then draw in order. */
-static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp, cb_t *cb) {
+/* Reflected UBO slots of the current pipeline, keyed by the pipeline pointer.
+ * nvn_apply_bind_state runs on the submitting thread, where the guest program
+ * object may already be recycled; never dereference prog_t there. */
+typedef struct {
+    GfxReflectedPipeline *rp;
+    uint32_t nubo[2];
+    int32_t ubo_slot[2][16];
+} nvn_pipe_ubo_t;
+static nvn_pipe_ubo_t g_pipe_ubo[128];
+static unsigned g_pipe_ubo_count;
+static pthread_mutex_t g_pipe_ubo_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void nvn_pipe_ubo_set(GfxReflectedPipeline *rp,
+                             const GfxBindingSpec *vss, uint32_t nvs,
+                             const GfxBindingSpec *pss, uint32_t nps) {
+    if (!rp) return;
+    pthread_mutex_lock(&g_pipe_ubo_lock);
+    nvn_pipe_ubo_t *e = NULL;
+    for (unsigned i = 0; i < g_pipe_ubo_count; i++)
+        if (g_pipe_ubo[i].rp == rp) { e = &g_pipe_ubo[i]; break; }
+    if (!e && g_pipe_ubo_count < sizeof g_pipe_ubo / sizeof g_pipe_ubo[0])
+        e = &g_pipe_ubo[g_pipe_ubo_count++];
+    if (e) {
+        memset(e, 0, sizeof *e);
+        e->rp = rp;
+        const GfxBindingSpec *src[2] = { vss, pss };
+        uint32_t cnt[2] = { nvs, nps };
+        for (int st = 0; st < 2; st++) {
+            /* cbuf slot 0 is NVN's driver "support buffer" whenever the shader
+             * also has a game cbuf (c1..); the guest binds game UBOs through
+             * BindUniformBuffer indices.  A shader whose only UBO is c0 (the
+             * synthetic probes) keeps c0 as its game UBO. */
+            int has_game = 0;
+            for (uint32_t k = 0; k < cnt[st]; k++)
+                if (src[st][k].kind == GFX_BIND_UBO && src[st][k].nvn_slot > 0) has_game = 1;
+            for (uint32_t k = 0; k < cnt[st] && e->nubo[st] < 16; k++) {
+                if (src[st][k].kind != GFX_BIND_UBO) continue;
+                if (src[st][k].nvn_slot < 0) continue;
+                if (has_game && src[st][k].nvn_slot == 0) continue;
+                e->ubo_slot[st][e->nubo[st]++] = src[st][k].nvn_slot;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_pipe_ubo_lock);
+}
+static const nvn_pipe_ubo_t *nvn_pipe_ubo_get(GfxReflectedPipeline *rp) {
+    const nvn_pipe_ubo_t *found = NULL;
+    pthread_mutex_lock(&g_pipe_ubo_lock);
+    for (unsigned i = 0; i < g_pipe_ubo_count; i++)
+        if (g_pipe_ubo[i].rp == rp) { found = &g_pipe_ubo[i]; break; }
+    pthread_mutex_unlock(&g_pipe_ubo_lock);
+    return found;
+}
+
+static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
+                                 const nvn_bind_state_t *b, cb_t *cb) {
     (void)p;
-    const nvn_bind_state_t *b = cb ? cb->bind_state : NULL;
     if (!b || !rp) return;
+    const nvn_pipe_ubo_t *pspec = nvn_pipe_ubo_get(rp);
     for (int stage = 0; stage < 2; stage++) {
+        uint32_t nspec = pspec ? pspec->nubo[stage] : 0;
+        if (nvn_trace_first() && nvn_ubo_apply_trace++ < 8) {
+            fprintf(stderr, "[totk-nvn] ApplyUbo stage=%d nbound_mask=%#x nspec=%u slots:",
+                    stage, b->ubo_mask[stage], nspec);
+            for (uint32_t k = 0; k < nspec; k++) fprintf(stderr, " %d", pspec->ubo_slot[stage][k]);
+            fprintf(stderr, "\n");
+        }
+        int failed_slot = -1;
+        const void *failed_data = NULL;
+        size_t failed_size = 0;
+        int nbound = 0;
         for (int i = 0; i < 16; i++) {
-            if (b->ubo_mask[stage] & (1u << i)) {
-                const void *data = (const void *)(uintptr_t)b->ubo[stage][i].address;
-                if (!gfx_backend_reflected_bind_ubo_slot(rp, (uint32_t)stage, (uint32_t)i,
-                                                         data, b->ubo[stage][i].size) &&
-                    nvn_trace())
-                    fprintf(stderr, "[totk-nvn] UBO stage=%d slot=%d size=%zu not in reflection\n",
-                            stage, i, b->ubo[stage][i].size);
+            if (!(b->ubo_mask[stage] & (1u << i))) continue;
+            const void *data = (const void *)(uintptr_t)b->ubo[stage][i].address;
+            size_t size = b->ubo[stage][i].size;
+            nbound++;
+            failed_slot = i;
+            failed_data = data;
+            failed_size = size;
+            if (!gfx_backend_reflected_bind_ubo_slot(rp, (uint32_t)stage, (uint32_t)i,
+                                                     data, size)) {
+                if (nvn_trace())
+                    fprintf(stderr, "[totk-nvn] UBO stage=%d nvn index=%d size=%zu not in reflection\n",
+                            stage, i, size);
             }
-            if (b->ssbo_mask[stage] & (1u << i)) {
-                const void *data = (const void *)(uintptr_t)b->ssbo[stage][i].address;
-                if (!gfx_backend_reflected_bind_storage_slot(rp, (uint32_t)stage, (uint32_t)i,
-                                                             data, b->ssbo[stage][i].size) &&
-                    nvn_trace())
-                    fprintf(stderr, "[totk-nvn] SSBO stage=%d slot=%d size=%zu not in reflection\n",
-                            stage, i, b->ssbo[stage][i].size);
+        }
+        /* NVN binds uniform buffers by the program's UBO index while the
+         * translated SPIR-V records the constant-bank slot the shader reads.
+         * When the stage has exactly one bound UBO and the shader has exactly
+         * one UBO, they must be the same resource even if the numbers differ;
+         * bind it to the reflected slot instead of silently leaving the shader
+         * with the dummy buffer.  (Observed TOTK frame draw: NVN index 0,
+         * shader cbuf slot 3.) */
+        if (nbound == 1 && nspec == 1) {
+            int target = pspec->ubo_slot[stage][0];
+            if (target >= 0 && target != failed_slot &&
+                gfx_backend_reflected_bind_ubo_slot(rp, (uint32_t)stage, (uint32_t)target,
+                                                    failed_data, failed_size)) {
+                static unsigned logged;
+                if (logged++ < 8)
+                    fprintf(stderr, "[totk-nvn] UBO stage=%d nvn index=%d -> shader cbuf"
+                                    " slot=%d (single-UBO program, size=%zu)\n",
+                            stage, failed_slot, target, failed_size);
             }
+        }
+        for (int i = 0; i < 16; i++) {
+            if (!(b->ssbo_mask[stage] & (1u << i))) continue;
+            const void *data = (const void *)(uintptr_t)b->ssbo[stage][i].address;
+            if (!gfx_backend_reflected_bind_storage_slot(rp, (uint32_t)stage, (uint32_t)i,
+                                                         data, b->ssbo[stage][i].size) &&
+                nvn_trace())
+                fprintf(stderr, "[totk-nvn] SSBO stage=%d slot=%d size=%zu not in reflection\n",
+                        stage, i, b->ssbo[stage][i].size);
         }
         for (int i = 0; i < 128; i++) {
             if (!(b->tex_mask[stage][i / 32] & (1u << (i % 32)))) continue;
             uint64_t handle = b->tex[stage][i];
             int tid = (int)(handle & 0xfffff);
-            const tex_t *t = cb->tex_pool ? nvn_tex_pool_lookup(cb->tex_pool, tid) : NULL;
+            const tex_pool_t *tpool = nvn_tex_pool_for(cb);
+            const tex_t *t = tpool ? nvn_tex_pool_lookup(tpool, tid) : NULL;
+            if (nvn_trace_first() && nvn_tex_apply_trace++ < 8)
+                fprintf(stderr, "[totk-nvn] ApplyTex stage=%d slot=%d handle=%#llx tid=%d"
+                                " tpool=%p tex=%p\n", stage, i, (unsigned long long)handle,
+                        tid, (const void *)tpool, (const void *)t);
             if (!t) continue;
             GfxTexture *g = nvn_texture_gfx_ready(t);   /* lazy first-bind upload */
+            if (nvn_trace_first() && nvn_tex_apply_trace <= 8)
+                fprintf(stderr, "[totk-nvn] ApplyTex stage=%d slot=%d gfx=%p target=%d"
+                                " fmt=%#x %ux%u\n", stage, i, (void *)g, t->d.target,
+                        t->d.format, t->d.width, t->d.height);
             if (g && !gfx_backend_reflected_bind_texture_slot(rp, (uint32_t)stage, (uint32_t)i, g) &&
                 nvn_trace())
                 fprintf(stderr, "[totk-nvn] texture stage=%d slot=%d handle=%#llx not in reflection\n",
@@ -3835,10 +4327,12 @@ static uint32_t nvn_translate_commands(const cb_t *cb, GfxCmd *out, uint32_t max
                 uint64_t h = c->u.desc.handle;
                 int tid = (int)(h & 0xfffff);
                 int sid = (int)((h >> 20) & 0xfff);
-                const tex_t *t = (h && tid != 0xfffff && cb->tex_pool)
-                    ? nvn_tex_pool_lookup(cb->tex_pool, tid) : NULL;
-                const samp_t *sp = (h && cb->samp_pool)
-                    ? nvn_samp_pool_lookup(cb->samp_pool, sid) : NULL;
+                const tex_pool_t *tpool = nvn_tex_pool_for(cb);
+                const samp_pool_t *spool = nvn_samp_pool_for(cb);
+                const tex_t *t = (h && tid != 0xfffff && tpool)
+                    ? nvn_tex_pool_lookup(tpool, tid) : NULL;
+                const samp_t *sp = (h && spool)
+                    ? nvn_samp_pool_lookup(spool, sid) : NULL;
                 out[n].u.bind.texture = t ? nvn_texture_gfx_ready(t) : NULL;
                 out[n].u.bind.sampler = sp ? nvn_sampler_gfx(sp) : NULL;
             } else {
@@ -3951,22 +4445,31 @@ static void nvn_warm_recording(void *vc) {
     GfxRenderTargetLayout layout;
     uint32_t rw = 0, rh = 0;
     int have_layout = 0;
+    int window_texture = 1;
+    const nvn_draw_snap_t *snap = nvn_cb_last_draw(cb);
     nvn_cb_target_t *cbt = nvn_cb_target(cb, 0);
-    if (cbt && cbt->valid) {
+    if (snap && snap->have_layout) {
+        layout = snap->layout;
+        rw = snap->width;
+        rh = snap->height;
+        window_texture = snap->window_texture;
+        have_layout = 1;
+    } else if (cbt && cbt->valid) {
         layout = cbt->layout;
         rw = cbt->width;
         rh = cbt->height;
+        window_texture = cbt->window_texture;
         have_layout = 1;
     } else {
         nvn_window_layout(w, &layout, &rw, &rh);
         have_layout = layout.color_count > 0 && rw && rh;
     }
     if (!have_layout) return;
-    int window_pass = (!cbt || cbt->window_texture) &&
-                      nvn_layout_matches_window(w, &layout, rw, rh);
+    int window_pass = window_texture && nvn_layout_matches_window(w, &layout, rw, rh);
     GfxVertexLayout input;
     uint64_t vertex_sig = 0;
-    nvn_build_vertex_layout(cb, &input, &vertex_sig);
+    const nvn_bind_state_t *wbs = nvn_cb_draw_state(cb);
+    nvn_build_vertex_layout(wbs, &input, &vertex_sig);
     char variant[192];
     nvn_variant_suffix(p, cb, variant, sizeof variant);
     (void)nvn_program_cached_pipeline(p, nvn_window_format(w), &layout,
@@ -3984,6 +4487,41 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             if (cand->handle == cmds[i]) { cb = cand; break; }
         }
         if (!cb || (!cb->draw_count && !cb->ncmds)) continue;
+        if (nvn_trace_first() && nvn_submit_trace++ < 4096) {
+            const nvn_bind_state_t *sb = cb->bind_state;
+            fprintf(stderr, "[totk-nvn] Submit#%u handle=%#llx cb=%p prog=%p draw=%d"
+                            " va=%#x ubo=%#x/%#x tex=%#x tpool=%p spool=%p\n",
+                    nvn_submit_trace, (unsigned long long)cmds[i], (void *)cb, (void *)cb->prog,
+                    cb->draw_count, sb ? sb->va_mask : 0, sb ? sb->ubo_mask[0] : 0,
+                    sb ? sb->ubo_mask[1] : 0, sb ? sb->tex_mask[0][0] : 0,
+                    (const void *)cb->tex_pool, (const void *)cb->samp_pool);
+            if (nvn_submit_trace == 1) for (int gs = 0; gs < 2; gs++) for (int gi = 0; gi < 16; gi++) {
+                uint64_t ga = 0; size_t gn = 0;
+                if (!nvn_global_ubo_get(gs, gi, &ga, &gn)) continue;
+                const uint32_t *gu = (const uint32_t *)(uintptr_t)ga;
+                size_t gnw = gn / 4; if (gnw > 4096) gnw = 4096;
+                size_t gnz = gnw;
+                for (size_t q = 0; q < gnw; q++) if (gu[q]) { gnz = q; break; }
+                fprintf(stderr, "[totk-nvn] GlobalUbo[%d][%d] addr=%#llx size=%zu first_nz=%s%#zx",
+                        gs, gi, (unsigned long long)ga, gn, gnz == gnw ? "none " : "",
+                        gnz == gnw ? 0 : gnz * 4);
+                for (size_t q = (gnz == gnw ? 0 : gnz); q < (gnz == gnw ? 0 : gnz + 8) && q < gnw; q++)
+                    fprintf(stderr, " %08x", gu[q]);
+                fprintf(stderr, "\n");
+            }
+            if (sb && nvn_submit_trace <= 8) for (int st2 = 0; st2 < 2; st2++) for (int ui = 0; ui < 16; ui++) {
+                if (!(sb->ubo_mask[st2] & (1u << ui)) || !sb->ubo[st2][ui].address) continue;
+                const uint32_t *u = (const uint32_t *)(uintptr_t)sb->ubo[st2][ui].address;
+                size_t nw = sb->ubo[st2][ui].size / 4;
+                if (nw > (1u << 16)) nw = 1u << 16;
+                size_t nz = nw;
+                for (size_t q = 0; q < nw; q++) if (u[q]) { nz = q; break; }
+                fprintf(stderr, "[totk-nvn] Submit#%u ubo[%d][%d] addr=%#llx size=%zu first_nz=%s%#zx\n",
+                        nvn_submit_trace - 1, st2, ui,
+                        (unsigned long long)sb->ubo[st2][ui].address, sb->ubo[st2][ui].size,
+                        nz == nw ? "none " : "", nz == nw ? 0 : nz * 4);
+            }
+        }
         prog_t *p = cb->prog;
         win_t *w = cb->win;
         int has_program = p && p->magic == NVN_MAGIC('P', 'R', 'O', 'G');
@@ -3999,19 +4537,98 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
         GfxRenderTargetLayout layout;
         uint32_t rw = 0, rh = 0;
         int have_layout = 0;
+        int window_texture = 1;
+        const nvn_draw_snap_t *snap = nvn_cb_last_draw(cb);
         nvn_cb_target_t *cbt = nvn_cb_target(cb, 0);
-        if (cbt && cbt->valid) {
+        if (snap && snap->have_layout) {
+            layout = snap->layout;
+            rw = snap->width;
+            rh = snap->height;
+            window_texture = snap->window_texture;
+            have_layout = 1;
+        } else if (cbt && cbt->valid) {
             layout = cbt->layout;
             rw = cbt->width;
             rh = cbt->height;
+            window_texture = cbt->window_texture;
             have_layout = 1;
         } else {
             nvn_window_layout(w, &layout, &rw, &rh);
             have_layout = layout.color_count > 0 && rw && rh;
         }
-        int window_target = !cbt || cbt->window_texture;
+        int window_target = window_texture;
         int window_pass = !have_layout ||
                           (window_target && nvn_layout_matches_window(w, &layout, rw, rh));
+        const nvn_bind_state_t *bs = nvn_cb_draw_state(cb);
+        if (nvn_trace_first() && nvn_nvn_draws < 4) {
+            fprintf(stderr, "[totk-nvn] Submit cb=%p bs=%p va0=%#x vs0=%#llx legacy=%p window=%p win_target=%d"
+                            " layout=%dx%d colors=%u depth=%#x have_layout=%d window_pass=%d"
+                            " va_mask=%#x vs_mask=%#x vb_mask=%#x ubo0=%#x ssbo0=%#x tex0=%#x"
+                            " tpool=%p spool=%p\n",
+                    (void *)cb, (void *)bs, bs ? bs->va[0] : 0,
+                    bs ? (unsigned long long)bs->vs[0] : 0, (void *)p, (void *)w, window_target, rw, rh,
+                    layout.color_count, layout.depth_format, have_layout, window_pass,
+                    bs ? bs->va_mask : 0, bs ? bs->vs_mask : 0, bs ? bs->vb_mask : 0,
+                    bs ? bs->ubo_mask[0] : 0, bs ? bs->ssbo_mask[0] : 0,
+                    bs ? bs->tex_mask[0][0] : 0,
+                    (const void *)cb->tex_pool, (const void *)cb->samp_pool);
+            if (bs) {
+                for (int i = 0; i < 16; i++)
+                    if (bs->ubo_mask[0] & (1u << i))
+                        fprintf(stderr, "[totk-nvn] Submit cb=%p ubo[0][%d] addr=%#llx size=%zu\n",
+                                (void *)cb, i, (unsigned long long)bs->ubo[0][i].address,
+                                bs->ubo[0][i].size);
+                for (int i = 0; i < 16; i++)
+                    if (bs->ubo_mask[1] & (1u << i))
+                        fprintf(stderr, "[totk-nvn] Submit cb=%p ubo[1][%d] addr=%#llx size=%zu\n",
+                                (void *)cb, i, (unsigned long long)bs->ubo[1][i].address,
+                                bs->ubo[1][i].size);
+                for (int i = 0; i < 16; i++)
+                    if ((bs->vb_mask & (1u << i)) && bs->vb[i].address)
+                        fprintf(stderr, "[totk-nvn] Submit cb=%p vb[%d] addr=%#llx size=%zu\n",
+                                (void *)cb, i, (unsigned long long)bs->vb[i].address,
+                                bs->vb[i].size);
+                if (nvn_nvn_draws < 2 && (bs->ubo_mask[0] & 1u) && bs->ubo[0][0].address) {
+                    const uint32_t *u = (const uint32_t *)(uintptr_t)bs->ubo[0][0].address;
+                    fprintf(stderr, "[totk-nvn] Submit cb=%p ubo0 hex:", (void *)cb);
+                    for (int k = 0; k < 16; k++) fprintf(stderr, " %08x", u[k]);
+                    fprintf(stderr, "\n");
+                    size_t nw = bs->ubo[0][0].size / 4;
+                    if (nw > (1u << 18)) nw = 1u << 18;
+                    size_t nz = nw;
+                    for (size_t k = 0; k < nw; k++) if (u[k]) { nz = k; break; }
+                    if (nz == nw) {
+                        fprintf(stderr, "[totk-nvn] Submit cb=%p ubo0 is all zero (%zu bytes)\n",
+                                (void *)cb, bs->ubo[0][0].size);
+                    } else {
+                        fprintf(stderr, "[totk-nvn] Submit cb=%p ubo0 first nonzero +%#zx:",
+                                (void *)cb, nz * 4);
+                        for (size_t k = nz; k < nz + 16 && k < nw; k++)
+                            fprintf(stderr, " %08x", u[k]);
+                        fprintf(stderr, "\n");
+                    }
+                }
+                if (nvn_nvn_draws < 2 && (bs->vb_mask & 1u) && bs->vb[0].address) {
+                    const uint32_t *v = (const uint32_t *)(uintptr_t)bs->vb[0].address;
+                    fprintf(stderr, "[totk-nvn] Submit cb=%p vb0 hex:", (void *)cb);
+                    for (int k = 0; k < 16; k++) fprintf(stderr, " %08x", v[k]);
+                    fprintf(stderr, "\n");
+                }
+                if (nvn_nvn_draws < 2) {
+                    for (uint32_t ci = 0; ci < cb->ncmds; ci++) {
+                        if (cb->cmds[ci].kind != NVN_CMD_DRAW_INDEXED) continue;
+                        uint64_t ip = cb->cmds[ci].u.draw_indexed.indices;
+                        const uint8_t *ib = (const uint8_t *)(uintptr_t)ip;
+                        fprintf(stderr, "[totk-nvn] Submit cb=%p draw_indexed type=%u count=%u"
+                                        " index_ptr=%#llx bytes=",
+                                (void *)cb, cb->cmds[ci].u.draw_indexed.index_type,
+                                cb->cmds[ci].u.draw_indexed.count, (unsigned long long)ip);
+                        for (int k = 0; k < 16; k++) fprintf(stderr, "%02x", ib[k]);
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
+        }
         GfxOffscreenTarget *rt = NULL;
         if (have_layout && !window_pass) {
             rt = nvn_host_rt_get(rw, rh, &layout);
@@ -4023,7 +4640,36 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
 
         GfxVertexLayout input;
         uint64_t vertex_sig = 0;
-        nvn_build_vertex_layout(cb, &input, &vertex_sig);
+        nvn_build_vertex_layout(bs, &input, &vertex_sig);
+        if (nvn_trace_first() && nvn_nvn_draws < 4) {
+            for (uint32_t ci = 0; ci < cb->ncmds; ci++) {
+                const nvn_cmd_t *cc = &cb->cmds[ci];
+                if (cc->kind == NVN_CMD_SET_VIEWPORT || cc->kind == NVN_CMD_SET_SCISSOR)
+                    fprintf(stderr, "[totk-nvn] Submit cb=%p cmd kind=%u rect=%d,%d %dx%d\n",
+                            (void *)cb, cc->kind, cc->u.rect.x, cc->u.rect.y,
+                            cc->u.rect.width, cc->u.rect.height);
+                else if (cc->kind == NVN_CMD_CLEAR_COLOR)
+                    fprintf(stderr, "[totk-nvn] Submit cb=%p cmd clear idx=%d rgba=%.3f,%.3f,%.3f,%.3f\n",
+                            (void *)cb, cc->u.clear.index, cc->u.clear.rgba[0],
+                            cc->u.clear.rgba[1], cc->u.clear.rgba[2], cc->u.clear.rgba[3]);
+            }
+            fprintf(stderr, "[totk-nvn] Submit cb=%p state cull=%u front=%u poly=%u dt=%u dw=%u df=%u"
+                            " blend=%#x stencil=%u chmask=%#x\n", (void *)cb,
+                    bs->rs.poly.cull, bs->rs.poly.front, bs->rs.poly.mode,
+                    bs->rs.ds.dt, bs->rs.ds.dw, bs->rs.ds.df,
+                    bs->rs.color.blend_en, bs->rs.ds.st, bs->rs.chmask.mask);
+            fprintf(stderr, "[totk-nvn] Submit cb=%p vertex layout attrs=%u bindings=%u sig=%#llx\n",
+                    (void *)cb, input.nattributes, input.nbindings,
+                    (unsigned long long)vertex_sig);
+            for (uint32_t ai = 0; ai < input.nattributes; ai++)
+                fprintf(stderr, "[totk-nvn] Submit cb=%p attr loc=%u binding=%u fmt=%#x off=%u\n",
+                        (void *)cb, input.attributes[ai].location, input.attributes[ai].binding,
+                        input.attributes[ai].format, input.attributes[ai].offset);
+            for (uint32_t bi = 0; bi < input.nbindings; bi++)
+                fprintf(stderr, "[totk-nvn] Submit cb=%p vbind b=%u stride=%u rate=%u\n",
+                        (void *)cb, input.bindings[bi].binding, input.bindings[bi].stride,
+                        input.bindings[bi].input_rate);
+        }
         GfxReflectedPipeline *reflected = has_program
             ? (GfxReflectedPipeline *)p->gfx_reflected_pipeline : NULL;
         if (!reflected && has_program) {
@@ -4049,9 +4695,9 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             uint32_t count = nvn_translate_commands(cb, translated, cap,
                                                     window_pass ? NULL : rt,
                                                     clear, &has_clear);
-            nvn_apply_bind_state(p, reflected, cb);
+            nvn_apply_bind_state(p, reflected, bs, cb);
             GfxVertexStream streams[16];
-            uint32_t nstreams = nvn_build_vertex_streams(cb, streams, 16);
+            uint32_t nstreams = nvn_build_vertex_streams(bs, streams, 16);
             if (window_pass)
                 drew = runtime_native_window_execute_reflected_ex(w->native, reflected,
                                                                   translated, count,
@@ -4092,14 +4738,20 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
         }
         static int l2_frame_dumped;
         const char *l2_frame = getenv("TOTK_ANDROID_L2_FRAME");
-        if (l2_frame && *l2_frame && !l2_frame_dumped) {
+        const char *l2_at_s = getenv("TOTK_ANDROID_L2_FRAME_AT");
+        unsigned l2_at = l2_at_s && *l2_at_s ? (unsigned)strtoul(l2_at_s, NULL, 0) : 0;
+        if (l2_frame && *l2_frame && !l2_frame_dumped && nvn_nvn_draws == l2_at) {
             l2_frame_dumped = 1;
             int shot = runtime_native_window_screenshot(w->native, l2_frame);
-            fprintf(stderr, "[totk-nvn] first reflected frame -> %s (%s)\n",
-                    l2_frame, shot ? "ok" : "failed");
+            if (l2_at)
+                fprintf(stderr, "[totk-nvn] reflected frame #%u -> %s (%s)\n",
+                        nvn_nvn_draws, l2_frame, shot ? "ok" : "failed");
+            else
+                fprintf(stderr, "[totk-nvn] first reflected frame -> %s (%s)\n",
+                        l2_frame, shot ? "ok" : "failed");
         }
         unsigned total = __atomic_add_fetch(&nvn_nvn_draws, 1, __ATOMIC_RELAXED);
-        if (total <= 32 || nvn_trace())
+        if (total <= 32 || (total % 300) == 0 || nvn_trace())
             fprintf(stderr, "[totk-nvn] NVN draw #%u program=%p window=%p vertices=%d%s%s\n",
                     total, (void *)p, (void *)w, cb->draw_count,
                     reflected ? " reflected" : " fallback",
@@ -5553,6 +6205,100 @@ int runtime_nvn_fence_selftest(void) {
     return ok;
 }
 
+/* Focused regression check for the two first-frame state bugs:
+ *  - the NVNvertexAttribState/StreamState setters actually fill the packed
+ *    objects the command buffer binds (attrs used to arrive as zero), and
+ *  - texture/sampler pools are inherited when the recording command buffer
+ *    has not set a pool of its own. */
+int runtime_nvn_vertex_state_selftest(void) {
+    nvn_dev_t d;
+    dev_builder_t db;
+    memset(&d, 0, sizeof d);
+    memset(&db, 0, sizeof db);
+    if (!nvnDeviceInitialize(&d, &db)) return 0;
+
+    uint32_t va = 0xdeadbeefu;
+    uint64_t vs = 0xdeadbeefcafef00dull;
+    nvnVertexAttribStateSetDefaults(&va);
+    nvnVertexAttribStateSetFormat(&va, 0x29, 0);
+    nvnVertexAttribStateSetStreamIndex(&va, 0);
+    nvnVertexStreamStateSetDefaults(&vs);
+    nvnVertexStreamStateSetStride(&vs, 16);
+    nvnVertexStreamStateSetDivisor(&vs, 0);
+    int fmt = -1;
+    ptrdiff_t off = -1;
+    nvnVertexAttribStateGetFormat(&va, &fmt, &off);
+    int ok = fmt == 0x29 && off == 0 && nvnVertexAttribStateGetStreamIndex(&va) == 0 &&
+             nvnVertexStreamStateGetStride(&vs) == 16 && nvnVertexStreamStateGetDivisor(&vs) == 0;
+
+    cb_t cb;
+    memset(&cb, 0, sizeof cb);
+    if (!nvnCommandBufferInitialize(&cb, &d)) return 0;
+    nvnCommandBufferBindVertexAttribState(&cb, 1, &va);
+    nvnCommandBufferBindVertexStreamState(&cb, 1, &vs);
+    nvnCommandBufferBindVertexBuffer(&cb, 0, 0x1000, 64);
+    const nvn_bind_state_t *bs = nvn_cb_draw_state(&cb);
+    GfxVertexLayout l;
+    uint64_t sig = 0;
+    nvn_build_vertex_layout(bs, &l, &sig);
+    int want_vk = gfx_backend_vk_format_for_nvn(0x29);
+    int layout_ok = l.nattributes == 1 && l.nbindings == 1 && sig != 0 &&
+                    l.attributes[0].location == 0 && l.attributes[0].binding == 0 &&
+                    l.attributes[0].format == want_vk && l.attributes[0].offset == 0 &&
+                    l.bindings[0].binding == 0 && l.bindings[0].stride == 16;
+    ok &= layout_ok;
+
+    /* Pool inheritance across command buffers. */
+    tex_pool_t tp;
+    samp_pool_t sp;
+    tex_t tex;
+    samp_t samp;
+    memset(&tp, 0, sizeof tp);
+    memset(&sp, 0, sizeof sp);
+    memset(&tex, 0, sizeof tex);
+    memset(&samp, 0, sizeof samp);
+    tp.magic = NVN_MAGIC('T', 'P', 'O', 'L'); tp.n = 4;
+    sp.magic = NVN_MAGIC('S', 'P', 'O', 'L'); sp.n = 4;
+    tex.magic = NVN_MAGIC('T', 'E', 'X', 0);
+    samp.magic = NVN_MAGIC('S', 'A', 'M', 'P');
+    nvn_tex_pool_add(&tp, 3, &tex);
+    nvn_samp_pool_add(&sp, 2, &samp);
+    cb_t pool_cb;
+    cb_t draw_cb;
+    memset(&pool_cb, 0, sizeof pool_cb);
+    memset(&draw_cb, 0, sizeof draw_cb);
+    if (!nvnCommandBufferInitialize(&pool_cb, &d) ||
+        !nvnCommandBufferInitialize(&draw_cb, &d))
+        return 0;
+    nvnCommandBufferSetTexturePool(&pool_cb, &tp);
+    nvnCommandBufferSetSamplerPool(&pool_cb, &sp);
+    uint64_t handle = ((uint64_t)2 << 20) | 3u;   /* sampler 2, texture 3 */
+    nvnCommandBufferBindTexture(&draw_cb, 1, 0, handle);
+    const nvn_bind_state_t *dbs = nvn_cb_draw_state(&draw_cb);
+    const tex_pool_t *tpool = nvn_tex_pool_for(&draw_cb);
+    const samp_pool_t *spool = nvn_samp_pool_for(&draw_cb);
+    int pool_ok = tpool == &tp && spool == &sp &&
+                  (dbs->tex_mask[1][0] & 1u) && dbs->tex[1][0] == handle &&
+                  nvn_tex_pool_lookup(tpool, 3) == &tex &&
+                  nvn_samp_pool_lookup(spool, 2) == &samp;
+    ok &= pool_ok;
+
+    fprintf(stderr, "[totk-nvn] vertex-state probe attrs=%u bindings=%u fmt=%#x stride=%u"
+                    " sig=%#llx layout=%d pool=%d -> %s\n",
+            l.nattributes, l.nbindings, l.attributes[0].format,
+            l.nbindings ? l.bindings[0].stride : 0, (unsigned long long)sig,
+            layout_ok, pool_ok, ok ? "PASS" : "FAIL");
+    nvn_tex_pool_forget(&tp);
+    nvn_samp_pool_forget(&sp);
+    nvn_pool_forget(&tp);
+    nvn_pool_forget(&sp);
+    nvnCommandBufferFinalize(&pool_cb);
+    nvnCommandBufferFinalize(&draw_cb);
+    nvnCommandBufferFinalize(&cb);
+    nvnDeviceFinalize(&d);
+    return ok;
+}
+
 static uint32_t nvnSyncInitialize(sync_t *s, const nvn_dev_t *d) { nvn_api("nvnSyncInitialize");
     if (!s || !nvn_obj(d, NVN_MAGIC('D', 'E', 'V', 0), "nvnSyncInitialize(device)")) return 0;
     memset(s, 0, sizeof *s);
@@ -5827,6 +6573,8 @@ static const nvn_entry nvn_entries[] = {
     NVN_E(nvnCommandBufferBindProgram), NVN_E(nvnCommandBufferBindVertexBuffer),
     NVN_E(nvnCommandBufferBindVertexBuffers), NVN_E(nvnCommandBufferBindVertexAttribState),
     NVN_E(nvnCommandBufferBindVertexStreamState), NVN_E(nvnCommandBufferSetPrimitiveRestart),
+    NVN_E(nvnCommandBufferCopyBufferToBuffer), NVN_E(nvnCommandBufferClearBuffer),
+    NVN_E(nvnCommandBufferCallCommands), NVN_E(nvnCommandBufferCopyCommands),
     NVN_E(nvnCommandBufferBindBlendState), NVN_E(nvnCommandBufferBindColorState),
     NVN_E(nvnCommandBufferBindChannelMaskState), NVN_E(nvnCommandBufferBindMultisampleState),
     NVN_E(nvnCommandBufferBindPolygonState), NVN_E(nvnCommandBufferBindDepthStencilState),
@@ -5853,6 +6601,12 @@ static const nvn_entry nvn_entries[] = {
     NVN_E(nvnDepthStencilStateSetDepthWriteEnable), NVN_E(nvnDepthStencilStateSetDepthFunc),
     NVN_E(nvnDepthStencilStateSetStencilTestEnable), NVN_E(nvnDepthStencilStateSetStencilFunc),
     NVN_E(nvnDepthStencilStateSetStencilOp),
+    NVN_E(nvnVertexAttribStateSetDefaults), NVN_E(nvnVertexAttribStateSetFormat),
+    NVN_E(nvnVertexAttribStateSetStreamIndex), NVN_E(nvnVertexAttribStateGetFormat),
+    NVN_E(nvnVertexAttribStateGetStreamIndex),
+    NVN_E(nvnVertexStreamStateSetDefaults), NVN_E(nvnVertexStreamStateSetStride),
+    NVN_E(nvnVertexStreamStateSetDivisor), NVN_E(nvnVertexStreamStateGetStride),
+    NVN_E(nvnVertexStreamStateGetDivisor),
     NVN_E(nvnProgramInitialize), NVN_E(nvnProgramFinalize), NVN_E(nvnProgramSetDebugLabel),
     NVN_E(nvnProgramSetShaders), NVN_E(nvnProgramSetShadersExt),
     NVN_E(nvnProgramSetSampleShading), NVN_E(nvnProgramGetSubtileSize),
@@ -5875,7 +6629,9 @@ static void *nvn_lookup(const char *name) {
     snprintf(g_last_proc, sizeof g_last_proc, "%s", name);
     for (unsigned i = 0; i < sizeof nvn_entries / sizeof *nvn_entries; i++)
         if (!strcmp(name, nvn_entries[i].name)) return (void *)nvn_entries[i].fn;
-    if (nvn_trace()) fprintf(stderr, "[totk-nvn] proc lookup %s (unimplemented)\n", name);
+    static unsigned logged;
+    if (nvn_trace() || (nvn_trace_first() && logged++ < 128))
+        fprintf(stderr, "[totk-nvn] proc lookup %s (unimplemented)\n", name);
     /* Object APIs must not silently report success.  The object categories
      * below have complete implementations, so an unknown name here is a real
      * gap: report it and return a zero-returning entry. */
