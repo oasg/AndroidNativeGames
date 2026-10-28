@@ -39,6 +39,41 @@ int runtime_shader_identity(const void *control, const void *code,
                             RuntimeShaderIdentity *out);
 const char *runtime_shader_stage_name(uint32_t stage);
 
+/* Resolve an NVNshaderData code address.
+ *
+ * TOTK's agl shader packages (BAHS) store the code section as an offset into
+ * the package's code pool.  The guest sometimes hands NVN that pool offset in
+ * the low NVNbufferAddress word (for example 0x16300) while `control` is a
+ * normal host pointer into the same package mapping, so the code pointer must
+ * be recovered as:
+ *
+ *     package_base + pool_offset + low_address
+ *
+ * where package_base is the BAHS header that precedes `control` in its
+ * mapping.  Genuine pointers (>= 0x100000) are passed through.  Resolution is
+ * rejected unless the candidate lands in the same readable mapping, fits the
+ * control section's declared code length, and starts with the SPH magic.
+ */
+typedef struct {
+    uintptr_t region_start;
+    uintptr_t region_end;
+    uintptr_t package_base;   /* BAHS header used for the offset, 0 if none */
+    uint32_t pool_offset;
+    uint32_t pool_size;
+    uintptr_t candidate;      /* last candidate examined */
+    uint32_t code_bytes;      /* control section's declared length */
+    const char *why;          /* failure reason / "bahs-pool" / "absolute" */
+} RuntimeShaderResolveInfo;
+
+/* Pure resolver: `region` is a readable mapping that contains `control`.
+ * Exposed for the host-side regression test; runtime_shader_resolve_code()
+ * finds the mapping in /proc/self/maps and calls this. */
+int runtime_shader_resolve_in_region(const void *region, size_t region_size,
+                                     const void *control, uint64_t low_addr,
+                                     const void **code, RuntimeShaderResolveInfo *info);
+int runtime_shader_resolve_code(const void *control, uint64_t low_addr,
+                                const void **code, RuntimeShaderResolveInfo *info);
+
 /* Cache root: TOTK_ANDROID_SHADER_CACHE, else <profile>/shader-cache, else
  * /data/local/tmp/totk-android/shader-cache.  The returned string is static. */
 const char *runtime_shader_cache_root(void);
