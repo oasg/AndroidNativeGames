@@ -224,7 +224,8 @@ static void nvn_fail(const char *what, const char *detail) {
 }
 static int nvn_trace(void) {
     static int on = -1;
-    if (on < 0) on = getenv("TOTK_ANDROID_TRACE_NVN") != NULL;
+    if (on < 0) on = getenv("TOTK_ANDROID_TRACE_NVN") != NULL ||
+                   getenv("TOTK_ANDROID_TRACE_FRAME") != NULL;
     return on;
 }
 
@@ -2136,9 +2137,20 @@ static void nvnCommandBufferSetRenderTargets(cb_t *c, int n, const void *const *
         win_t *w = nvn_window_for_texture(t[0]);
         if (w) c->win = w;
     }
-    if (nvn_trace() && n)
-        fprintf(stderr, "[totk-nvn] SetRenderTargets count=%d color0=%p window=%p\n",
-                n, t[0], (void *)c->win);
+    if (nvn_trace() && n) {
+        const tex_t *t0 = t[0];
+        const tex_t *dt = depth;
+        if (t0)
+            fprintf(stderr, "[totk-nvn] SetRenderTargets count=%d color0=%p window=%p"
+                            " color0-target=%d format=%#x %ux%u samples=%u"
+                            " depth=%p depth-format=%#x %ux%u\n",
+                    n, t[0], (void *)c->win, t0->d.target, t0->d.format,
+                    t0->d.width, t0->d.height, t0->d.samples,
+                    depth, dt ? dt->d.format : 0, dt ? dt->d.width : 0, dt ? dt->d.height : 0);
+        else
+            fprintf(stderr, "[totk-nvn] SetRenderTargets count=%d color0=%p window=%p (not a tex_t)\n",
+                    n, t[0], (void *)c->win);
+    }
 }
 static void nvnCommandBufferClearColor(cb_t *c, int i, const float *v, int mask) {
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferClearColor", "invalid command buffer"); return; }
@@ -2381,8 +2393,16 @@ static void nvnCommandBufferBindTexture(cb_t *c, int stage, int i, uint64_t hand
         int tid = (int)(handle & 0xfffff), sid = (int)((handle >> 20) & 0xfff);
         const tex_t *t = c->tex_pool ? nvn_tex_pool_lookup(c->tex_pool, tid) : NULL;
         const samp_t *s = c->samp_pool ? nvn_samp_pool_lookup(c->samp_pool, sid) : NULL;
-        fprintf(stderr, "[totk-nvn] BindTexture stage=%d index=%d handle=%#llx tex=%d(%p) samp=%d(%p)\n",
-                stage, i, (unsigned long long)handle, tid, (const void *)t, sid, (const void *)s);
+        if (t)
+            fprintf(stderr, "[totk-nvn] BindTexture stage=%d index=%d handle=%#llx tex=%d(%p)"
+                            " samp=%d(%p) target=%d format=%#x %ux%ux%u levels=%u samples=%u\n",
+                    stage, i, (unsigned long long)handle, tid, (const void *)t, sid, (const void *)s,
+                    t->d.target, t->d.format, t->d.width, t->d.height, t->d.depth,
+                    t->d.levels, t->d.samples);
+        else
+            fprintf(stderr, "[totk-nvn] BindTexture stage=%d index=%d handle=%#llx tex=%d(%p)"
+                            " samp=%d(%p) texture-not-in-pool\n",
+                    stage, i, (unsigned long long)handle, tid, (const void *)t, sid, (const void *)s);
     }
 }
 static void nvnCommandBufferBindTextures(cb_t *c, int stage, int first, int n, const uint64_t *handles) {

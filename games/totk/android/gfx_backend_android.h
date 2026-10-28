@@ -32,6 +32,75 @@ typedef struct {
 GfxSampler *gfx_backend_sampler_create(const GfxSamplerDesc *desc);
 void gfx_backend_sampler_destroy(GfxSampler *sampler);
 
+/* ------------------------------------------------------------------ */
+/* First-frame contract (Phase 2B.4).  These types are frozen before the
+ * renderer lanes start so NVN translation and the Vulkan backend can be
+ * implemented in parallel.  Additive changes only; ask the lead. */
+
+#define GFX_MAX_COLOR_TARGETS 8
+
+typedef enum {
+    GFX_TEXTURE_2D = 0,
+    GFX_TEXTURE_3D,
+    GFX_TEXTURE_CUBE,
+    GFX_TEXTURE_2D_ARRAY,
+    GFX_TEXTURE_CUBE_ARRAY
+} GfxTextureTarget;
+
+/* A texture description independent of NVN's object layout.  `vk_format` is
+ * the already-mapped Vulkan format; `samples` is 1 for non-MSAA. */
+typedef struct {
+    uint32_t target;        /* GfxTextureTarget */
+    uint32_t vk_format;
+    uint32_t width, height, depth;
+    uint32_t mip_levels, array_layers, samples;
+} GfxTextureDesc;
+
+/* One linearized mip/layer slice.  The NVN translation lane deswizzles guest
+ * block-linear storage into `data`; the backend uploads it into the image.
+ * `size` must be at least the tightly packed slice size for the format. */
+typedef struct {
+    uint32_t level, layer;
+    const void *data;
+    size_t size;
+} GfxTextureSubresource;
+
+/* Create a full texture (mips/layers/3D/cube).  Returns NULL for unsupported
+ * format/target combinations; never silently substitutes RGBA8. */
+GfxTexture *gfx_backend_texture_create_desc(const GfxTextureDesc *desc,
+                                            const GfxTextureSubresource *subresources,
+                                            uint32_t count);
+int gfx_backend_texture_read_pixels(const GfxTexture *texture,
+                                    uint32_t level, uint32_t layer,
+                                    void *dst, size_t size);
+
+/* Render-target layout: one to eight color attachments plus depth.  The depth
+ * format is a VkFormat or 0 for no depth attachment. */
+typedef struct {
+    uint32_t color_count;
+    int color_formats[GFX_MAX_COLOR_TARGETS];
+    int depth_format;
+} GfxRenderTargetLayout;
+
+GfxOffscreenTarget *gfx_backend_offscreen_create_layout(uint32_t width, uint32_t height,
+                                                        const GfxRenderTargetLayout *layout);
+uint32_t gfx_backend_offscreen_color_count(const GfxOffscreenTarget *target);
+const GfxRenderTargetLayout *gfx_backend_offscreen_layout(const GfxOffscreenTarget *target);
+int gfx_backend_offscreen_read_pixel_index(const GfxOffscreenTarget *target, uint32_t index,
+                                           uint32_t x, uint32_t y, uint8_t out[4]);
+int gfx_backend_offscreen_write_ppm_index(const GfxOffscreenTarget *target, uint32_t index,
+                                          const char *path);
+
+/* Submission fence.  The current backend submits and waits synchronously; a
+ * fence may therefore already be signaled after submit.  L4 maps NVN
+ * FenceSync/Wait and buffer-map ordering onto this API. */
+typedef struct GfxFence GfxFence;
+GfxFence *gfx_backend_fence_create(void);
+void gfx_backend_fence_signal(GfxFence *fence);
+int gfx_backend_fence_wait(GfxFence *fence, uint64_t timeout_ns);
+void gfx_backend_fence_destroy(GfxFence *fence);
+int gfx_backend_queue_idle(void);
+
 /* Backend availability is explicit: a failed Vulkan path never reports a fake
  * success.  `gfx_backend_vulkan_init` is idempotent and thread-safe. */
 int gfx_backend_vulkan_init(void);
@@ -198,6 +267,16 @@ GfxReflectedPipeline *gfx_backend_reflected_pipeline_create_ex(
                                                             const GfxBindingSpec *vs_specs, uint32_t nvs,
                                                             const GfxBindingSpec *ps_specs, uint32_t nps,
                                                             const GfxVertexLayout *input);
+/* MRT/depth-aware variant used by the first-frame path.  The pipeline is keyed
+ * by the complete target layout (color count/formats + depth) and the optional
+ * vertex layout, so draws with different attachments never share a pass. */
+GfxReflectedPipeline *gfx_backend_reflected_pipeline_create_layout(
+                                                            const uint8_t *vs, size_t vs_size,
+                                                            const uint8_t *ps, size_t ps_size,
+                                                            const GfxRenderTargetLayout *layout,
+                                                            const GfxBindingSpec *vs_specs, uint32_t nvs,
+                                                            const GfxBindingSpec *ps_specs, uint32_t nps,
+                                                            const GfxVertexLayout *input);
 void gfx_backend_reflected_pipeline_destroy(GfxReflectedPipeline *pipeline);
 int gfx_backend_reflected_draw(GfxReflectedPipeline *pipeline, GfxOffscreenTarget *target,
                                float r, float g, float b, float a);
@@ -213,6 +292,7 @@ typedef enum {
     GFX_CMD_SET_SCISSOR,
     GFX_CMD_BIND_DESC,
     GFX_CMD_CLEAR_DEPTH_STENCIL,
+    GFX_CMD_SET_RENDER_TARGETS,
     GFX_CMD_DRAW,
     GFX_CMD_DRAW_INDEXED
 } GfxCmdKind;
@@ -228,6 +308,7 @@ typedef struct {
     union {
         struct { float rgba[4]; uint32_t mask; } clear;
         struct { float depth; uint32_t dmask; int stencil; uint32_t smask; } clear_depth;
+        struct { GfxOffscreenTarget *target; } set_targets;
         struct { int32_t x, y, width, height; } rect;
         struct {
             uint32_t stage, kind, slot;
