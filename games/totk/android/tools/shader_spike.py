@@ -31,7 +31,11 @@ import sys
 
 REPO = pathlib.Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO/'games/totk/scripts'))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from prepare_shader_seed import decoder, bnsh_shaders, sharcb_shaders  # noqa: E402
+from prepare_shader_cache import (  # noqa: E402
+    answer_attr, answer_from_reflection, answer_suffix, validate_suffix,
+)
 
 DEFAULT_PACKAGES = (
     'Shader/system.Product.100.product.Nin_NX_NVN.bfsha.zs',
@@ -93,8 +97,9 @@ def main():
                    help='first N shaders per package (default 2); use --all for every shader')
     p.add_argument('--all', action='store_true')
     p.add_argument('--keep-code', action='store_true', help='keep the sliced Maxwell code files')
-    p.add_argument('--answers', type=pathlib.Path,
-                   help='JSON list of bind-state answer sets; each row may carry name, attr, tex, img, fout')
+    p.add_argument('--answers',
+                   help="JSON list of bind-state answer rows, or 'auto' to derive "
+                        "one row per shader from its canonical SPIR-V/.res.json")
     p.add_argument('--keys', type=pathlib.Path,
                    help='file with one NVN shader key per line; translate only those keys')
     a = p.parse_args()
@@ -114,45 +119,40 @@ def main():
     def read(name):
         return (a.romfs/name).read_bytes()
 
-    decode = decoder(a.romfs, read)
     wanted = None
     if a.keys:
         wanted = {line.strip() for line in a.keys.read_text().splitlines() if line.strip()}
         if not wanted:
             raise SystemExit(f'{a.keys}: no keys')
+    answer_mode = 'none'
     answer_rows = []
     if a.answers:
-        raw = json.loads(a.answers.read_text())
-        if not isinstance(raw, list) or not raw:
-            raise SystemExit(f'{a.answers}: expected a non-empty JSON list')
-        answer_rows = raw
+        if a.answers == 'auto':
+            answer_mode = 'auto'
+        else:
+            answer_path = pathlib.Path(a.answers)
+            if not answer_path.is_file():
+                raise SystemExit(f'answers file not found: {answer_path}')
+            try:
+                raw = json.loads(answer_path.read_text())
+            except ValueError as e:
+                raise SystemExit(f'{answer_path}: invalid JSON: {e}')
+            if not isinstance(raw, list) or not raw:
+                raise SystemExit(f'{answer_path}: expected a non-empty JSON list')
+            for i, ans in enumerate(raw):
+                if not isinstance(ans, dict):
+                    raise SystemExit(f'{answer_path}: row {i}: expected an object')
+                if not (ans.get('name') or ans.get('attr') is not None or
+                        ans.get('formats') is not None or ans.get('tex')):
+                    raise SystemExit(f'{answer_path}: row {i}: no name/attr/formats/tex answer')
+            answer_rows = raw
+            answer_mode = 'list'
 
-    def answer_suffix(ans):
-        """The suffix the Android runtime derives from the same bind state."""
-        names = {'1d': '1d', '2d': '2d', '3d': '3d', '1darray': '1da',
-                 '2darray': '2da', '2dms': '2dms', '2dmsarray': '2dmsa',
-                 'cube': 'cube', 'cubearray': 'cubearr', 'buffer': 'buf'}
-        attr = ans.get('attr') or {}
-        chars, any_attr = [], False
-        for i in range(16):
-            v = attr.get(str(i))
-            c = {'uint': 'u', 'sint': 's', 'float': 'f'}.get(v, '_')
-            chars.append(c)
-            any_attr = any_attr or c != '_'
-        out = ('a' + ''.join(chars)) if any_attr else ''
-        tex = ans.get('tex') or {}
-        parts = []
-        for k in sorted(tex, key=lambda x: int(x)):
-            t = tex[k]
-            depth = t.endswith('_depth')
-            base = t[:-6] if depth else t
-            parts.append(f"t{k}_{names.get(base, base)}{'d' if depth else ''}")
-        if parts:
-            out += ('-' if out else '') + '-'.join(parts)
-        return out
-
+    decode = decoder(a.romfs, read)
     jobs = []
     meta = {}
+    base_jobs = {}
+    base_meta = {}
     used_names = set()
     for package in [x for x in a.packages.split(',') if x]:
         if not (a.romfs/package).is_file():
@@ -185,22 +185,12 @@ def main():
             job = dict(key=stem, stage=stage, code=str(code_path), c1=code[c1:length].hex(),
                        depth_minus_w=True, debug=False, reduced=True,
                        tex={}, img={}, attr={}, fout={})
-            base_meta = dict(source=package, key=key, stage=stage, control_bytes=len(control),
-                             code_bytes=length, c1_hex=c1, source_offset=at)
-            if answer_rows:
-                for ans in answer_rows:
-                    suffix = ans.get('name') or answer_suffix(ans)
-                    if not suffix:
-                        continue
-                    vstem = f'{stem}--{suffix}'
-                    vjob = dict(job, key=vstem,
-                                tex=ans.get('tex') or {}, img=ans.get('img') or {},
-                                attr=ans.get('attr') or {}, fout=ans.get('fout') or {})
-                    jobs.append(vjob)
-                    meta[vstem] = dict(base_meta, stem=stem, variant=suffix)
-            else:
-                jobs.append(job)
-                meta[stem] = base_meta
+            jobs.append(job)
+            base_jobs[stem] = job
+            base_meta[stem] = dict(source=package, key=key, stage=stage,
+                                   control_bytes=len(control), code_bytes=length,
+                                   c1_hex=c1, source_offset=at)
+            meta[stem] = base_meta[stem]
             selected += 1
             if not a.all and not wanted and selected >= a.limit_per_file:
                 break
@@ -210,7 +200,7 @@ def main():
         raise SystemExit('no shaders selected')
     jobs_path = a.out/'jobs.json'
     jobs_path.write_text(json.dumps(jobs, indent=2))
-    print(f'translating {len(jobs)} shaders with {a.translator}')
+    print(f'translating {len(jobs)} canonical shaders with {a.translator}')
     with (a.out/'translate.log').open('w') as log:
         r = subprocess.run([str(a.translator), str(jobs_path), str(spv_dir)],
                            stdout=log, stderr=subprocess.STDOUT, text=True)
@@ -218,8 +208,54 @@ def main():
     if r.returncode != 0:
         print(f'translator returned {r.returncode}', file=sys.stderr)
 
+    # Second pass: bind-state variants, named exactly like nvn_variant_suffix().
+    variant_jobs = []
+    if answer_mode == 'auto':
+        for stem, job in base_jobs.items():
+            if not (spv_dir/(stem+'.spv')).is_file():
+                continue
+            ans = answer_from_reflection(spv_dir/(stem+'.spv'),
+                                         spv_dir/(stem+'.res.json'))
+            suffix = answer_suffix(ans)
+            if not suffix or not validate_suffix(suffix):
+                print(f'  no auto answers for {stem}', file=sys.stderr)
+                continue
+            vstem = f'{stem}--{suffix}'
+            variant_jobs.append(dict(job, key=vstem, attr=answer_attr(ans),
+                                     tex=ans.get('tex') or {}, img={}))
+            meta[vstem] = dict(base_meta[stem], stem=stem, variant=suffix)
+    elif answer_mode == 'list':
+        for stem, job in base_jobs.items():
+            for i, ans in enumerate(answer_rows):
+                suffix = answer_suffix(ans)
+                if not suffix or not validate_suffix(suffix):
+                    print(f'  skip answer {i} for {stem}: no usable suffix',
+                          file=sys.stderr)
+                    continue
+                vstem = f'{stem}--{suffix}'
+                if vstem in meta:
+                    print(f'  skip answer {i} for {stem}: duplicate {suffix}',
+                          file=sys.stderr)
+                    continue
+                variant_jobs.append(dict(job, key=vstem, attr=answer_attr(ans),
+                                         tex=ans.get('tex') or {},
+                                         img=ans.get('img') or {}))
+                meta[vstem] = dict(base_meta[stem], stem=stem, variant=suffix)
+
+    if variant_jobs:
+        vjobs_path = a.out/'variant-jobs.json'
+        vjobs_path.write_text(json.dumps(variant_jobs, indent=2))
+        print(f'translating {len(variant_jobs)} bind-state variants')
+        with (a.out/'translate.log').open('a') as log:
+            vr = subprocess.run([str(a.translator), str(vjobs_path), str(spv_dir)],
+                                stdout=log, stderr=subprocess.STDOUT, text=True)
+        if vr.returncode != 0:
+            print(f'variant translator returned {vr.returncode}', file=sys.stderr)
+
+    total_jobs = len(jobs) + len(variant_jobs)
+
     report = dict(spike='2B.2', translator=str(a.translator), romfs=str(a.romfs),
-                  packages=[x for x in a.packages.split(',') if x], jobs=len(jobs),
+                  packages=[x for x in a.packages.split(',') if x], jobs=total_jobs,
                   translated=0, failed=0, modules=[], errors=[])
     for stem, m in meta.items():
         spv = spv_dir/(stem+'.spv')
@@ -248,10 +284,10 @@ def main():
                 for x in report['modules']))
     if not a.keep_code:
         shutil.rmtree(code_dir, ignore_errors=True)
-    print(f"translated {report['translated']}/{len(jobs)}, failed {report['failed']}, "
+    print(f"translated {report['translated']}/{total_jobs}, failed {report['failed']}, "
           f"bytes={report['bytes_total']} avg={report['bytes_avg']}")
     print(f'out: {spv_dir}')
-    return 0 if report['failed'] == 0 and report['translated'] == len(jobs) else 1
+    return 0 if report['failed'] == 0 and report['translated'] == total_jobs else 1
 
 
 if __name__ == '__main__':
