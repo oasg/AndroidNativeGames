@@ -14,9 +14,10 @@ out=${1:-$here/build/surface-test.apk}
 work=$here/build
 rm -rf "$work"; mkdir -p "$work/classes" "$work/dex" "$work/lib/arm64-v8a"
 python3 "$repo/games/totk/android/tools/prepare_triangle_spv.py" --ndk "$ndk" --out "$work/triangle_spv.h" >/dev/null
-"$cc" -shared -fPIC -O2 -I"$repo/games/totk/android" -I"$work" \
+"$cc" -shared -fPIC -O2 -I"$repo/games/totk/android" -I"$repo/games/totk/runtime" -I"$work" \
   -o "$work/lib/arm64-v8a/libtotk_surface.so" \
-  "$here/surface_test.c" "$repo/games/totk/android/gfx_vulkan_android.c" \
+  "$here/surface_test.c" "$repo/games/totk/android/native_window_android.c" \
+  "$repo/games/totk/android/gfx_vulkan_android.c" \
   -lvulkan -landroid -llog -pthread
 javac -source 8 -target 8 -cp "$jar" -d "$work/classes" "$here/java/com/totk/surfacetest/MainActivity.java"
 "$bt/d8" --lib "$jar" --output "$work/dex" $(find "$work/classes" -name '*.class')
