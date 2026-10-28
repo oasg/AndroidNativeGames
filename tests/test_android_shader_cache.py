@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT/'games/totk/android/tools'
 PACKER = TOOLS/'prepare_shader_cache.py'
 TRANSLATE_DUMP = TOOLS/'translate_dump.py'
+SHADER_SPIKE = TOOLS/'shader_spike.py'
 MAGIC = b'\x03\x02\x23\x07'
 VS_KEY = 'a'*64
 PS_KEY = 'b'*64
@@ -269,6 +270,42 @@ class TranslateDump(unittest.TestCase):
         r = self.run_tool(out, '--clean')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse((out/'stale.spv').exists())
+
+
+class ShaderSpikeAnswers(unittest.TestCase):
+    def test_missing_answers_fails_before_reading_the_romfs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            romfs = root/'romfs'
+            romfs.mkdir()
+            translator = root/'xlate'
+            translator.write_text('#!/bin/sh\nexit 0\n')
+            translator.chmod(0o755)
+            r = subprocess.run([
+                sys.executable, str(SHADER_SPIKE), '--romfs', str(romfs),
+                '--out', str(root/'out'), '--translator', str(translator),
+                '--answers', str(root/'missing.json')],
+                capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn('answers file not found', r.stderr)
+
+    def test_empty_answers_row_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            romfs = root/'romfs'
+            romfs.mkdir()
+            translator = root/'xlate'
+            translator.write_text('#!/bin/sh\nexit 0\n')
+            translator.chmod(0o755)
+            answers = root/'answers.json'
+            answers.write_text('[]')
+            r = subprocess.run([
+                sys.executable, str(SHADER_SPIKE), '--romfs', str(romfs),
+                '--out', str(root/'out'), '--translator', str(translator),
+                '--answers', str(answers)],
+                capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn('non-empty JSON list', r.stderr)
 
 
 if __name__ == '__main__':

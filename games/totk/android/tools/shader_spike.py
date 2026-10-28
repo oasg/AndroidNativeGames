@@ -119,7 +119,6 @@ def main():
     def read(name):
         return (a.romfs/name).read_bytes()
 
-    decode = decoder(a.romfs, read)
     wanted = None
     if a.keys:
         wanted = {line.strip() for line in a.keys.read_text().splitlines() if line.strip()}
@@ -149,6 +148,7 @@ def main():
             answer_rows = raw
             answer_mode = 'list'
 
+    decode = decoder(a.romfs, read)
     jobs = []
     meta = {}
     base_jobs = {}
