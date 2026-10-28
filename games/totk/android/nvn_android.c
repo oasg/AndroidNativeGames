@@ -2111,6 +2111,7 @@ typedef struct {
     GfxRenderTargetLayout layout;
     uint32_t width, height;
     int valid;
+    int window_texture;   /* color 0 is a registered window swapchain texture */
 } nvn_cb_target_t;
 static nvn_cb_target_t g_cb_targets[64];
 static pthread_mutex_t g_cb_target_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -2616,7 +2617,7 @@ static void nvnCommandBufferSetRenderTargets(cb_t *c, int n, const void *const *
      * texture is color target 0 so present/draw share one host target. */
     if (n > 0 && t && t[0]) {
         win_t *w = nvn_window_for_texture(t[0]);
-        if (w) c->win = w;
+        if (w) { c->win = w; if (cbt) cbt->window_texture = 1; }
     }
     if (nvn_trace() && n) {
         const tex_t *t0 = nvn_tex_registry_find(t[0]);
@@ -3334,6 +3335,7 @@ static void nvn_variant_suffix(prog_t *p, const cb_t *cb, char *out, size_t cap)
 
 static GfxReflectedPipeline *nvn_program_cached_pipeline(prog_t *p, uint32_t nvn_format,
                                                          const GfxRenderTargetLayout *layout,
+                                                         int legacy_window_target,
                                                          const GfxVertexLayout *input,
                                                          uint64_t vertex_sig,
                                                          const char *variant) {
@@ -3351,6 +3353,7 @@ static GfxReflectedPipeline *nvn_program_cached_pipeline(prog_t *p, uint32_t nvn
     }
     uint64_t variant_sig = nvn_variant_sig(variant);
     uint64_t layout_sig = nvn_layout_sig(layout);
+    if (legacy_window_target) layout_sig ^= 0x9e3779b97f4a7c15ull;
     if (s->pipeline && s->pipeline_format == fmt && s->vertex_sig == vertex_sig &&
         s->variant_sig == variant_sig && s->layout_sig == layout_sig) {
         GfxReflectedPipeline *ready = s->pipeline;
@@ -3406,7 +3409,15 @@ static GfxReflectedPipeline *nvn_program_cached_pipeline(prog_t *p, uint32_t nvn
                 layout ? layout->color_count : 0, layout ? layout->depth_format : 0,
                 input ? input->nattributes : 0, input ? input->nbindings : 0,
                 variant && *variant ? variant : "-");
-    s->pipeline = layout
+    /* The legacy window/single-target image (gfx_backend_offscreen_create) is
+     * color-only from NVN's point of view; keep it on the old create_ex path so
+     * that path keeps working, and use the layout-aware variant whenever NVN
+     * asked for MRT or depth.  (L3 note: as of the merge test the legacy
+     * target reports depth=VK_FORMAT_D24_UNORM_S8_UINT, so a create_layout
+     * pipeline with depth=0 is rejected by the backend's layout check.) */
+    int use_layout = layout && !legacy_window_target &&
+                     (layout->color_count > 1 || layout->depth_format != 0);
+    s->pipeline = use_layout
         ? gfx_backend_reflected_pipeline_create_layout(uspv[0], usize[0], uspv[1], usize[1],
                                                        layout, vss, nvs, pss, nps, input)
         : gfx_backend_reflected_pipeline_create_ex(uspv[0], usize[0], uspv[1], usize[1],
@@ -3794,9 +3805,9 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             nvn_window_layout(w, &layout, &rw, &rh);
             have_layout = layout.color_count > 0 && rw && rh;
         }
-        int window_pass = have_layout &&
-                          nvn_layout_matches_window(w, &layout, rw, rh);
-        if (!have_layout) window_pass = 1;   /* no layout info: keep the window path */
+        int window_target = !cbt || cbt->window_texture;
+        int window_pass = !have_layout ||
+                          (window_target && nvn_layout_matches_window(w, &layout, rw, rh));
         GfxOffscreenTarget *rt = NULL;
         if (have_layout && !window_pass) {
             rt = nvn_host_rt_get(rw, rh, &layout);
@@ -3816,6 +3827,7 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             nvn_variant_suffix(p, cb, variant, sizeof variant);
             reflected = nvn_program_cached_pipeline(p, nvn_window_format(w),
                                                     have_layout ? &layout : NULL,
+                                                    window_pass,
                                                     input.nattributes ? &input : NULL,
                                                     vertex_sig, variant);
         }
