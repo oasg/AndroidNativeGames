@@ -1108,6 +1108,32 @@ static void dump_threads(unsigned secs) {
     }
 #endif
 }
+/* Low-noise probe for first-frame tracing: where is a guest thread now?
+ * Returns 0 when the thread is gone or the global lock is busy; the caller
+ * must not block a recording/submit path on the diagnostic. */
+int runtime_thread_probe(uint32_t handle, int *wkind, uint64_t *waddr,
+                         uint32_t wh[4], int *nwh, int *last_svc,
+                         uint64_t *last_lr, uint64_t *last_fp,
+                         uint64_t *nsvc, int *exited) {
+    int ok = 0;
+    if (pthread_mutex_trylock(&G)) return 0;
+    for (thr_t *t = g_all; t; t = t->all) {
+        if (t->handle != handle) continue;
+        if (wkind) *wkind = t->wkind;
+        if (waddr) *waddr = t->waddr;
+        if (nwh) *nwh = t->nwh;
+        if (wh) for (int i = 0; i < 4; i++) wh[i] = i < t->nwh ? t->wh[i] : 0;
+        if (last_svc) *last_svc = t->last_svc;
+        if (last_lr) *last_lr = t->last_lr;
+        if (last_fp) *last_fp = t->last_fp;
+        if (nsvc) *nsvc = t->nsvc;
+        if (exited) *exited = t->exited;
+        ok = 1;
+        break;
+    }
+    pthread_mutex_unlock(&G);
+    return ok;
+}
 void runtime_dump_threads(void) { dump_threads(0); }   // TOTK_INPUT_FILE "threads"
 __attribute__((constructor)) static void dump_init(void) {
     const char *c = getenv("TOTK_LISTCHECK");
