@@ -2236,6 +2236,15 @@ int main(int argc, char **argv) {
         printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-vertex-state\"}\n");
         return 0;
     }
+    if (!strcmp(argv[2], "probe-nvn-cb-call")) {
+        int runtime_nvn_cb_call_selftest(void);
+        if (!runtime_nvn_cb_call_selftest()) {
+            fprintf(stderr, "[totk-nvn] NVN finalized-handle CallCommands selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-cb-call\"}\n");
+        return 0;
+    }
     if (!strcmp(argv[2], "probe-vi")) {
         int runtime_vi_selftest(void);
         if (!runtime_vi_selftest()) { fprintf(stderr, "[totk-vi] selftest FAIL\n"); return 1; }

@@ -2513,6 +2513,121 @@ static void nvn_cb_free_commands(cb_t *c) {
     c->ncmds = c->cmds_cap = 0;
 }
 
+/* --- Retired command-buffer recordings --------------------------------- */
+/* NVN command handles stay valid after nvnCommandBufferFinalize until the
+ * command memory is reused: the boot frame records a 6-vertex indexed draw,
+ * finalizes the command buffer and then replays the handle with
+ * nvnCommandBufferCallCommands every frame.  Keep an immutable deep copy of
+ * the recording (commands including uniform-update payloads, bind state,
+ * program/window/pools and the resolved targets) keyed by handle so the dead
+ * handle remains executable.  The copy never aliases the guest's command
+ * memory, so re-initialising the command buffer cannot mutate it. */
+typedef struct {
+    uint64_t handle;
+    uint64_t age;                 /* LRU stamp, refreshed on every replay */
+    int used;
+    const cb_t *source;
+    nvn_cmd_t *cmds;
+    uint32_t ncmds;
+    nvn_bind_state_t *bind;
+    void *prog, *win;
+    const tex_pool_t *tex_pool;
+    const samp_pool_t *samp_pool;
+    uint32_t draw_count;
+    GfxRenderTargetLayout layout;
+    uint32_t width, height;
+    int have_layout, window_texture;
+} nvn_retired_t;
+#define NVN_RETIRED_MAX 1024
+static nvn_retired_t g_retired[NVN_RETIRED_MAX];
+static uint64_t g_retired_age;
+static pthread_mutex_t g_retired_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int nvn_cmd_clone(nvn_cmd_t *dst, const nvn_cmd_t *src) {
+    *dst = *src;
+    if (src->kind != NVN_CMD_UPDATE_UBO) return 1;
+    dst->u.update.data = NULL;
+    if (!src->u.update.data || !src->u.update.size) return 1;
+    uint8_t *copy = malloc(src->u.update.size);
+    if (!copy) return 0;
+    memcpy(copy, src->u.update.data, src->u.update.size);
+    dst->u.update.data = copy;
+    return 1;
+}
+static void nvn_retired_clear_locked(nvn_retired_t *e) {
+    if (!e) return;
+    for (uint32_t i = 0; i < e->ncmds; i++)
+        if (e->cmds[i].kind == NVN_CMD_UPDATE_UBO) free(e->cmds[i].u.update.data);
+    free(e->cmds);
+    free(e->bind);
+    memset(e, 0, sizeof *e);
+}
+static void nvn_cb_retire(cb_t *c) {
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) return;
+    if (!c->handle || (!c->ncmds && !c->draw_count)) return;
+    pthread_mutex_lock(&g_retired_lock);
+    nvn_retired_t *e = NULL, *oldest = NULL;
+    for (unsigned i = 0; i < NVN_RETIRED_MAX; i++) {
+        if (g_retired[i].used && g_retired[i].handle == c->handle) { e = &g_retired[i]; break; }
+        if (!g_retired[i].used && !e) e = &g_retired[i];
+        if (g_retired[i].used && (!oldest || g_retired[i].age < oldest->age)) oldest = &g_retired[i];
+    }
+    if (!e) e = oldest;
+    if (!e) { pthread_mutex_unlock(&g_retired_lock); return; }
+    nvn_retired_clear_locked(e);
+    uint32_t n = c->ncmds;
+    nvn_cmd_t *cmds = n ? calloc(n, sizeof *cmds) : NULL;
+    uint32_t copied = 0;
+    if (n && !cmds) { pthread_mutex_unlock(&g_retired_lock); return; }
+    for (uint32_t i = 0; i < n; i++) {
+        if (!nvn_cmd_clone(&cmds[i], &c->cmds[i])) {
+            for (uint32_t k = 0; k < i; k++)
+                if (cmds[k].kind == NVN_CMD_UPDATE_UBO) free(cmds[k].u.update.data);
+            free(cmds);
+            pthread_mutex_unlock(&g_retired_lock);
+            return;
+        }
+        copied++;
+    }
+    e->used = 1;
+    e->handle = c->handle;
+    e->age = ++g_retired_age;
+    e->source = c;
+    e->cmds = cmds;
+    e->ncmds = copied;
+    if (c->bind_state) {
+        e->bind = malloc(sizeof(nvn_bind_state_t));
+        if (e->bind) memcpy(e->bind, c->bind_state, sizeof(nvn_bind_state_t));
+    }
+    e->prog = c->prog;
+    e->win = c->win;
+    e->tex_pool = c->tex_pool;
+    e->samp_pool = c->samp_pool;
+    e->draw_count = (uint32_t)c->draw_count;
+    nvn_cb_target_t *t = nvn_cb_target(c, 0);
+    if (t) {
+        e->layout = t->layout;
+        e->width = t->width;
+        e->height = t->height;
+        e->have_layout = t->valid;
+        e->window_texture = t->window_texture;
+    }
+    pthread_mutex_unlock(&g_retired_lock);
+    if (nvn_trace_frame())
+        fprintf(stderr, "[totk-frame] retire cb=%p handle=%#llx cmds=%u draws=%u bind=%d\n",
+                (void *)c, (unsigned long long)c->handle, copied, e->draw_count, e->bind != NULL);
+}
+/* Drop handles whose command memory is being reused (nvnCommandBufferInitialize
+ * on the same guest object): NVN invalidates the old handle at that point. */
+static void nvn_retired_drop_cb(const cb_t *c) {
+    if (!c) return;
+    pthread_mutex_lock(&g_retired_lock);
+    for (unsigned i = 0; i < NVN_RETIRED_MAX; i++)
+        if (g_retired[i].used && g_retired[i].source == c) nvn_retired_clear_locked(&g_retired[i]);
+    pthread_mutex_unlock(&g_retired_lock);
+}
+
+
 static uint32_t nvnCommandBufferInitialize(cb_t *c, void *d) { nvn_api("nvnCommandBufferInitialize");
     if (!c) { nvn_fail("nvnCommandBufferInitialize", "null command buffer"); return 0; }
     /* Re-initialising the same guest object must drop the previous recording
@@ -2522,6 +2637,7 @@ static uint32_t nvnCommandBufferInitialize(cb_t *c, void *d) { nvn_api("nvnComma
         if (!m || !m->submit_count) nvn_orphan_add(c, m);
     }
     { cb_meta_t *m = nvn_cb_meta(c, 0); if (m) { memset(m, 0, sizeof *m); m->cb = c; } }
+    nvn_retired_drop_cb(c);
     for (unsigned i = 0; i < g_ncbs; i++) {
         if (g_cbs[i] != c) continue;
         nvn_cb_untrack(c);
@@ -2554,6 +2670,7 @@ static void nvnCommandBufferFinalize(cb_t *c) {
                     (void *)c, (unsigned long long)c->handle, runtime_thread_current_handle(),
                     c->ncmds, c->draw_count);
     }
+    nvn_cb_retire(c);
     nvn_cb_untrack(c);
     nvn_cb_target_forget(c);
     nvn_cb_free_commands(c);
@@ -3313,47 +3430,52 @@ static void nvn_frame_report_orphans(void) {
  * Command records are appended in order; the source's final bind state is
  * merged so the draw that follows sees the resources the copied commands
  * bound.  NVN applies those binds on the queue in the same order. */
+static void nvn_bind_state_merge(nvn_bind_state_t *d, const nvn_bind_state_t *s) {
+    if (!d || !s) return;
+    for (int st = 0; st < 6; st++) {
+        for (int i = 0; i < 16; i++) {
+            if (s->ubo_mask[st] & (1u << i)) {
+                d->ubo[st][i] = s->ubo[st][i];
+                d->ubo_mask[st] |= 1u << i;
+            }
+            if (s->ssbo_mask[st] & (1u << i)) {
+                d->ssbo[st][i] = s->ssbo[st][i];
+                d->ssbo_mask[st] |= 1u << i;
+            }
+        }
+        for (int i = 0; i < 128; i++) {
+            if (!(s->tex_mask[st][i / 32] & (1u << (i % 32)))) continue;
+            d->tex[st][i] = s->tex[st][i];
+            d->tex_mask[st][i / 32] |= 1u << (i % 32);
+        }
+    }
+    if (s->va_mask) { memcpy(d->va, s->va, sizeof d->va); d->va_mask = s->va_mask; }
+    if (s->vs_mask) { memcpy(d->vs, s->vs, sizeof d->vs); d->vs_mask = s->vs_mask; }
+    if (s->vb_mask) {
+        for (int i = 0; i < 16; i++)
+            if (s->vb_mask & (1u << i)) d->vb[i] = s->vb[i];
+        d->vb_mask |= s->vb_mask;
+    }
+    d->rs = s->rs;
+    d->depth_tex = s->depth_tex;
+}
+static int nvn_cb_append_command(cb_t *dst, const nvn_cmd_t *src) {
+    nvn_cmd_t *d = nvn_cb_cmd(dst, src->kind);
+    if (!d) return 0;
+    return nvn_cmd_clone(d, src);
+}
 static void nvn_cb_merge_commands(cb_t *dst, const cb_t *src, const char *what) {
     if (!dst || !src) return;
-    for (uint32_t i = 0; i < src->ncmds; i++) {
-        nvn_cmd_t *d = nvn_cb_cmd(dst, src->cmds[i].kind);
-        if (!d) break;
-        *d = src->cmds[i];
-    }
+    for (uint32_t i = 0; i < src->ncmds; i++)
+        if (!nvn_cb_append_command(dst, &src->cmds[i])) break;
     nvn_bind_state_t *d = nvn_cb_bind_state(dst);
     const nvn_bind_state_t *s = src->bind_state;
-    if (d && s) {
-        for (int st = 0; st < 6; st++) {
-            for (int i = 0; i < 16; i++) {
-                if (s->ubo_mask[st] & (1u << i)) {
-                    d->ubo[st][i] = s->ubo[st][i];
-                    d->ubo_mask[st] |= 1u << i;
-                }
-                if (s->ssbo_mask[st] & (1u << i)) {
-                    d->ssbo[st][i] = s->ssbo[st][i];
-                    d->ssbo_mask[st] |= 1u << i;
-                }
-            }
-            for (int i = 0; i < 128; i++) {
-                if (!(s->tex_mask[st][i / 32] & (1u << (i % 32)))) continue;
-                d->tex[st][i] = s->tex[st][i];
-                d->tex_mask[st][i / 32] |= 1u << (i % 32);
-            }
-        }
-        if (s->va_mask) { memcpy(d->va, s->va, sizeof d->va); d->va_mask = s->va_mask; }
-        if (s->vs_mask) { memcpy(d->vs, s->vs, sizeof d->vs); d->vs_mask = s->vs_mask; }
-        if (s->vb_mask) {
-            for (int i = 0; i < 16; i++)
-                if (s->vb_mask & (1u << i)) d->vb[i] = s->vb[i];
-            d->vb_mask |= s->vb_mask;
-        }
-        d->rs = s->rs;
-        d->depth_tex = s->depth_tex;
-    }
+    nvn_bind_state_merge(d, s);
     if (src->prog) dst->prog = src->prog;
     if (src->win) dst->win = src->win;
     if (src->tex_pool) dst->tex_pool = src->tex_pool;
     if (src->samp_pool) dst->samp_pool = src->samp_pool;
+    dst->draw_count += src->draw_count;
     nvn_cb_target_t *st_t = nvn_cb_target(src, 0);
     nvn_cb_target_t *dt_t = nvn_cb_target(dst, 1);
     if (st_t && dt_t && st_t->valid) *dt_t = *st_t, dt_t->cb = dst;
@@ -3362,6 +3484,47 @@ static void nvn_cb_merge_commands(cb_t *dst, const cb_t *src, const char *what) 
                         " ubo=%#x va=%#x tex=%#x\n", what, (void *)dst, (void *)src,
                 src->ncmds, src->draw_count,
                 s ? s->ubo_mask[0] : 0, s ? s->va_mask : 0, s ? s->tex_mask[0][0] : 0);
+}
+/* Replay a finalized recording from the retired table.  The lock is held while
+ * copying so an entry cannot be evicted in the middle of the merge. */
+static int nvn_cb_merge_retired(cb_t *dst, uint64_t handle, const char *what) {
+    if (!dst) return 0;
+    pthread_mutex_lock(&g_retired_lock);
+    nvn_retired_t *e = NULL;
+    for (unsigned i = 0; i < NVN_RETIRED_MAX; i++)
+        if (g_retired[i].used && g_retired[i].handle == handle) { e = &g_retired[i]; break; }
+    if (!e) { pthread_mutex_unlock(&g_retired_lock); return 0; }
+    uint32_t appended = 0;
+    for (uint32_t i = 0; i < e->ncmds; i++) {
+        if (!nvn_cb_append_command(dst, &e->cmds[i])) break;
+        appended++;
+    }
+    nvn_bind_state_t *d = nvn_cb_bind_state(dst);
+    nvn_bind_state_merge(d, e->bind);
+    if (e->prog) dst->prog = e->prog;
+    if (e->win) dst->win = e->win;
+    if (e->tex_pool) dst->tex_pool = e->tex_pool;
+    if (e->samp_pool) dst->samp_pool = e->samp_pool;
+    dst->draw_count += (int)e->draw_count;
+    if (e->have_layout) {
+        nvn_cb_target_t *dt = nvn_cb_target(dst, 1);
+        if (dt) {
+            dt->layout = e->layout;
+            dt->width = e->width;
+            dt->height = e->height;
+            dt->valid = 1;
+            dt->window_texture = e->window_texture;
+        }
+    }
+    e->age = ++g_retired_age;   /* keep a handle the engine replays hot */
+    uint32_t ncmds = e->ncmds, draws = e->draw_count;
+    int has_bind = e->bind != NULL;
+    pthread_mutex_unlock(&g_retired_lock);
+    if (nvn_trace_frame())
+        fprintf(stderr, "[totk-frame] %s retired handle=%#llx dst=%p ncmds=%u draws=%u"
+                        " appended=%u bind=%d\n", what, (unsigned long long)handle,
+                (void *)dst, ncmds, draws, appended, has_bind);
+    return appended != 0 || draws != 0;
 }
 static void nvnCommandBufferCallCommands(cb_t *c, int n, const uint64_t *handles) {
     nvn_api("nvnCommandBufferCallCommands");
@@ -3379,12 +3542,13 @@ static void nvnCommandBufferCallCommands(cb_t *c, int n, const uint64_t *handles
     }
     for (int i = 0; i < n; i++) {
         cb_t *src = nvn_cb_by_handle(handles[i]);
-        if (!src) {
-            if (nvn_trace()) fprintf(stderr, "[totk-nvn] CallCommands handle %#llx not live\n",
-                                     (unsigned long long)handles[i]);
+        if (src) {
+            nvn_cb_merge_commands(c, src, "CallCommands");
             continue;
         }
-        nvn_cb_merge_commands(c, src, "CallCommands");
+        if (!nvn_cb_merge_retired(c, handles[i], "CallCommands") && nvn_trace())
+            fprintf(stderr, "[totk-nvn] CallCommands handle %#llx not live or retired\n",
+                    (unsigned long long)handles[i]);
     }
 }
 static void nvnCommandBufferCopyCommands(cb_t *c, int n, const uint64_t *handles) {
@@ -3403,12 +3567,13 @@ static void nvnCommandBufferCopyCommands(cb_t *c, int n, const uint64_t *handles
     }
     for (int i = 0; i < n; i++) {
         cb_t *src = nvn_cb_by_handle(handles[i]);
-        if (!src) {
-            if (nvn_trace()) fprintf(stderr, "[totk-nvn] CopyCommands handle %#llx not live\n",
-                                     (unsigned long long)handles[i]);
+        if (src) {
+            nvn_cb_merge_commands(c, src, "CopyCommands");
             continue;
         }
-        nvn_cb_merge_commands(c, src, "CopyCommands");
+        if (!nvn_cb_merge_retired(c, handles[i], "CopyCommands") && nvn_trace())
+            fprintf(stderr, "[totk-nvn] CopyCommands handle %#llx not live or retired\n",
+                    (unsigned long long)handles[i]);
     }
 }
 
@@ -5249,6 +5414,80 @@ int runtime_nvn_cb_lifetime_selftest(void) {
     fprintf(stderr, "[totk-nvn] cb lifetime selftest live=%u/%u stale_draws=%u reuse=%d ok=%d\n",
             live_draws, (unsigned)LIVE, stale_draws, reused, ok);
     free(cbs);
+    nvnWindowFinalize(&w);
+    nvnProgramFinalize(&p);
+    runtime_native_window_destroy(nw);
+    return ok;
+}
+
+/* Regression check for NVN command-handle lifetime: a recorded draw list must
+ * survive nvnCommandBufferFinalize and remain executable through
+ * nvnCommandBufferCallCommands.  The guest command-buffer object is clobbered
+ * after finalize to prove the replay uses an immutable snapshot, not stale
+ * guest memory. */
+int runtime_nvn_cb_call_selftest(void) {
+    void *nw = runtime_native_window_create(640, 480, 0x25, 0xCF);
+    if (!nw) return 0;
+    nvn_dev_t d;
+    dev_builder_t db;
+    queue_t q;
+    queue_builder_t qb;
+    memset(&d, 0, sizeof d);
+    memset(&db, 0, sizeof db);
+    memset(&q, 0, sizeof q);
+    memset(&qb, 0, sizeof qb);
+    int ok = nvnDeviceInitialize(&d, &db) != 0;
+    qb.dev = &d; qb.flags = 1; qb.cmd_sz = 0x10000; qb.ctl_sz = 0x1000; qb.mem_sz = 0x2000;
+    ok &= nvnQueueInitialize(&q, &qb) != 0;
+    prog_t p;
+    memset(&p, 0, sizeof p);
+    ok &= nvnProgramInitialize(&p, &d) != 0;
+    p.gfx_pipeline = gfx_backend_builtin_triangle_pipeline();
+    ok &= p.gfx_pipeline != NULL;
+    win_t w;
+    win_builder_t wb;
+    memset(&w, 0, sizeof w);
+    memset(&wb, 0, sizeof wb);
+    wb.dev = &d; wb.native = nw; wb.ntex = 1; wb.tex[0] = (void *)(uintptr_t)1;
+    ok &= nvnWindowInitialize(&w, &wb) != 0;
+
+    cb_t src;
+    memset(&src, 0, sizeof src);
+    ok &= nvnCommandBufferInitialize(&src, &d) != 0;
+    src.prog = &p;
+    src.win = &w;
+    nvnCommandBufferBeginRecording(&src);
+    for (int i = 0; i < 6; i++) nvnCommandBufferDrawArrays(&src, NVN_DRAW_TRIANGLES, 0, 3);
+    uint64_t handle = nvnCommandBufferEndRecording(&src);
+    unsigned src_cmds = src.ncmds;
+    nvnCommandBufferFinalize(&src);
+    /* Command memory is gone; clobber the guest object to prove the replay
+     * cannot depend on it. */
+    memset(&src, 0xaa, sizeof src);
+
+    cb_t dst;
+    memset(&dst, 0, sizeof dst);
+    ok &= nvnCommandBufferInitialize(&dst, &d) != 0;
+    dst.prog = &p;
+    dst.win = &w;
+    nvnCommandBufferBeginRecording(&dst);
+    nvnCommandBufferCallCommands(&dst, 1, &handle);
+    unsigned draws = 0;
+    for (uint32_t i = 0; i < dst.ncmds; i++)
+        if (dst.cmds[i].kind == NVN_CMD_DRAW) draws++;
+    uint64_t dh = nvnCommandBufferEndRecording(&dst);
+    unsigned before = nvn_nvn_draws;
+    nvnQueueSubmitCommands(&q, 1, &dh);
+    int executed = nvn_nvn_draws > before;
+    uint8_t center[4] = {0};
+    runtime_native_window_read_pixel(nw, 320, 240, center);
+    int visible = center[0] > 200 && center[1] > 60 && center[1] < 100 && center[2] < 40;
+    ok &= src_cmds == 6 && draws == 6 && dst.draw_count == 18 && executed && visible;
+    fprintf(stderr, "[totk-nvn] cb-call probe src_cmds=%u merged_draws=%u merged_cmds=%u"
+                    " draw_count=%d executed=%d center=%02x%02x%02x%02x ok=%d\n",
+            src_cmds, draws, dst.ncmds, dst.draw_count, executed,
+            center[0], center[1], center[2], center[3], ok);
+    nvnCommandBufferFinalize(&dst);
     nvnWindowFinalize(&w);
     nvnProgramFinalize(&p);
     runtime_native_window_destroy(nw);
