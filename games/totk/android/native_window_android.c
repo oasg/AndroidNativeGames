@@ -169,6 +169,10 @@ void runtime_native_window_attach_android(void *native_window, void *host_window
             gfx_backend_detach_android_surface();
             return;
         }
+        if (g_shell_window) {
+            runtime_native_window_destroy(g_shell_window);
+            g_shell_window = NULL;
+        }
         w = runtime_native_window_create(width ? width : 1280, height ? height : 720,
                                          nvn_format ? nvn_format : 0x25, 0x53484c4cu /* "SHLL" */);
         if (!w) {
