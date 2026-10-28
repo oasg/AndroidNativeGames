@@ -2227,6 +2227,15 @@ int main(int argc, char **argv) {
         printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-fence\"}\n");
         return 0;
     }
+    if (!strcmp(argv[2], "probe-nvn-vertex-state")) {
+        int runtime_nvn_vertex_state_selftest(void);
+        if (!runtime_nvn_vertex_state_selftest()) {
+            fprintf(stderr, "[totk-nvn] NVN vertex-state/pool-inheritance selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-vertex-state\"}\n");
+        return 0;
+    }
     if (!strcmp(argv[2], "probe-vi")) {
         int runtime_vi_selftest(void);
         if (!runtime_vi_selftest()) { fprintf(stderr, "[totk-vi] selftest FAIL\n"); return 1; }
