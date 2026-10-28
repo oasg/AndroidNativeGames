@@ -56,7 +56,7 @@
 #define H_CUR_THREAD  0xFFFF8000u
 
 enum { O_FREE, O_THREAD, O_EVENT_R, O_EVENT_W, O_SESSION, O_TMEM };   // O_SESSION / O_TMEM: IPC objects owned by ipc.c
-typedef struct event { int signaled; int refs; } event_t;
+typedef struct event { int signaled; int refs; int autoclear; } event_t;
 typedef struct thr {
     uint32_t handle; uint64_t id;
     uint64_t entry, arg, stack_top; uint64_t host_context[2]; int prio, core; uint64_t mask;
@@ -572,6 +572,19 @@ static int sig_obj(uint32_t h, int *bad) {    // 1=已触发（持 G） | 1 = si
     default: *bad = 1; return 0;
     }
 }
+/* Auto-clear readable events are consumed by the successful wait, like the
+ * Horizon kernel event that backs an nn::os auto-clear SystemEvent.  Keeping
+ * the signal set makes a client that waits in a loop spin forever. */
+static void event_consume(uint32_t h) {
+#ifdef GAME_BOTW
+    unsigned i = h_index(h);
+#else
+    unsigned i = h - 0x1000;
+#endif
+    if (i == 0 || i >= MAX_H || g_h[i].type != O_EVENT_R) return;
+    event_t *e = g_h[i].obj;
+    if (e && e->autoclear) e->signaled = 0;
+}
 // 只唤醒有对象已触发的同步等待者（等待的句柄多于记下的 4 个时照旧全唤醒；句柄失效的也唤醒，好让它返回错误）。
 // 原先王国之泪每次触发都唤醒全部同步等待者：每个都要醒来、重新抢虚拟核（core_take，可能为此抢占别的线程）、查一遍句柄再睡回去，
 // 一次触发就是每个等待线程一次宿主线程切换，费 CPU 和电（iPhone 上尤甚）。旷野之息从 58ac238 起就这样做（它的 wake_queue 让被唤醒者立即抢核）；
@@ -877,7 +890,7 @@ int svc_thread(int num, uint64_t *regs) {
             int bad = 0;
             for (int i = 0; i < n && idx < 0; i++) if (sig_obj(hs[i], &bad)) idx = i;
             if (bad) { r = R_BAD_HANDLE; break; }
-            if (idx >= 0) { r = 0; break; }
+            if (idx >= 0) { event_consume(hs[idx]); r = 0; break; }
             int64_t left = ns < 0 ? -1 : ns == 0 ? 0 : deadline - (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns());
             if (ns > 0 && left <= 0) { r = R_TIMEOUT; break; }
             if (block(t, 4, left) == R_TIMEOUT) { r = R_TIMEOUT; break; }
@@ -979,6 +992,13 @@ void *runtime_handle_get(uint32_t h, int session) { pthread_mutex_lock(&G); void
 // Service-side event: returns the writable handle kept by the service.
 uint32_t runtime_event_new(void) {
     event_t *e = calloc(1, sizeof *e); if (!e) die("event allocation"); e->refs = 1;
+    pthread_mutex_lock(&G); uint32_t hw = h_new(O_EVENT_W, e); pthread_mutex_unlock(&G); return hw;
+}
+/* Periodic service events (vsync, audio buffer availability, device-change)
+ * are auto-clear: the successful wait consumes the signal. */
+uint32_t runtime_event_new_auto(void) {
+    event_t *e = calloc(1, sizeof *e); if (!e) die("event allocation");
+    e->refs = 1; e->autoclear = 1;
     pthread_mutex_lock(&G); uint32_t hw = h_new(O_EVENT_W, e); pthread_mutex_unlock(&G); return hw;
 }
 // Copy-handle transfer of the readable end: each call gives the client its own handle to the same event.

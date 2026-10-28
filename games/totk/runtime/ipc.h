@@ -79,6 +79,7 @@ _Noreturn void ipc_unimplemented(const IpcSession *s, const IpcRequest *rq);
 uint32_t runtime_handle_new(int session, void *obj);
 void *runtime_handle_get(uint32_t h, int session);
 uint32_t runtime_event_new(void);
+uint32_t runtime_event_new_auto(void);
 uint32_t runtime_event_readable(uint32_t writable);
 void runtime_event_signal(uint32_t writable);
 void runtime_ipc_session_closed(void *session);
