@@ -2052,6 +2052,14 @@ int main(int argc, char **argv) {
         printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"vulkan-mrt\"}\n");
         return 0;
     }
+    if (!strcmp(argv[2], "probe-vulkan-surface-target")) {
+        if (!gfx_backend_surface_target_selftest()) {
+            fprintf(stderr, "[totk-vk] surface target selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"vulkan-surface-target\"}\n");
+        return 0;
+    }
     if (!strcmp(argv[2], "probe-nvn-texture")) {
         int runtime_nvn_textured_draw_selftest(const char *screenshot, int frames);
         char shot[PATH_MAX];

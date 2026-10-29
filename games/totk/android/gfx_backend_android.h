@@ -395,6 +395,38 @@ void gfx_backend_detach_android_surface(void);
 int gfx_backend_surface_ready(void);
 int gfx_backend_surface_present(float r, float g, float b, float a);
 
+/* Scale policy for gfx_backend_surface_present_target().  FIT is the default
+ * (0): preserve the target aspect ratio, centre it, and fill the bars with
+ * opaque black.  STRETCH (1) fills the whole surface and is diagnostic only. */
+typedef enum {
+    GFX_SURFACE_SCALE_FIT = 0,
+    GFX_SURFACE_SCALE_STRETCH = 1
+} GfxSurfaceScaleMode;
+
+/* Present color attachment 0 of `target` through the Android swapchain.
+ *
+ * Acquires the next swapchain image, copies/scales the target into it (a
+ * format-compatible vkCmdBlitImage when the formats match, otherwise a
+ * fullscreen sampled conversion such as R11G11B10F -> RGBA8), transitions the
+ * image to PRESENT_SRC_KHR, submits with the backend fence, waits, and
+ * presents.  Out-of-date/suboptimal swapchains are recreated from the
+ * ANativeWindow retained by gfx_backend_attach_android_surface(); a failed
+ * recreation returns 0 and leaves on-screen present disabled rather than
+ * reporting a frame that never reached the surface.  Returns 1 only when the
+ * frame was presented (a suboptimal present still counts and schedules a
+ * recreate on the next call).
+ *
+ * The target may be const; only its cached layout is updated internally. */
+int gfx_backend_surface_present_target(const GfxOffscreenTarget *target, uint32_t scale_mode);
+
+/* GPU-side probe for the target-present path.  Renders/clears RGBA8 and
+ * R11G11B10F targets, runs the same copy code into an offscreen image shaped
+ * like a 96x64 surface, verifies fit/stretch and format conversion by
+ * readback, and finally presents the RGBA8 target when a real surface is
+ * attached.  Works without an ANativeWindow (the surface step is skipped).
+ */
+int gfx_backend_surface_target_selftest(void);
+
 /* End-to-end host test: instance/device, 1280x720 offscreen RGBA8 target,
  * clear, GPU copy-back and pixel verification. */
 int gfx_backend_selftest(void);
