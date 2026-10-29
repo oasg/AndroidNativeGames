@@ -11,6 +11,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+typedef struct GfxOffscreenTarget GfxOffscreenTarget;
+
 /* Create/destroy the host description.  `format` is an NVN format id
  * (0x25 = RGBA8); `layer_id` is only diagnostic. */
 void *runtime_native_window_create(uint32_t width, uint32_t height, uint32_t format,
@@ -35,6 +37,13 @@ void *runtime_native_window_android(const void *host_window);
 int runtime_native_window_surface_ready(const void *host_window);
 unsigned runtime_native_window_present_count(const void *host_window);
 unsigned runtime_native_window_surface_present_count(const void *host_window);
+
+/* Route present() to the target the renderer actually produced.  The host
+ * window borrows the target; it never destroys it.  NULL restores the host
+ * window's own offscreen target. */
+void runtime_native_window_set_present_target(void *host_window, GfxOffscreenTarget *target);
+GfxOffscreenTarget *runtime_native_window_present_target(const void *host_window);
+GfxOffscreenTarget *runtime_native_window_gfx_target(const void *host_window);
 
 /* Clear + present through the same path the NVN window uses: swapchain when a
  * surface is attached, Vulkan offscreen target otherwise. */
