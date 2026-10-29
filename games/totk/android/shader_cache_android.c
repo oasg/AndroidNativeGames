@@ -130,13 +130,14 @@ static int resolve_in_region_impl(const void *region_v, size_t region_size,
      * already verified that the address is mapped.  TOTK also passes BAHS code
      * offsets above 1 MiB; those must go through the pool resolver. */
     if (pointer_ok && low_addr >= SHADER_LOW_PTR) {
-        info->candidate = (uintptr_t)low_addr;
+        uintptr_t ptr = (uintptr_t)low_addr & 0x00ffffffffffffffULL;
+        info->candidate = ptr;
         info->why = "pointer";
-        *code = (const void *)(uintptr_t)low_addr;
+        *code = (const void *)ptr;
         return 1;
     }
 
-    uintptr_t control_addr = (uintptr_t)control;
+    uintptr_t control_addr = (uintptr_t)control & 0x00ffffffffffffffULL;
     if (control_addr < (uintptr_t)region_v ||
         control_addr - (uintptr_t)region_v >= region_size) {
         info->why = "control-outside-region";
@@ -201,8 +202,9 @@ int runtime_shader_resolve_code(const void *control, uint64_t low_addr,
     FILE *f = fopen("/proc/self/maps", "r");
     if (!f) { info->why = "no-maps"; return 0; }
     char line[512];
-    uintptr_t control_addr = (uintptr_t)control;
-    uintptr_t code_addr = (uintptr_t)low_addr;
+    /* Bionic may tag heap pointers; /proc/self/maps uses untagged VAs. */
+    uintptr_t control_addr = (uintptr_t)control & 0x00ffffffffffffffULL;
+    uintptr_t code_addr = (uintptr_t)low_addr & 0x00ffffffffffffffULL;
     int found = 0, code_mapped = 0;
     unsigned long long code_start = 0, code_end = 0;
     while (fgets(line, sizeof line, f)) {
