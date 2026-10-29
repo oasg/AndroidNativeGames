@@ -66,6 +66,14 @@ typedef struct {
     VkFormat sc_format;
     int surface_ready;
     unsigned surface_presents;
+
+    /* Needed to rebuild a lost/out-of-date swapchain without another attach
+     * call from the app shell.  `android_window` is the ANativeWindow* the
+     * surface was created from. */
+    void *android_window;
+    uint32_t attach_width, attach_height;
+    uint32_t attach_format;
+    int sc_suboptimal;
 } VulkanState;
 
 struct GfxOffscreenTarget {
@@ -91,6 +99,120 @@ struct GfxOffscreenTarget {
 
 static VulkanState g;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Fullscreen present blit shaders.
+ *
+ * A swapchain image is almost always 8-bit RGBA while an NVN target may be
+ * R11G11B10F; vkCmdBlitImage only accepts format-compatible pairs, so the
+ * mismatched case converts by sampling the target as a texture in a fullscreen
+ * pass.  GLSL source (kept here so the generated words stay auditable):
+ *
+ *   // present.vert
+ *   #version 450
+ *   layout(location = 0) out vec2 v_uv;
+ *   void main() {
+ *       vec2 p = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));
+ *       v_uv = p;
+ *       gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+ *   }
+ *   // present.frag
+ *   #version 450
+ *   layout(set = 0, binding = 0) uniform sampler2D src_tex;
+ *   layout(location = 0) in vec2 v_uv;
+ *   layout(location = 0) out vec4 out_color;
+ *   void main() { out_color = texture(src_tex, v_uv); }
+ *
+ * Regenerate with the NDK's glslc:
+ *   glslc --target-env=vulkan1.0 -O -fshader-stage=vert present.vert -o present.vert.spv
+ *   glslc --target-env=vulkan1.0 -O -fshader-stage=frag present.frag -o present.frag.spv
+ * then emit the little-endian words below. */
+static const uint32_t present_vert_spv[] __attribute__((aligned(4))) = {
+    0x07230203,0x00010000,0x000d000a,0x0000002f,0x00000000,0x00020011,0x00000001,0x0006000b,
+    0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
+    0x0008000f,0x00000000,0x00000004,0x6e69616d,0x00000000,0x0000000c,0x00000018,0x00000020,
+    0x00040047,0x0000000c,0x0000000b,0x0000002a,0x00040047,0x00000018,0x0000001e,0x00000000,
+    0x00050048,0x0000001e,0x00000000,0x0000000b,0x00000000,0x00050048,0x0000001e,0x00000001,
+    0x0000000b,0x00000001,0x00050048,0x0000001e,0x00000002,0x0000000b,0x00000003,0x00050048,
+    0x0000001e,0x00000003,0x0000000b,0x00000004,0x00030047,0x0000001e,0x00000002,0x00020013,
+    0x00000002,0x00030021,0x00000003,0x00000002,0x00030016,0x00000006,0x00000020,0x00040017,
+    0x00000007,0x00000006,0x00000002,0x00040015,0x0000000a,0x00000020,0x00000001,0x00040020,
+    0x0000000b,0x00000001,0x0000000a,0x0004003b,0x0000000b,0x0000000c,0x00000001,0x0004002b,
+    0x0000000a,0x0000000e,0x00000001,0x0004002b,0x0000000a,0x00000010,0x00000002,0x00040020,
+    0x00000017,0x00000003,0x00000007,0x0004003b,0x00000017,0x00000018,0x00000003,0x00040017,
+    0x0000001a,0x00000006,0x00000004,0x00040015,0x0000001b,0x00000020,0x00000000,0x0004002b,
+    0x0000001b,0x0000001c,0x00000001,0x0004001c,0x0000001d,0x00000006,0x0000001c,0x0006001e,
+    0x0000001e,0x0000001a,0x00000006,0x0000001d,0x0000001d,0x00040020,0x0000001f,0x00000003,
+    0x0000001e,0x0004003b,0x0000001f,0x00000020,0x00000003,0x0004002b,0x0000000a,0x00000021,
+    0x00000000,0x0004002b,0x00000006,0x00000023,0x40000000,0x0004002b,0x00000006,0x00000025,
+    0x3f800000,0x0004002b,0x00000006,0x00000028,0x00000000,0x00040020,0x0000002c,0x00000003,
+    0x0000001a,0x0005002c,0x00000007,0x0000002e,0x00000025,0x00000025,0x00050036,0x00000002,
+    0x00000004,0x00000000,0x00000003,0x000200f8,0x00000005,0x0004003d,0x0000000a,0x0000000d,
+    0x0000000c,0x000500c4,0x0000000a,0x0000000f,0x0000000d,0x0000000e,0x000500c7,0x0000000a,
+    0x00000011,0x0000000f,0x00000010,0x0004006f,0x00000006,0x00000012,0x00000011,0x000500c7,
+    0x0000000a,0x00000014,0x0000000d,0x00000010,0x0004006f,0x00000006,0x00000015,0x00000014,
+    0x00050050,0x00000007,0x00000016,0x00000012,0x00000015,0x0003003e,0x00000018,0x00000016,
+    0x0005008e,0x00000007,0x00000024,0x00000016,0x00000023,0x00050083,0x00000007,0x00000027,
+    0x00000024,0x0000002e,0x00050051,0x00000006,0x00000029,0x00000027,0x00000000,0x00050051,
+    0x00000006,0x0000002a,0x00000027,0x00000001,0x00070050,0x0000001a,0x0000002b,0x00000029,
+    0x0000002a,0x00000028,0x00000025,0x00050041,0x0000002c,0x0000002d,0x00000020,0x00000021,
+    0x0003003e,0x0000002d,0x0000002b,0x000100fd,0x00010038,
+};
+static const size_t present_vert_spv_size = sizeof present_vert_spv;
+
+static const uint32_t present_frag_spv[] __attribute__((aligned(4))) = {
+    0x07230203,0x00010000,0x000d000a,0x00000014,0x00000000,0x00020011,0x00000001,0x0006000b,
+    0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
+    0x0007000f,0x00000004,0x00000004,0x6e69616d,0x00000000,0x00000009,0x00000011,0x00030010,
+    0x00000004,0x00000007,0x00040047,0x00000009,0x0000001e,0x00000000,0x00040047,0x0000000d,
+    0x00000022,0x00000000,0x00040047,0x0000000d,0x00000021,0x00000000,0x00040047,0x00000011,
+    0x0000001e,0x00000000,0x00020013,0x00000002,0x00030021,0x00000003,0x00000002,0x00030016,
+    0x00000006,0x00000020,0x00040017,0x00000007,0x00000006,0x00000004,0x00040020,0x00000008,
+    0x00000003,0x00000007,0x0004003b,0x00000008,0x00000009,0x00000003,0x00090019,0x0000000a,
+    0x00000006,0x00000001,0x00000000,0x00000000,0x00000000,0x00000001,0x00000000,0x0003001b,
+    0x0000000b,0x0000000a,0x00040020,0x0000000c,0x00000000,0x0000000b,0x0004003b,0x0000000c,
+    0x0000000d,0x00000000,0x00040017,0x0000000f,0x00000006,0x00000002,0x00040020,0x00000010,
+    0x00000001,0x0000000f,0x0004003b,0x00000010,0x00000011,0x00000001,0x00050036,0x00000002,
+    0x00000004,0x00000000,0x00000003,0x000200f8,0x00000005,0x0004003d,0x0000000b,0x0000000e,
+    0x0000000d,0x0004003d,0x0000000f,0x00000012,0x00000011,0x00050057,0x00000007,0x00000013,
+    0x0000000e,0x00000012,0x0003003e,0x00000009,0x00000013,0x000100fd,0x00010038,
+};
+static const size_t present_frag_spv_size = sizeof present_frag_spv;
+
+/* Cached fullscreen-present pipeline, keyed by (target format, swapchain
+ * format, final layout).  At most one surface exists at a time, so a handful
+ * of entries covers the RGBA8 and R11G11B10F targets plus the selftest image. */
+#define GFX_PRESENT_PIPE_MAX 8
+typedef struct {
+    int used;
+    VkFormat src_format, dst_format;
+    VkImageLayout final_layout;
+    VkRenderPass pass;
+    VkPipelineLayout layout;
+    VkPipeline pipe;
+    VkDescriptorSetLayout dsl;
+    VkDescriptorPool pool;
+    VkDescriptorSet set;
+    VkSampler sampler;
+} GfxPresentPipe;
+static GfxPresentPipe g_present_pipes[GFX_PRESENT_PIPE_MAX];
+
+static void vk_present_cache_destroy_locked(void) {
+    if (!g.dev) {
+        memset(g_present_pipes, 0, sizeof g_present_pipes);
+        return;
+    }
+    for (unsigned i = 0; i < GFX_PRESENT_PIPE_MAX; i++) {
+        GfxPresentPipe *p = &g_present_pipes[i];
+        if (!p->used) continue;
+        if (p->pipe) vkDestroyPipeline(g.dev, p->pipe, NULL);
+        if (p->layout) vkDestroyPipelineLayout(g.dev, p->layout, NULL);
+        if (p->pass) vkDestroyRenderPass(g.dev, p->pass, NULL);
+        if (p->pool) vkDestroyDescriptorPool(g.dev, p->pool, NULL);
+        if (p->dsl) vkDestroyDescriptorSetLayout(g.dev, p->dsl, NULL);
+        if (p->sampler) vkDestroySampler(g.dev, p->sampler, NULL);
+        memset(p, 0, sizeof *p);
+    }
+}
 
 static void vk_log(const char *fmt, ...) {
     char buf[1024];
@@ -120,7 +242,7 @@ static int vk_mem_type(uint32_t bits, VkMemoryPropertyFlags want, uint32_t *out)
     return 0;
 }
 
-static void vk_destroy_swapchain_locked(void) {
+static void vk_destroy_swapchain_images_locked(void) {
     if (!g.dev) return;
     for (uint32_t i = 0; i < g.sc_count; i++) {
         if (g.sc_views[i]) vkDestroyImageView(g.dev, g.sc_views[i], NULL);
@@ -131,9 +253,20 @@ static void vk_destroy_swapchain_locked(void) {
     g.sc_count = 0;
     if (g.swapchain) vkDestroySwapchainKHR(g.dev, g.swapchain, NULL);
     g.swapchain = VK_NULL_HANDLE;
+    g.sc_extent.width = g.sc_extent.height = 0;
+    g.sc_format = VK_FORMAT_UNDEFINED;
+    g.sc_suboptimal = 0;
+    g.surface_ready = 0;
+}
+
+static void vk_destroy_swapchain_locked(void) {
+    if (!g.dev) return;
+    vk_destroy_swapchain_images_locked();
     if (g.surface) vkDestroySurfaceKHR(g.instance, g.surface, NULL);
     g.surface = VK_NULL_HANDLE;
-    g.surface_ready = 0;
+    g.android_window = NULL;
+    g.attach_width = g.attach_height = 0;
+    g.attach_format = 0;
 }
 
 static void vk_reset_locked(void) {
@@ -142,6 +275,7 @@ static void vk_reset_locked(void) {
     if (g.dev) {
         if (g.fence) vkDestroyFence(g.dev, g.fence, NULL);
         if (g.pool) vkDestroyCommandPool(g.dev, g.pool, NULL);
+        vk_present_cache_destroy_locked();
         vkDestroyDevice(g.dev, NULL);
     }
     if (g.instance) vkDestroyInstance(g.instance, NULL);
@@ -1016,6 +1150,8 @@ static GfxOffscreenTarget *vk_offscreen_create_layout_locked(uint32_t width, uin
     for (uint32_t i = 0; i < layout->color_count; i++) {
         VkFormat fmt = (VkFormat)layout->color_formats[i];
         VkFormatInfo info = vk_format_info(fmt);
+        VkFormatProperties fmt_props;
+        vkGetPhysicalDeviceFormatProperties(g.phys, fmt, &fmt_props);
         size_t bytes = (size_t)width * height * info.bpp;
         t->color_format[i] = fmt;
         t->color_bpp[i] = info.bpp;
@@ -1026,7 +1162,10 @@ static GfxOffscreenTarget *vk_offscreen_create_layout_locked(uint32_t width, uin
                                     VK_SAMPLE_COUNT_1_BIT,
                                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                    ((fmt_props.optimalTilingFeatures &
+                                      VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+                                         ? VK_IMAGE_USAGE_SAMPLED_BIT : 0),
                                     0, &t->color_image[i], &t->color_mem[i]))
             goto fail;
         VkImageViewCreateInfo vci = {
@@ -1294,56 +1433,43 @@ static int vk_choose_surface_format(VkSurfaceKHR surface, VkFormat *out_format,
     return 1;
 }
 
-int gfx_backend_attach_android_surface(void *window, uint32_t width, uint32_t height,
-                                       uint32_t nvn_format) {
-    (void)nvn_format;
+static int vk_create_android_surface_locked(void *window) {
     if (!window) return 0;
-    pthread_mutex_lock(&g_lock);
-    if (!vk_init_locked()) { pthread_mutex_unlock(&g_lock); return 0; }
-    if (!g.has_surface_ext || !g.has_android_ext || !g.has_swapchain_ext) {
-        vk_log("ERROR Android surface/swapchain extensions unavailable");
-        pthread_mutex_unlock(&g_lock);
-        return 0;
-    }
-    vkDeviceWaitIdle(g.dev);
-    vk_destroy_swapchain_locked();
-
+    if (g.surface) return 1;
     VkAndroidSurfaceCreateInfoKHR sci = {
         .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
         .window = (ANativeWindow *)window,
     };
     if (!vk_ok(vkCreateAndroidSurfaceKHR(g.instance, &sci, NULL, &g.surface),
-               "vkCreateAndroidSurfaceKHR")) {
-        pthread_mutex_unlock(&g_lock);
+               "vkCreateAndroidSurfaceKHR"))
         return 0;
-    }
+    return 1;
+}
+
+/* Create (or recreate) the swapchain for the current surface.  The caller must
+ * have destroyed the previous swapchain images and the device must be idle. */
+static int vk_create_swapchain_locked(void) {
+    if (!g.dev || !g.surface) return 0;
     VkBool32 supported = VK_FALSE;
     if (!vk_ok(vkGetPhysicalDeviceSurfaceSupportKHR(g.phys, g.family, g.surface, &supported),
                "vkGetPhysicalDeviceSurfaceSupportKHR") || !supported) {
         vk_log("ERROR graphics queue family does not support the Android surface");
-        vk_destroy_swapchain_locked();
-        pthread_mutex_unlock(&g_lock);
         return 0;
     }
     VkSurfaceCapabilitiesKHR caps;
     if (!vk_ok(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.phys, g.surface, &caps),
-               "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")) {
-        vk_destroy_swapchain_locked();
-        pthread_mutex_unlock(&g_lock);
+               "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"))
         return 0;
-    }
     VkFormat fmt = VK_FORMAT_UNDEFINED;
     VkColorSpaceKHR color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     if (!vk_choose_surface_format(g.surface, &fmt, &color_space)) {
         vk_log("ERROR no surface format");
-        vk_destroy_swapchain_locked();
-        pthread_mutex_unlock(&g_lock);
         return 0;
     }
     VkExtent2D extent = caps.currentExtent;
     if (extent.width == UINT32_MAX) {
-        extent.width = width ? width : 1280;
-        extent.height = height ? height : 720;
+        extent.width = g.attach_width ? g.attach_width : 1280;
+        extent.height = g.attach_height ? g.attach_height : 720;
         if (extent.width < caps.minImageExtent.width) extent.width = caps.minImageExtent.width;
         if (extent.width > caps.maxImageExtent.width) extent.width = caps.maxImageExtent.width;
         if (extent.height < caps.minImageExtent.height) extent.height = caps.minImageExtent.height;
@@ -1353,8 +1479,6 @@ int gfx_backend_attach_android_surface(void *window, uint32_t width, uint32_t he
         !(caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
         vk_log("ERROR surface does not support color/transfer-dst swapchain usage (%#x)",
                caps.supportedUsageFlags);
-        vk_destroy_swapchain_locked();
-        pthread_mutex_unlock(&g_lock);
         return 0;
     }
     uint32_t images = caps.minImageCount + 1;
@@ -1376,18 +1500,12 @@ int gfx_backend_attach_android_surface(void *window, uint32_t width, uint32_t he
         .oldSwapchain = VK_NULL_HANDLE,
     };
     if (!vk_ok(vkCreateSwapchainKHR(g.dev, &cci, NULL, &g.swapchain),
-               "vkCreateSwapchainKHR")) {
-        vk_destroy_swapchain_locked();
-        pthread_mutex_unlock(&g_lock);
+               "vkCreateSwapchainKHR"))
         return 0;
-    }
     uint32_t count = VK_MAX_SWAPCHAIN_IMAGES;
     if (!vk_ok(vkGetSwapchainImagesKHR(g.dev, g.swapchain, &count, g.sc_images),
-               "vkGetSwapchainImagesKHR")) {
-        vk_destroy_swapchain_locked();
-        pthread_mutex_unlock(&g_lock);
+               "vkGetSwapchainImagesKHR"))
         return 0;
-    }
     g.sc_count = count;
     for (uint32_t i = 0; i < count; i++) {
         VkImageViewCreateInfo vci = {
@@ -1397,11 +1515,8 @@ int gfx_backend_attach_android_surface(void *window, uint32_t width, uint32_t he
             .format = fmt,
             .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
         };
-        if (!vk_ok(vkCreateImageView(g.dev, &vci, NULL, &g.sc_views[i]), "vkCreateImageView(swapchain)")) {
-            vk_destroy_swapchain_locked();
-            pthread_mutex_unlock(&g_lock);
+        if (!vk_ok(vkCreateImageView(g.dev, &vci, NULL, &g.sc_views[i]), "vkCreateImageView(swapchain)"))
             return 0;
-        }
         g.sc_layouts[i] = VK_IMAGE_LAYOUT_UNDEFINED;
     }
     g.sc_extent = extent;
@@ -1409,8 +1524,69 @@ int gfx_backend_attach_android_surface(void *window, uint32_t width, uint32_t he
     g.surface_ready = 1;
     vk_log("Android surface %ux%u format=%s images=%u", extent.width, extent.height,
            vk_format_name(fmt), count);
-    pthread_mutex_unlock(&g_lock);
     return 1;
+}
+
+/* Acquire-time out-of-date/suboptimal recovery.  The ANativeWindow from attach
+ * is retained so a rotation/resize does not need another shell callback; if the
+ * window itself is gone (surface lost), recreation fails explicitly and the
+ * caller reports 0 rather than presenting into a dead surface. */
+static int vk_recreate_swapchain_locked(void) {
+    if (!g.dev || !g.android_window) {
+        vk_log("ERROR swapchain recreate: no ANativeWindow");
+        return 0;
+    }
+    vkDeviceWaitIdle(g.dev);
+    vk_destroy_swapchain_images_locked();
+    if (!g.surface && !vk_create_android_surface_locked(g.android_window)) {
+        vk_log("ERROR swapchain recreate: vkCreateAndroidSurfaceKHR failed");
+        return 0;
+    }
+    if (!vk_create_swapchain_locked()) {
+        /* The VkSurfaceKHR itself may be stale after the window was replaced;
+         * rebuild it once from the retained ANativeWindow. */
+        vk_destroy_swapchain_images_locked();
+        if (g.surface) vkDestroySurfaceKHR(g.instance, g.surface, NULL);
+        g.surface = VK_NULL_HANDLE;
+        if (!vk_create_android_surface_locked(g.android_window) ||
+            !vk_create_swapchain_locked()) {
+            vk_destroy_swapchain_images_locked();
+            if (g.surface) vkDestroySurfaceKHR(g.instance, g.surface, NULL);
+            g.surface = VK_NULL_HANDLE;
+            vk_log("ERROR swapchain recreate failed; on-screen present disabled");
+            return 0;
+        }
+    }
+    vk_log("swapchain recreated %ux%u format=%s images=%u",
+           g.sc_extent.width, g.sc_extent.height, vk_format_name(g.sc_format), g.sc_count);
+    return 1;
+}
+
+int gfx_backend_attach_android_surface(void *window, uint32_t width, uint32_t height,
+                                       uint32_t nvn_format) {
+    if (!window) return 0;
+    pthread_mutex_lock(&g_lock);
+    if (!vk_init_locked()) { pthread_mutex_unlock(&g_lock); return 0; }
+    if (!g.has_surface_ext || !g.has_android_ext || !g.has_swapchain_ext) {
+        vk_log("ERROR Android surface/swapchain extensions unavailable");
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    vkDeviceWaitIdle(g.dev);
+    vk_destroy_swapchain_locked();
+    g.android_window = window;
+    g.attach_width = width;
+    g.attach_height = height;
+    g.attach_format = nvn_format;
+    int ok = vk_create_android_surface_locked(window) && vk_create_swapchain_locked();
+    if (!ok) {
+        vk_destroy_swapchain_images_locked();
+        if (g.surface) vkDestroySurfaceKHR(g.instance, g.surface, NULL);
+        g.surface = VK_NULL_HANDLE;
+        g.android_window = NULL;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return ok;
 }
 
 void gfx_backend_detach_android_surface(void) {
@@ -1422,31 +1598,519 @@ void gfx_backend_detach_android_surface(void) {
 
 int gfx_backend_surface_ready(void) { return g.surface_ready; }
 
+/* ------------------------------------------------------------------ */
+/* Presenting a real NVN target to the Android surface.
+ *
+ * Scale policy: GFX_SURFACE_SCALE_FIT (0) is the default and preserves the
+ * target aspect ratio, centring the image and filling the uncovered bars with
+ * opaque black.  GFX_SURFACE_SCALE_STRETCH (1) fills the surface exactly and
+ * is intended for debugging only.
+ *
+ * Format policy: when the target format equals the swapchain format (the
+ * common RGBA8 case) the copy is a scaled vkCmdBlitImage.  Any other pair
+ * (notably R11G11B10F -> RGBA8) is converted by sampling the target in a
+ * fullscreen pass; vkCmdBlitImage is not valid between incompatible formats. */
+
+static int vk_present_format_is_shader_src(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+    case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+    case VK_FORMAT_R5G6B5_UNORM_PACK16:
+    case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static VkFilter vk_present_filter(VkFormat src) {
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(g.phys, src, &fp);
+    return (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
+               ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+}
+
+static int vk_present_blit_ok(VkFormat src, VkFormat dst, VkFilter *out_filter) {
+    if (src != dst || src == VK_FORMAT_UNDEFINED) return 0;
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(g.phys, src, &fp);
+    VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+                                VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    if ((fp.optimalTilingFeatures & need) != need) return 0;
+    if (out_filter) *out_filter = vk_present_filter(src);
+    return 1;
+}
+
+static VkRect2D vk_present_rect(const GfxOffscreenTarget *t, VkExtent2D extent,
+                                uint32_t scale_mode) {
+    uint32_t dw = extent.width, dh = extent.height;
+    if (scale_mode != GFX_SURFACE_SCALE_STRETCH && t->width && t->height) {
+        uint64_t fit_by_width = (uint64_t)extent.width * t->height;
+        uint64_t fit_by_height = (uint64_t)extent.height * t->width;
+        if (fit_by_width <= fit_by_height) {
+            dw = extent.width;
+            dh = (uint32_t)((uint64_t)t->height * extent.width / t->width);
+        } else {
+            dh = extent.height;
+            dw = (uint32_t)((uint64_t)t->width * extent.height / t->height);
+        }
+        if (!dw) dw = 1;
+        if (!dh) dh = 1;
+    }
+    return (VkRect2D){ { (int32_t)((extent.width - dw) / 2),
+                         (int32_t)((extent.height - dh) / 2) },
+                       { dw, dh } };
+}
+
+static GfxPresentPipe *vk_present_pipe_get_locked(VkFormat src, VkFormat dst,
+                                                  VkImageLayout final_layout) {
+    GfxPresentPipe *p = NULL;
+    for (unsigned i = 0; i < GFX_PRESENT_PIPE_MAX; i++) {
+        if (g_present_pipes[i].used && g_present_pipes[i].src_format == src &&
+            g_present_pipes[i].dst_format == dst &&
+            g_present_pipes[i].final_layout == final_layout) {
+            return &g_present_pipes[i];
+        }
+        if (!g_present_pipes[i].used && !p) p = &g_present_pipes[i];
+    }
+    if (!p) {
+        /* Small cache; a present pipeline is cheap to rebuild and the surface
+         * format rarely changes.  Drop everything and start again. */
+        vk_present_cache_destroy_locked();
+        p = &g_present_pipes[0];
+    }
+    memset(p, 0, sizeof *p);
+    p->src_format = src;
+    p->dst_format = dst;
+    p->final_layout = final_layout;
+
+    VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+    if (!vk_ok(vkCreateShaderModule(g.dev, &(VkShaderModuleCreateInfo){
+                   .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                   .codeSize = present_vert_spv_size,
+                   .pCode = present_vert_spv }, NULL, &vs),
+               "vkCreateShaderModule(present vs)"))
+        goto fail;
+    if (!vk_ok(vkCreateShaderModule(g.dev, &(VkShaderModuleCreateInfo){
+                   .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                   .codeSize = present_frag_spv_size,
+                   .pCode = present_frag_spv }, NULL, &fs),
+               "vkCreateShaderModule(present fs)"))
+        goto fail;
+
+    VkDescriptorSetLayoutBinding b = {
+        .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+    };
+    VkDescriptorSetLayoutCreateInfo dlci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1, .pBindings = &b,
+    };
+    if (!vk_ok(vkCreateDescriptorSetLayout(g.dev, &dlci, NULL, &p->dsl),
+               "vkCreateDescriptorSetLayout(present)"))
+        goto fail;
+    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 };
+    VkDescriptorPoolCreateInfo dpci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps,
+    };
+    if (!vk_ok(vkCreateDescriptorPool(g.dev, &dpci, NULL, &p->pool),
+               "vkCreateDescriptorPool(present)"))
+        goto fail;
+    VkDescriptorSetAllocateInfo dsai = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = p->pool, .descriptorSetCount = 1, .pSetLayouts = &p->dsl,
+    };
+    if (!vk_ok(vkAllocateDescriptorSets(g.dev, &dsai, &p->set),
+               "vkAllocateDescriptorSets(present)"))
+        goto fail;
+
+    VkSamplerCreateInfo sci = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = vk_present_filter(src), .minFilter = vk_present_filter(src),
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .maxLod = 0,
+    };
+    if (!vk_ok(vkCreateSampler(g.dev, &sci, NULL, &p->sampler), "vkCreateSampler(present)"))
+        goto fail;
+
+    VkAttachmentDescription att = {
+        .format = dst, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .finalLayout = final_layout,
+    };
+    VkAttachmentReference ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription sub = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                 .colorAttachmentCount = 1, .pColorAttachments = &ref };
+    VkSubpassDependency dep = {
+        .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
+        .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+    };
+    VkRenderPassCreateInfo rpci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+                                    .attachmentCount = 1, .pAttachments = &att,
+                                    .subpassCount = 1, .pSubpasses = &sub,
+                                    .dependencyCount = 1, .pDependencies = &dep };
+    if (!vk_ok(vkCreateRenderPass(g.dev, &rpci, NULL, &p->pass), "vkCreateRenderPass(present)"))
+        goto fail;
+    VkPipelineLayoutCreateInfo lci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                       .setLayoutCount = 1, .pSetLayouts = &p->dsl };
+    if (!vk_ok(vkCreatePipelineLayout(g.dev, &lci, NULL, &p->layout),
+               "vkCreatePipelineLayout(present)"))
+        goto fail;
+
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "main" },
+    };
+    VkPipelineVertexInputStateCreateInfo vi = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo ia = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+    };
+    VkPipelineViewportStateCreateInfo vp = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1, .scissorCount = 1,
+    };
+    VkPipelineRasterizationStateCreateInfo rast = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE,
+        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f,
+    };
+    VkPipelineMultisampleStateCreateInfo ms = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+    };
+    VkPipelineColorBlendAttachmentState cba = {
+        .blendEnable = VK_FALSE, .colorWriteMask = 0xf,
+    };
+    VkPipelineColorBlendStateCreateInfo cb = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = 1, .pAttachments = &cba,
+    };
+    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo ds = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = 2, .pDynamicStates = dyn,
+    };
+    VkGraphicsPipelineCreateInfo gpci = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 2, .pStages = stages,
+        .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vp,
+        .pRasterizationState = &rast, .pMultisampleState = &ms, .pColorBlendState = &cb,
+        .pDynamicState = &ds, .layout = p->layout, .renderPass = p->pass, .subpass = 0,
+    };
+    int ok = vk_ok(vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &gpci, NULL, &p->pipe),
+                   "vkCreateGraphicsPipelines(present)");
+    if (vs) vkDestroyShaderModule(g.dev, vs, NULL);
+    if (fs) vkDestroyShaderModule(g.dev, fs, NULL);
+    if (!ok) goto fail;
+    p->used = 1;
+    return p;
+
+fail:
+    if (vs) vkDestroyShaderModule(g.dev, vs, NULL);
+    if (fs) vkDestroyShaderModule(g.dev, fs, NULL);
+    if (p->pipe) vkDestroyPipeline(g.dev, p->pipe, NULL);
+    if (p->layout) vkDestroyPipelineLayout(g.dev, p->layout, NULL);
+    if (p->pass) vkDestroyRenderPass(g.dev, p->pass, NULL);
+    if (p->pool) vkDestroyDescriptorPool(g.dev, p->pool, NULL);
+    if (p->dsl) vkDestroyDescriptorSetLayout(g.dev, p->dsl, NULL);
+    if (p->sampler) vkDestroySampler(g.dev, p->sampler, NULL);
+    memset(p, 0, sizeof *p);
+    return NULL;
+}
+
+/* Record the target -> dst copy.  Leaves `dst` in `dst_final_layout` and the
+ * target back in GENERAL (the layout every NVN producer leaves active).  The
+ * caller owns command-buffer submission. */
+static int vk_present_target_locked(VkCommandBuffer cmd, GfxOffscreenTarget *t,
+                                    VkImage dst, VkImageView dst_view,
+                                    VkImageLayout dst_old,
+                                    VkFormat dst_format, VkExtent2D extent,
+                                    uint32_t scale_mode, VkImageLayout dst_final,
+                                    VkFramebuffer *out_fb) {
+    if (out_fb) *out_fb = VK_NULL_HANDLE;
+    if (!t || t->rt_layout.color_count < 1 || !extent.width || !extent.height) return 0;
+    VkFormat src_format = t->color_format[0];
+    if (!src_format || src_format == VK_FORMAT_UNDEFINED) return 0;
+    VkRect2D rect = vk_present_rect(t, extent, scale_mode);
+    VkClearColorValue black = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } };
+    VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    VkFilter filter = VK_FILTER_NEAREST;
+    if (vk_present_blit_ok(src_format, dst_format, &filter)) {
+        vk_image_barrier(cmd, dst, dst_old, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                         VK_ACCESS_TRANSFER_WRITE_BIT,
+                         dst_old == VK_IMAGE_LAYOUT_UNDEFINED
+                             ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                             : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT);
+        vk_image_barrier_range(cmd, t->color_image[0], t->layout_state,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0,
+                               VK_ACCESS_TRANSFER_READ_BIT,
+                               t->layout_state == VK_IMAGE_LAYOUT_UNDEFINED
+                                   ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                                   : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
+        vkCmdClearColorImage(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+        VkImageBlit blit = {
+            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        };
+        blit.srcOffsets[1] = (VkOffset3D){ (int32_t)t->width, (int32_t)t->height, 1 };
+        blit.dstOffsets[0] = (VkOffset3D){ rect.offset.x, rect.offset.y, 0 };
+        blit.dstOffsets[1] = (VkOffset3D){ rect.offset.x + (int32_t)rect.extent.width,
+                                           rect.offset.y + (int32_t)rect.extent.height, 1 };
+        vkCmdBlitImage(cmd, t->color_image[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, filter);
+        vk_image_barrier_range(cmd, t->color_image[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT, 0,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
+        vk_image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, dst_final,
+                         VK_ACCESS_TRANSFER_WRITE_BIT, 0,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         dst_final == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+                             ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
+                             : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        t->layout_state = VK_IMAGE_LAYOUT_GENERAL;
+        return 1;
+    }
+
+    /* Format conversion path.  The target must be samplable and its format must
+     * be representable by a float sampler; integer/compressed targets are not
+     * silently converted. */
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(g.phys, src_format, &fp);
+    if (!vk_present_format_is_shader_src(src_format) ||
+        !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+        vk_log("ERROR present target: %s -> %s needs a sampled conversion the driver "
+               "or format does not support", vk_format_name(src_format),
+               vk_format_name(dst_format));
+        return 0;
+    }
+    GfxPresentPipe *p = vk_present_pipe_get_locked(src_format, dst_format, dst_final);
+    if (!p) return 0;
+
+    VkDescriptorImageInfo di = {
+        .sampler = p->sampler, .imageView = t->color_view[0],
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    VkWriteDescriptorSet w = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = p->set, .dstBinding = 0, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .pImageInfo = &di,
+    };
+    vkUpdateDescriptorSets(g.dev, 1, &w, 0, NULL);
+
+    vk_image_barrier(cmd, dst, dst_old, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0,
+                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                     dst_old == VK_IMAGE_LAYOUT_UNDEFINED
+                         ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                         : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    vk_image_barrier_range(cmd, t->color_image[0], t->layout_state,
+                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0,
+                           VK_ACCESS_SHADER_READ_BIT,
+                           t->layout_state == VK_IMAGE_LAYOUT_UNDEFINED
+                               ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                               : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                           VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
+
+    VkRenderPassBeginInfo rp = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .renderPass = p->pass,
+        .renderArea = { { 0, 0 }, { extent.width, extent.height } },
+        .clearValueCount = 1,
+        .pClearValues = (VkClearValue[]){ { .color = { .float32 = { 0, 0, 0, 1 } } } },
+    };
+    /* The framebuffer is transient: one per present.  It must outlive command
+     * buffer submission, so ownership is handed back to the caller. */
+    if (!dst_view) {
+        vk_log("ERROR present target: destination image has no view");
+        return 0;
+    }
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    VkFramebufferCreateInfo fci = {
+        .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+        .renderPass = p->pass, .attachmentCount = 1, .pAttachments = &dst_view,
+        .width = extent.width, .height = extent.height, .layers = 1,
+    };
+    if (!vk_ok(vkCreateFramebuffer(g.dev, &fci, NULL, &fb), "vkCreateFramebuffer(present)"))
+        return 0;
+    rp.framebuffer = fb;
+    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, 1,
+                            &p->set, 0, NULL);
+    VkViewport vport = { (float)rect.offset.x, (float)rect.offset.y,
+                         (float)rect.extent.width, (float)rect.extent.height, 0.0f, 1.0f };
+    vkCmdSetViewport(cmd, 0, 1, &vport);
+    vkCmdSetScissor(cmd, 0, 1, &rect);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRenderPass(cmd);
+    if (out_fb) *out_fb = fb;
+
+    vk_image_barrier_range(cmd, t->color_image[0], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                           VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, 0,
+                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                           VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
+    t->layout_state = VK_IMAGE_LAYOUT_GENERAL;
+    return 1;
+}
+
+/* Acquire one swapchain image, recreating once when the surface says the
+ * swapchain is stale.  Returns the image index or -1; on -1 the caller reports
+ * failure.  `suboptimal` is informational: the frame can still be presented. */
+static int vk_surface_acquire_locked(uint32_t *out_idx, int *out_suboptimal) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+        uint32_t idx = 0;
+        VkResult ar = vkAcquireNextImageKHR(g.dev, g.swapchain, UINT64_MAX, VK_NULL_HANDLE,
+                                            g.fence, &idx);
+        if (ar == VK_SUCCESS || ar == VK_SUBOPTIMAL_KHR) {
+            VkResult wr = vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, UINT64_MAX);
+            if (wr != VK_SUCCESS) {
+                vk_log("ERROR vkWaitForFences(acquire): %d", (int)wr);
+                return -1;
+            }
+            if (out_suboptimal) *out_suboptimal = ar == VK_SUBOPTIMAL_KHR;
+            *out_idx = idx;
+            return 0;
+        }
+        if (ar != VK_ERROR_OUT_OF_DATE_KHR && ar != VK_SUBOPTIMAL_KHR) {
+            vk_log("ERROR vkAcquireNextImageKHR: %d", (int)ar);
+            return -1;
+        }
+        vk_log("swapchain out of date/suboptimal during acquire; recreating");
+        if (!vk_recreate_swapchain_locked()) return -1;
+    }
+    vk_log("ERROR swapchain still out of date after recreate");
+    return -1;
+}
+
+int gfx_backend_surface_present_target(const GfxOffscreenTarget *target, uint32_t scale_mode) {
+    if (!target) return 0;
+    pthread_mutex_lock(&g_lock);
+    if (!g.ready || !g.surface_ready || !g.swapchain) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    if (g.sc_suboptimal && !vk_recreate_swapchain_locked()) {
+        vk_log("ERROR swapchain recreate after suboptimal present failed");
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    uint32_t idx = 0;
+    int suboptimal = 0;
+    if (vk_surface_acquire_locked(&idx, &suboptimal)) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    if (suboptimal) g.sc_suboptimal = 1;
+
+    VkCommandBuffer cmd = g.cmd;
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    if (!vk_ok(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer(surface-target)")) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    GfxOffscreenTarget *t = (GfxOffscreenTarget *)target;   /* layout_state is a cache */
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    int ok = vk_present_target_locked(cmd, t, g.sc_images[idx], g.sc_views[idx],
+                                      g.sc_layouts[idx], g.sc_format, g.sc_extent, scale_mode,
+                                      VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, &fb);
+    if (!ok) {
+        vkEndCommandBuffer(cmd);
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    t->layout_state = VK_IMAGE_LAYOUT_GENERAL;
+    int submitted = vk_submit_and_wait(cmd, "surface-present-target");
+    if (fb) vkDestroyFramebuffer(g.dev, fb, NULL);
+    if (!submitted) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    g.sc_layouts[idx] = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    VkPresentInfoKHR pi = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .swapchainCount = 1,
+        .pSwapchains = &g.swapchain,
+        .pImageIndices = &idx,
+    };
+    VkResult pr = vkQueuePresentKHR(g.queue, &pi);
+    if (pr == VK_ERROR_OUT_OF_DATE_KHR) {
+        vk_log("swapchain out of date on present; recreating");
+        g.sc_layouts[idx] = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vk_recreate_swapchain_locked())
+            vk_log("swapchain recreated after out-of-date present");
+        else
+            vk_log("ERROR swapchain recreate after out-of-date present failed");
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    if (pr == VK_SUBOPTIMAL_KHR) {
+        g.sc_suboptimal = 1;
+        vk_log("swapchain present suboptimal; recreate scheduled");
+    } else if (pr != VK_SUCCESS) {
+        vk_log("ERROR vkQueuePresentKHR(target): %d", (int)pr);
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    g.surface_presents++;
+    if (getenv("TOTK_ANDROID_TRACE_VK"))
+        vk_log("surface target present #%u image=%u target=%ux%u %s mode=%s%s",
+               g.surface_presents, idx, t->width, t->height,
+               vk_format_name(t->color_format[0]),
+               scale_mode == GFX_SURFACE_SCALE_STRETCH ? "stretch" : "fit",
+               suboptimal ? " (suboptimal)" : "");
+    pthread_mutex_unlock(&g_lock);
+    return 1;
+}
+
 int gfx_backend_surface_present(float r, float g_, float b, float a) {
     pthread_mutex_lock(&g_lock);
     if (!g.ready || !g.surface_ready || !g.swapchain) {
         pthread_mutex_unlock(&g_lock);
         return 0;
     }
+    if (g.sc_suboptimal && !vk_recreate_swapchain_locked()) {
+        vk_log("ERROR swapchain recreate after suboptimal present failed");
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
     uint32_t idx = 0;
-    VkResult ar = vkAcquireNextImageKHR(g.dev, g.swapchain, UINT64_MAX, VK_NULL_HANDLE,
-                                        g.fence, &idx);
-    if (ar == VK_ERROR_OUT_OF_DATE_KHR) {
-        vk_log("swapchain out of date during acquire");
+    int suboptimal = 0;
+    if (vk_surface_acquire_locked(&idx, &suboptimal)) {
         pthread_mutex_unlock(&g_lock);
         return 0;
     }
-    if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
-        vk_log("ERROR vkAcquireNextImageKHR: %d", (int)ar);
-        pthread_mutex_unlock(&g_lock);
-        return 0;
-    }
-    VkResult wr = vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, UINT64_MAX);
-    if (wr != VK_SUCCESS) {
-        vk_log("ERROR vkWaitForFences(acquire): %d", (int)wr);
-        pthread_mutex_unlock(&g_lock);
-        return 0;
-    }
+    if (suboptimal) g.sc_suboptimal = 1;
     VkCommandBuffer cmd = g.cmd;
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
@@ -4638,6 +5302,210 @@ int gfx_backend_mrt_selftest(void) {
     ok = ok && fence_ok;
     gfx_backend_reflected_pipeline_destroy(p);
     gfx_backend_offscreen_destroy(t);
+    return ok;
+}
+
+/* Run the production target-present copy into a 96x64 RGBA8 image shaped like
+ * a landscape surface and read the result back.  This exercises the same
+ * vk_present_target_locked() used on the swapchain without requiring a real
+ * ANativeWindow, so the CLI can validate format conversion and scaling. */
+static int vk_present_probe_locked(GfxOffscreenTarget *t, uint32_t scale_mode,
+                                   uint8_t **out_pixels) {
+    const uint32_t w = 96, h = 64;
+    *out_pixels = NULL;
+    VkImage img = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory bmem = VK_NULL_HANDLE;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    uint8_t *pixels = NULL;
+    int ok = 0;
+    if (!vk_create_device_image(VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, w, h, 1, 1, 1,
+                                VK_SAMPLE_COUNT_1_BIT,
+                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                0, &img, &mem))
+        goto done;
+    VkImageViewCreateInfo vci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    };
+    if (!vk_ok(vkCreateImageView(g.dev, &vci, NULL, &view), "vkCreateImageView(present probe)"))
+        goto done;
+    if (!vk_create_host_buffer((VkDeviceSize)w * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                               &buf, &bmem))
+        goto done;
+
+    VkCommandBuffer cmd = g.cmd;
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    if (!vk_ok(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer(present probe)"))
+        goto done;
+    if (!vk_present_target_locked(cmd, t, img, view, VK_IMAGE_LAYOUT_UNDEFINED,
+                                  VK_FORMAT_R8G8B8A8_UNORM, (VkExtent2D){ w, h },
+                                  scale_mode, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, &fb)) {
+        vkEndCommandBuffer(cmd);
+        goto done;
+    }
+    VkBufferImageCopy region = {
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageExtent = { w, h, 1 },
+    };
+    vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &region);
+    VkBufferMemoryBarrier bb = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = buf, .offset = 0, .size = VK_WHOLE_SIZE,
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 0, NULL, 1, &bb, 0, NULL);
+    int submitted = vk_submit_and_wait(cmd, "present probe");
+    if (fb) { vkDestroyFramebuffer(g.dev, fb, NULL); fb = VK_NULL_HANDLE; }
+    if (!submitted) goto done;
+    void *mapped = NULL;
+    if (!vk_ok(vkMapMemory(g.dev, bmem, 0, VK_WHOLE_SIZE, 0, &mapped),
+               "vkMapMemory(present probe)"))
+        goto done;
+    pixels = malloc((size_t)w * h * 4);
+    if (pixels) memcpy(pixels, mapped, (size_t)w * h * 4);
+    vkUnmapMemory(g.dev, bmem);
+    if (!pixels) goto done;
+    *out_pixels = pixels;
+    pixels = NULL;
+    ok = 1;
+
+done:
+    free(pixels);
+    if (fb) vkDestroyFramebuffer(g.dev, fb, NULL);
+    if (buf) vkDestroyBuffer(g.dev, buf, NULL);
+    if (bmem) vkFreeMemory(g.dev, bmem, NULL);
+    if (view) vkDestroyImageView(g.dev, view, NULL);
+    if (img) vkDestroyImage(g.dev, img, NULL);
+    if (mem) vkFreeMemory(g.dev, mem, NULL);
+    return ok;
+}
+
+static void probe_pixel(const uint8_t *pixels, uint32_t x, uint32_t y, uint8_t out[4]) {
+    memcpy(out, pixels + ((size_t)y * 96 + x) * 4, 4);
+}
+
+int gfx_backend_surface_target_selftest(void) {
+    if (!gfx_backend_vulkan_init()) {
+        vk_log("surface target selftest: Vulkan unavailable");
+        return 0;
+    }
+    int ok = 1;
+
+    GfxOffscreenTarget *rgba = gfx_backend_offscreen_create(64, 64, 0x25);
+    if (!rgba) {
+        vk_log("surface target selftest: RGBA8 target creation failed");
+        return 0;
+    }
+    GfxTrianglePipeline *tri = gfx_backend_builtin_triangle_pipeline();
+    if (!tri || !gfx_backend_triangle_draw(tri, rgba, 0.0f, 0.0f, 0.0f, 1.0f)) {
+        vk_log("surface target selftest: RGBA8 triangle draw failed");
+        gfx_backend_offscreen_destroy(rgba);
+        return 0;
+    }
+
+    uint8_t *px = NULL;
+    pthread_mutex_lock(&g_lock);
+    int probe_ok = vk_present_probe_locked(rgba, GFX_SURFACE_SCALE_FIT, &px);
+    pthread_mutex_unlock(&g_lock);
+    if (!probe_ok || !px) {
+        vk_log("surface target selftest: RGBA8 fit copy failed");
+        ok = 0;
+    } else {
+        uint8_t centre[4], bar[4], upper[4], lower[4];
+        probe_pixel(px, 48, 32, centre);
+        probe_pixel(px, 4, 32, bar);
+        probe_pixel(px, 36, 20, upper);
+        probe_pixel(px, 36, 44, lower);
+        int content = centre[0] > 200 && centre[1] > 40 && centre[1] < 130 && centre[2] < 70;
+        int letterbox = bar[0] < 24 && bar[1] < 24 && bar[2] < 24;
+        int upright = upper[0] > 200 && lower[0] < 24 && lower[1] < 24 && lower[2] < 24;
+        vk_log("surface target selftest RGBA8 fit centre=%02x%02x%02x bar=%02x%02x%02x "
+               "upper=%02x%02x%02x lower=%02x%02x%02x content=%s letterbox=%s upright=%s",
+               centre[0], centre[1], centre[2], bar[0], bar[1], bar[2],
+               upper[0], upper[1], upper[2], lower[0], lower[1], lower[2],
+               content ? "OK" : "BAD", letterbox ? "OK" : "BAD", upright ? "OK" : "BAD");
+        ok = ok && content && letterbox && upright;
+        free(px);
+        px = NULL;
+    }
+
+    GfxOffscreenTarget *hdr = gfx_backend_offscreen_create(64, 64, 0x3F);
+    if (!hdr) {
+        vk_log("surface target selftest: R11G11B10F target creation failed");
+        ok = 0;
+    } else {
+        if (!gfx_backend_offscreen_clear(hdr, 0.0f, 1.0f, 0.0f, 1.0f)) {
+            vk_log("surface target selftest: R11G11B10F clear failed");
+            ok = 0;
+        } else {
+            /* Stretch: conversion path must fill the whole surface. */
+            pthread_mutex_lock(&g_lock);
+            probe_ok = vk_present_probe_locked(hdr, GFX_SURFACE_SCALE_STRETCH, &px);
+            pthread_mutex_unlock(&g_lock);
+            if (!probe_ok || !px) {
+                vk_log("surface target selftest: R11G11B10F stretch copy failed");
+                ok = 0;
+            } else {
+                uint8_t centre[4], edge[4];
+                probe_pixel(px, 48, 32, centre);
+                probe_pixel(px, 4, 32, edge);
+                int filled = centre[1] > 200 && edge[1] > 200 &&
+                             centre[0] < 40 && edge[0] < 40;
+                vk_log("surface target selftest R11 stretch centre=%02x%02x%02x "
+                       "edge=%02x%02x%02x %s", centre[0], centre[1], centre[2],
+                       edge[0], edge[1], edge[2], filled ? "OK" : "BAD");
+                ok = ok && filled;
+                free(px);
+                px = NULL;
+            }
+            /* Fit: converted target must still letterbox. */
+            pthread_mutex_lock(&g_lock);
+            probe_ok = vk_present_probe_locked(hdr, GFX_SURFACE_SCALE_FIT, &px);
+            pthread_mutex_unlock(&g_lock);
+            if (!probe_ok || !px) {
+                vk_log("surface target selftest: R11G11B10F fit copy failed");
+                ok = 0;
+            } else {
+                uint8_t centre[4], edge[4];
+                probe_pixel(px, 48, 32, centre);
+                probe_pixel(px, 4, 32, edge);
+                int fitted = centre[1] > 200 && edge[0] < 24 && edge[1] < 24 &&
+                             edge[2] < 24;
+                vk_log("surface target selftest R11 fit centre=%02x%02x%02x "
+                       "edge=%02x%02x%02x %s", centre[0], centre[1], centre[2],
+                       edge[0], edge[1], edge[2], fitted ? "OK" : "BAD");
+                ok = ok && fitted;
+                free(px);
+                px = NULL;
+            }
+        }
+        gfx_backend_offscreen_destroy(hdr);
+    }
+
+    if (gfx_backend_surface_ready()) {
+        if (!gfx_backend_surface_present_target(rgba, GFX_SURFACE_SCALE_FIT)) {
+            vk_log("surface target selftest: real surface present failed");
+            ok = 0;
+        } else {
+            vk_log("surface target selftest: presented RGBA8 target to ANativeWindow");
+        }
+    } else {
+        vk_log("surface target selftest: no ANativeWindow attached; surface present skipped");
+    }
+    gfx_backend_offscreen_destroy(rgba);
+    vk_log("surface target selftest %s", ok ? "PASS" : "FAIL");
     return ok;
 }
 
