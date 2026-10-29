@@ -416,5 +416,46 @@ int main(void) {
             self.assertIn('ok absolute', run.stdout)
 
 
+class SceneReflection(unittest.TestCase):
+    """Texture target/depth/array answers for scene-style sampler types."""
+
+    @staticmethod
+    def image_spv(dim, depth=0, arrayed=0, ms=0):
+        def inst(op, args):
+            return ((len(args) + 1) << 16) | op, *args
+        words = [0x07230203, 0x00010000, 0, 20, 0]
+        words.extend(inst(25, [10, 1, dim, depth, arrayed, ms, 1, 0]))  # OpTypeImage
+        words.extend(inst(27, [11, 10]))                               # OpTypeSampledImage
+        words.extend(inst(32, [12, 0, 11]))                            # OpTypePointer
+        words.extend(inst(71, [13, 33, 1]))                            # OpDecorate binding=1
+        words.extend(inst(59, [12, 13, 0]))                            # OpVariable
+        return struct.pack(f'<{len(words)}I', *words)
+
+    def answers(self, **kw):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spv = root/'ps.spv'
+            res = root/'ps.res.json'
+            spv.write_bytes(self.image_spv(**kw))
+            res.write_text(json.dumps(dict(
+                stage='ps', textures=[dict(binding=1, slot=8)])))
+            return pack.answer_from_reflection(spv, res)
+
+    def test_scene_texture_targets_from_spirv(self):
+        cases = [
+            (dict(dim=1), 't8_2d'),
+            (dict(dim=1, arrayed=1), 't8_2da'),
+            (dict(dim=1, ms=1, arrayed=1), 't8_2dmsa'),
+            (dict(dim=2), 't8_3d'),
+            (dict(dim=3, arrayed=1), 't8_cubearr'),
+            (dict(dim=1, depth=1), 't8_2dd'),
+            (dict(dim=1, depth=1, arrayed=1), 't8_2dad'),
+        ]
+        for kwargs, token in cases:
+            with self.subTest(token=token):
+                ans = self.answers(**kwargs)
+                self.assertEqual(pack.answer_suffix(ans), token)
+
+
 if __name__ == '__main__':
     unittest.main()
