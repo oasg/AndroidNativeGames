@@ -2226,6 +2226,23 @@ int main(int argc, char **argv) {
                frames, shot, shot);
         return 0;
     }
+    if (!strcmp(argv[2], "probe-nvn-segment-targets")) {
+        int runtime_nvn_segment_selftest(const char *screenshot, int frames);
+        char shot[PATH_MAX];
+        const char *env = getenv("TOTK_ANDROID_SCREENSHOT");
+        if (env && *env) snprintf(shot, sizeof shot, "%s", env);
+        else snprintf(shot, sizeof shot, "%s/nvn-segment.ppm", argv[1]);
+        const char *fs = getenv("TOTK_ANDROID_NVN_DRAW_FRAMES");
+        int frames = fs && *fs ? atoi(fs) : 1;
+        if (!runtime_nvn_segment_selftest(shot, frames)) {
+            fprintf(stderr, "[totk-nvn] NVN segment targets selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-segment-targets\","
+               "\"frames\":%d,\"color0\":\"%s.c0.ppm\",\"color1\":\"%s.c1.ppm\"}\n",
+               frames, shot, shot);
+        return 0;
+    }
     if (!strcmp(argv[2], "probe-nvn-fence")) {
         int runtime_nvn_fence_selftest(void);
         if (!runtime_nvn_fence_selftest()) {
