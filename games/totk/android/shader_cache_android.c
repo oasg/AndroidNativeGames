@@ -113,9 +113,10 @@ static int find_bahs(const uint8_t *region, size_t region_size, size_t control_o
     return 0;
 }
 
-int runtime_shader_resolve_in_region(const void *region_v, size_t region_size,
-                                     const void *control, uint64_t low_addr,
-                                     const void **code, RuntimeShaderResolveInfo *info) {
+static int resolve_in_region_impl(const void *region_v, size_t region_size,
+                                  const void *control, uint64_t low_addr,
+                                  const void **code, RuntimeShaderResolveInfo *info,
+                                  int pointer_ok) {
     RuntimeShaderResolveInfo local;
     if (!info) info = &local;
     memset(info, 0, sizeof *info);
@@ -125,8 +126,10 @@ int runtime_shader_resolve_in_region(const void *region_v, size_t region_size,
     if (code) *code = NULL;
     if (!region_v || !control || !code) { info->why = "invalid-args"; return 0; }
 
-    /* A genuine host pointer needs no translation. */
-    if (low_addr >= SHADER_LOW_PTR) {
+    /* A genuine host pointer needs no translation, but only when the caller has
+     * already verified that the address is mapped.  TOTK also passes BAHS code
+     * offsets above 1 MiB; those must go through the pool resolver. */
+    if (pointer_ok && low_addr >= SHADER_LOW_PTR) {
         info->candidate = (uintptr_t)low_addr;
         info->why = "pointer";
         *code = (const void *)(uintptr_t)low_addr;
@@ -183,37 +186,59 @@ int runtime_shader_resolve_in_region(const void *region_v, size_t region_size,
     return 0;
 }
 
+int runtime_shader_resolve_in_region(const void *region_v, size_t region_size,
+                                     const void *control, uint64_t low_addr,
+                                     const void **code, RuntimeShaderResolveInfo *info) {
+    return resolve_in_region_impl(region_v, region_size, control, low_addr, code, info, 1);
+}
+
 int runtime_shader_resolve_code(const void *control, uint64_t low_addr,
                                 const void **code, RuntimeShaderResolveInfo *info) {
     RuntimeShaderResolveInfo local;
     if (!info) info = &local;
     memset(info, 0, sizeof *info);
     if (code) *code = NULL;
-    if (low_addr >= SHADER_LOW_PTR) {
-        info->candidate = (uintptr_t)low_addr;
-        info->why = "pointer";
-        if (code) *code = (const void *)(uintptr_t)low_addr;
-        return 1;
-    }
     FILE *f = fopen("/proc/self/maps", "r");
     if (!f) { info->why = "no-maps"; return 0; }
     char line[512];
     uintptr_t control_addr = (uintptr_t)control;
-    int found = 0;
+    uintptr_t code_addr = (uintptr_t)low_addr;
+    int found = 0, code_mapped = 0;
+    unsigned long long code_start = 0, code_end = 0;
     while (fgets(line, sizeof line, f)) {
         unsigned long long start = 0, end = 0;
         char perms[8] = { 0 };
         if (sscanf(line, "%llx-%llx %7s", &start, &end, perms) != 3) continue;
+        if (low_addr >= SHADER_LOW_PTR && code_addr >= start && code_addr < end &&
+            perms[0] == 'r') {
+            code_mapped = 1;
+            code_start = start;
+            code_end = end;
+        }
         if (control_addr < start || control_addr >= end) continue;
         found = 1;
         if (perms[0] != 'r') { info->why = "control-not-readable"; break; }
-        runtime_shader_resolve_in_region((const void *)(uintptr_t)start,
-                                         (size_t)(end - start), control, low_addr,
-                                         code, info);
+        if (low_addr >= SHADER_LOW_PTR && code_mapped) {
+            info->candidate = code_addr;
+            info->region_start = code_start;
+            info->region_end = code_end;
+            info->why = "pointer";
+            if (code) *code = (const void *)code_addr;
+            break;
+        }
+        /* The value is not a mapped host pointer.  It can still be a BAHS code
+         * offset above 1 MiB; resolve it through the control's package pool. */
+        resolve_in_region_impl((const void *)(uintptr_t)start,
+                               (size_t)(end - start), control, low_addr,
+                               code, info, 0);
         break;
     }
     fclose(f);
-    if (!found && !info->why) info->why = "control-not-mapped";
+    if (!*code) {
+        if (!found && !info->why) info->why = "control-not-mapped";
+        else if (found && low_addr >= SHADER_LOW_PTR && !code_mapped && !info->why)
+            info->why = "pointer-unmapped";
+    }
     return *code != NULL;
 }
 
