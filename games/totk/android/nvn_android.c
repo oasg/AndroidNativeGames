@@ -57,6 +57,7 @@ static void nvn_host_rt_clear(void);
 static void nvn_scene_submit_pending(void);
 static int nvn_is_empty_target(const void *tex);
 static int nvn_trace_inputs(void);
+static uint32_t nvn_first_nonzero(const uint8_t *p, size_t n, size_t cap);
 /* Evidence counters for the title/UI input trace. */
 static unsigned nvn_tex_writes, nvn_buf_maps, nvn_cb_copy_b2b, nvn_cb_copy_b2t;
 static unsigned nvn_cb_draw_texture_calls, nvn_cb_clear_texture_calls;
@@ -5252,6 +5253,21 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
                                 " tpool=%p tex=%p\n", stage, i, (unsigned long long)handle,
                         tid, (const void *)tpool, (const void *)t);
             if (!t) continue;
+            if (nvn_trace_inputs()) {
+                static unsigned bind_traces;
+                if (bind_traces++ < 8) {
+                    size_t ms = t->L.size ? (size_t)t->L.size
+                                          : (size_t)t->d.width * t->d.height * 4;
+                    uint32_t nz = nvn_first_nonzero(t->mem, ms, 1u << 20);
+                    fprintf(stderr, "[totk-frame] bind-tex stage=%d slot=%d handle=%#llx"
+                                    " tex=%p fmt=%#x %ux%u lv=%u mem=%p msize=%zu"
+                                    " first_nz=%s%u host=%p\n",
+                            stage, i, (unsigned long long)handle, (const void *)t,
+                            t->d.format, t->d.width, t->d.height, t->d.levels,
+                            (void *)t->mem, ms, nz == UINT32_MAX ? "none " : "",
+                            nz == UINT32_MAX ? 0 : nz, (void *)nvn_texture_gfx(t));
+                }
+            }
             GfxTexture *g = nvn_texture_gfx_ready(t);   /* lazy first-bind upload */
             if ((nvn_trace_first() || (nvn_trace_frame() && nvn_scene_rendered > 0)) &&
                 nvn_tex_apply_trace <= 24)
