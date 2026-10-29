@@ -107,6 +107,9 @@ int gfx_backend_vulkan_init(void);
 void gfx_backend_vulkan_shutdown(void);
 int gfx_backend_vulkan_available(void);
 const char *gfx_backend_name(void);
+/* True when the instance/device level supports negative viewport heights
+ * without an optional extension. */
+int gfx_backend_negative_viewport_supported(void);
 
 /* NVN format id -> Vulkan VkFormat.  Returns VK_FORMAT_UNDEFINED (0) for an
  * unsupported format; callers must treat that as an error. */

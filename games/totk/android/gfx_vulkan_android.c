@@ -181,7 +181,7 @@ static int vk_init_locked(void) {
         .applicationVersion = 1,
         .pEngineName = "nvn-cpu",
         .engineVersion = 1,
-        .apiVersion = VK_API_VERSION_1_0,
+        .apiVersion = VK_API_VERSION_1_1,
     };
     VkInstanceCreateInfo ici = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -190,6 +190,12 @@ static int vk_init_locked(void) {
         .ppEnabledExtensionNames = n_enabled ? enabled : NULL,
     };
     VkResult r = vkCreateInstance(&ici, NULL, &g.instance);
+    if (r != VK_SUCCESS) {
+        /* Older Android Vulkan 1.0 loaders reject the 1.1 application
+         * version; keep the 1.0 path and disable the negative viewport. */
+        app.apiVersion = VK_API_VERSION_1_0;
+        r = vkCreateInstance(&ici, NULL, &g.instance);
+    }
     if (r != VK_SUCCESS && n_enabled) {
         vk_log("surface extensions unavailable at instance creation (%d); retrying offscreen-only", (int)r);
         g.has_surface_ext = g.has_android_ext = 0;
@@ -348,6 +354,11 @@ void gfx_backend_vulkan_shutdown(void) {
 
 const char *gfx_backend_name(void) {
     return g.ready ? "vulkan" : "software";
+}
+
+int gfx_backend_negative_viewport_supported(void) {
+    if (!g.ready && !gfx_backend_vulkan_init()) return 0;
+    return g.ready && g.props.apiVersion >= VK_API_VERSION_1_1;
 }
 
 static VkFormatInfo vk_format_info(VkFormat f) {

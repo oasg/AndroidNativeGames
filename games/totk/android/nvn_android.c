@@ -4768,6 +4768,7 @@ static uint32_t nvn_translate_commands(const cb_t *cb, GfxCmd *out, uint32_t max
                                        float clear[4], int *has_clear) {
     uint32_t n = 0;
     *has_clear = 0;
+    int yflip = 0;
     if (!cb) return 0;
     nvn_render_state_t defaults;
     nvn_render_state_defaults(&defaults);
@@ -4795,14 +4796,25 @@ static uint32_t nvn_translate_commands(const cb_t *cb, GfxCmd *out, uint32_t max
             out[n].u.clear.mask = c->u.clear.mask;
             n++;
             break;
-        case NVN_CMD_SET_VIEWPORT:
+        case NVN_CMD_SET_VIEWPORT: {
             out[n].kind = GFX_CMD_SET_VIEWPORT;
             out[n].u.rect.x = c->u.rect.x;
             out[n].u.rect.y = c->u.rect.y;
             out[n].u.rect.width = c->u.rect.width;
             out[n].u.rect.height = c->u.rect.height;
+            /* NVN's upper-left origin uses Y-up NDC; the Vulkan framebuffer
+             * is Y-down.  A negative-height viewport is the faithful transform
+             * (Vulkan 1.1 / VK_KHR_maintenance1). */
+            const nvn_dev_t *dev = cb ? (const nvn_dev_t *)cb->dev : NULL;
+            if (dev && dev->origin == 1 && out[n].u.rect.height > 0 &&
+                gfx_backend_negative_viewport_supported()) {
+                out[n].u.rect.y += out[n].u.rect.height;
+                out[n].u.rect.height = -out[n].u.rect.height;
+                yflip = 1;
+            }
             n++;
             break;
+        }
         case NVN_CMD_SET_SCISSOR:
             out[n].kind = GFX_CMD_SET_SCISSOR;
             out[n].u.rect.x = c->u.rect.x;
@@ -4854,6 +4866,7 @@ static uint32_t nvn_translate_commands(const cb_t *cb, GfxCmd *out, uint32_t max
             out[n].u.draw.first = c->u.draw.first;
             out[n].u.draw.count = c->u.draw.count;
             out[n].u.draw.state = cur_state;
+            if (yflip) out[n].u.draw.state.front_face ^= 1;
             out[n].u.draw.has_state = 1;
             n++;
             break;
@@ -4868,6 +4881,7 @@ static uint32_t nvn_translate_commands(const cb_t *cb, GfxCmd *out, uint32_t max
                 (c->u.draw_indexed.index_type == 2 ? 4 :
                  c->u.draw_indexed.index_type == 1 ? 2 : 1);
             out[n].u.draw_indexed.state = cur_state;
+            if (yflip) out[n].u.draw_indexed.state.front_face ^= 1;
             out[n].u.draw_indexed.has_state = 1;
             n++;
             break;
