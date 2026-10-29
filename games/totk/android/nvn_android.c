@@ -2715,6 +2715,38 @@ static void nvn_retired_clear_locked(nvn_retired_t *e) {
     free(e->bind);
     memset(e, 0, sizeof *e);
 }
+/* Per-target draw histogram for a retired recording.  TOTK's large UI/atlas
+ * command buffers set a 1920x1080 0x3f colour target but draw only to small
+ * atlas textures; knowing which target actually received the draws avoids
+ * treating the cleared 0x3f target as a rendered scene pass. */
+static void nvn_frame_target_hist(const cb_t *c, const void *chosen) {
+    nvn_cb_target_t *t = nvn_cb_target(c, 0);
+    if (!t || !t->draws) return;
+    struct { const void *tex; uint32_t fmt, w, h, n; } g[8];
+    unsigned ng = 0;
+    for (uint32_t i = 0; i < t->ndraws; i++) {
+        const nvn_draw_snap_t *d = &t->draws[i];
+        if (!d->have_layout || !d->color0_tex) continue;
+        unsigned k;
+        for (k = 0; k < ng; k++)
+            if (g[k].tex == d->color0_tex && g[k].fmt == (uint32_t)d->layout.color_formats[0] &&
+                g[k].w == d->width && g[k].h == d->height) break;
+        if (k == ng && ng < sizeof g / sizeof g[0]) {
+            g[ng].tex = d->color0_tex;
+            g[ng].fmt = (uint32_t)d->layout.color_formats[0];
+            g[ng].w = d->width;
+            g[ng].h = d->height;
+            g[ng].n = 0;
+            ng++;
+        }
+        if (k < ng) g[k].n++;
+    }
+    fprintf(stderr, "[totk-frame] draw targets:");
+    for (unsigned k = 0; k < ng; k++)
+        fprintf(stderr, " %p vkfmt=%#x %ux%u draws=%u%s", g[k].tex, g[k].fmt, g[k].w,
+                g[k].h, g[k].n, g[k].tex == chosen ? "*" : "");
+    fputc('\n', stderr);
+}
 static void nvn_cb_retire(cb_t *c) {
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) return;
     if (!c->handle || (!c->ncmds && !c->draw_count)) return;
@@ -2783,6 +2815,8 @@ static void nvn_cb_retire(cb_t *c) {
     }
     int queue_scene = e->used && e->draw_count && e->have_layout &&
                       !e->window_texture && e->color0_tex != NULL;
+    if (nvn_trace_frame() && e->draw_count)
+        nvn_frame_target_hist(c, e->color0_tex);
     uint64_t scene_handle = e->handle;
     pthread_mutex_unlock(&g_retired_lock);
     if (nvn_trace_frame())
