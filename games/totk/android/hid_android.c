@@ -36,6 +36,34 @@ static int hid_send_vibration(const void *handle, const void *value) {
     return 0;
 }
 
+/* ControllerSupportResultInfo: int8 player count, 3 pad bytes, u32 selected
+ * id.  The Switch shows its "connect controllers" applet here; the Android host
+ * has one local player, so report that immediately instead of opening a
+ * library applet whose completion event the HLE cannot produce. */
+typedef struct { int8_t players; uint8_t pad[3]; uint32_t selected; } hid_support_result;
+_Static_assert(sizeof(hid_support_result) == 8, "controller support result ABI");
+static uint32_t hid_show_controller_support(hid_support_result *out, const void *arg) {
+    (void)arg;
+    if (out) *out = (hid_support_result){ .players = 1, .selected = 0 };
+    static int once;
+    if (!once++) fprintf(stderr, "[totk-hid] controller support applet: one player (handheld)\n");
+    return 0;
+}
+static uint32_t hid_show_controller_support_v1(const void *arg) {
+    (void)arg;
+    return 0;
+}
+static uint32_t hid_show_controller_support_sys(hid_support_result *out, const void *arg, int flag) {
+    (void)flag;
+    return hid_show_controller_support(out, arg);
+}
+static uint32_t hid_show_controller_support_sys_v1(const void *arg, int flag) {
+    (void)arg; (void)flag;
+    return 0;
+}
+static uint32_t hid_show_controller_noop(const void *arg) { (void)arg; return 0; }
+static uint32_t hid_show_controller_noop2(const void *arg, int x) { (void)arg; (void)x; return 0; }
+
 void *runtime_hid_override(const char *name) {
     static const struct { const char *name; void *fn; } map[] = {
         {"_ZN2nn3hid14InitializeNpadEv", hid_ok},
@@ -63,6 +91,14 @@ void *runtime_hid_override(const char *name) {
         {"_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", hid_send_vibration},
         {"_ZN2nn3hid18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE", hid_ok},
         {"_ZN2nn3hid14DisconnectNpadERKj", hid_ok},
+        {"_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE", hid_show_controller_support},
+        {"_ZN2nn3hid21ShowControllerSupportERKNS0_20ControllerSupportArgE", hid_show_controller_support_v1},
+        {"_ZN2nn3hid6system30ShowControllerSupportForSystemEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgEb", hid_show_controller_support_sys},
+        {"_ZN2nn3hid6system30ShowControllerSupportForSystemERKNS0_20ControllerSupportArgEb", hid_show_controller_support_sys_v1},
+        {"_ZN2nn3hid24ShowControllerStrapGuideEv", hid_ok},
+        {"_ZN2nn3hid28ShowControllerFirmwareUpdateERKNS0_27ControllerFirmwareUpdateArgE", hid_show_controller_noop},
+        {"_ZN2nn3hid6system37ShowControllerFirmwareUpdateForSystemERKNS0_27ControllerFirmwareUpdateArgENS1_23ControllerSupportCallerE", hid_show_controller_noop2},
+        {"_ZN2nn3hid6system35ShowControllerKeyRemappingForSystemERKNS1_25ControllerKeyRemappingArgENS1_23ControllerSupportCallerE", hid_show_controller_noop2},
     };
     for (size_t i = 0; i < sizeof map / sizeof *map; i++)
         if (!strcmp(name, map[i].name)) return map[i].fn;
