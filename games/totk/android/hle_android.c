@@ -57,6 +57,11 @@ static int oe_focus_mode(int mode) { fprintf(stderr, "[totk-android] focus handl
 static int oe_performance_config(int mode, int config) { fprintf(stderr, "[totk-android] performance configuration mode=%d config=%#x\n", mode, config); return 0; }
 static int oe_cpu_boost(int mode) { fprintf(stderr, "[totk-android] CPU boost mode %d\n", mode); return 0; }
 static int oe_notification(unsigned char enabled) { (void)enabled; return 0; }
+/* No system startup logo is drawn on the Android host, so there is nothing to
+ * dismiss.  The SDK's implementation opens the oe/am applet proxy and faults
+ * when that host service has no logo session (sdk+0x39b080 after the
+ * controller-support applet). */
+static void oe_finish_startup_logo(void) { fprintf(stderr, "[totk-android] startup logo finished\n"); }
 static uint64_t applet_resource_user_id(void) { return 1; }
 void *runtime_nvn_bootstrap(const char *name);
 void *runtime_hid_override(const char *name);
@@ -169,11 +174,34 @@ static int applet_try_pop_parameter(void *storage, int kind) {
     return 0;
 }
 
+/* nn::nfp: the Android host has no NFC reader.  The generic IPC stub returned
+ * success for nfp:user Open without a device object, and the SDK then
+ * dereferenced NULL (sdk+0x378dec).  Keep the macOS host's no-device HLE so
+ * the amiibo path cleanly reports "no device" and boot continues. */
+#define NFP_DEVICE_NOT_FOUND 0x8073u   /* nfp module 115, description 64 */
+static int nfp_state;
+static unsigned nfp_initialize(void) { nfp_state = 1; return 0; }
+static unsigned nfp_finalize(void) { nfp_state = 0; return 0; }
+static int nfp_get_state(void) { return nfp_state; }
+static unsigned nfp_list(void *handles, int *count, int max) {
+    (void)handles; (void)max;
+    if (count) *count = 0;
+    return NFP_DEVICE_NOT_FOUND;
+}
+static unsigned nfp_attach_availability(void *event) {
+    if (!event) runtime_fail("nfp availability event");
+    hle_bind_system_event(event, 0);
+    return 0;
+}
+static unsigned nfp_no_device(void) { return NFP_DEVICE_NOT_FOUND; }
+static int nfp_device_state(const void *h) { (void)h; return 0; }
+
 void *runtime_override(const char *name) {
     static const struct { const char *name; void *fn; } map[] = {
         {"_ZN2nn2oe10InitializeEv", oe_init},
         {"_ZN2nn2oe18GetDesiredLanguageEv", oe_desired_language},
         {"_ZN2nn2oe16GetOperationModeEv", oe_operation_mode},
+        {"_ZN2nn2oe17FinishStartupLogoEv", oe_finish_startup_logo},
         {"_ZN2nn2oe18GetPerformanceModeEv", oe_performance_mode},
         {"_ZN2nn2oe20GetCurrentFocusStateEv", oe_focus_state},
         {"_ZN2nn2oe24GetExpectedVolumeBalanceEPfS1_", oe_expected_volume_balance},
@@ -203,6 +231,20 @@ void *runtime_override(const char *name) {
         {"_ZN2nn3err26InitializeContextWriterApiEv", err_init},
         {"_ZN2nn4diag34InitializeApplicationAbortObserverEv", diag_abort_init},
         {"_ZN2nn6applet37TryPopFromApplicationParameterChannelEPNS0_13StorageHandleENS0_19LaunchParameterKindE", applet_try_pop_parameter},
+        {"_ZN2nn3nfp10InitializeEv", nfp_initialize},
+        {"_ZN2nn3nfp8FinalizeEv", nfp_finalize},
+        {"_ZN2nn3nfp8GetStateEv", nfp_get_state},
+        {"_ZN2nn3nfp11ListDevicesEPNS0_12DeviceHandleEPii", nfp_list},
+        {"_ZN2nn3nfp29AttachAvailabilityChangeEventEPNS_2os15SystemEventTypeE", nfp_attach_availability},
+        {"_ZN2nn3nfp14GetDeviceStateERKNS0_12DeviceHandleE", nfp_device_state},
+        {"_ZN2nn3nfp5MountERKNS0_12DeviceHandleENS0_9ModelTypeENS0_11MountTargetE", nfp_no_device},
+        {"_ZN2nn3nfp9GetNpadIdEPjRKNS0_12DeviceHandleE", nfp_no_device},
+        {"_ZN2nn3nfp19AttachActivateEventEPNS_2os15SystemEventTypeERKNS0_12DeviceHandleE", nfp_no_device},
+        {"_ZN2nn3nfp21AttachDeactivateEventEPNS_2os15SystemEventTypeERKNS0_12DeviceHandleE", nfp_no_device},
+        {"_ZN2nn3nfp14StartDetectionERKNS0_12DeviceHandleE", nfp_no_device},
+        {"_ZN2nn3nfp13StopDetectionERKNS0_12DeviceHandleE", nfp_no_device},
+        {"_ZN2nn3nfp10GetTagInfoEPNS0_7TagInfoERKNS0_12DeviceHandleE", nfp_no_device},
+        {"_ZN2nn3nfp12GetModelInfoEPNS0_9ModelInfoERKNS0_12DeviceHandleE", nfp_no_device},
         {"_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE", vi_create_layer_host},
         {"_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE", vi_get_native_window_host},
         {"nvnBootstrapLoader", runtime_nvn_bootstrap},
