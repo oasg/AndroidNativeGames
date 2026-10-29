@@ -341,7 +341,9 @@ uint64_t runtime_svc(unsigned num, uint64_t *r, const char *module, uint64_t off
         fprintf(stderr, "[totk-android] SVC %#x at %s+%#llx x0=%#llx x1=%#llx x2=%#llx\n",
                 num, module, (unsigned long long)offset,
                 (unsigned long long)r[0], (unsigned long long)r[1], (unsigned long long)r[2]);
-    if (num == 0x18 && getenv("TOTK_ANDROID_TRACE_SYNC") &&
+    static int trace_sync = -1;
+    if (trace_sync < 0) trace_sync = getenv("TOTK_ANDROID_TRACE_SYNC") != NULL;
+    if (num == 0x18 && trace_sync &&
         r[1] && *(const uint32_t *)(uintptr_t)r[1] == 0) {
         static int shown;
         if (shown++ < 3) {

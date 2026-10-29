@@ -871,7 +871,9 @@ int svc_thread(int num, uint64_t *regs) {
     case 0x18: {  // WaitSynchronization(→w1 下标; x1 句柄数组, w2 个数, x3 超时) | WaitSynchronization(→w1 index; x1 handle array, w2 count, x3 timeout)
         thr_t *t = cur(); const uint32_t *hs = (const uint32_t *)regs[1]; int n = (int)regs[2]; int64_t ns = (int64_t)regs[3];
         if(n<0||n>64||(!hs&&n)){regs[0]=R_BAD_STATE;return 1;}
-        if (getenv("TOTK_ANDROID_TRACE_SYNC")) {
+        static int sync_trace = -1;
+        if (sync_trace < 0) sync_trace = getenv("TOTK_ANDROID_TRACE_SYNC") != NULL;
+        if (sync_trace) {
             static uint32_t seen[16]; static int nseen, calls;
             uint32_t h = n > 0 ? hs[0] : 0;
             int found = 0;
@@ -896,6 +898,19 @@ int svc_thread(int num, uint64_t *regs) {
             if (block(t, 4, left) == R_TIMEOUT) { r = R_TIMEOUT; break; }
         }
         pthread_mutex_unlock(&G);
+        static int wait_trace = -1;
+        if (wait_trace < 0) wait_trace = getenv("TOTK_ANDROID_TRACE_WAIT") != NULL;
+        if (wait_trace && t) {
+            static uint64_t calls;
+            if ((calls++ % 10000000) == 0) {
+                uint32_t h = n > 0 ? hs[0] : 0;
+                event_t *e = h_peek(h, O_EVENT_R);
+                thr_t *th = h_peek(h, O_THREAD);
+                fprintf(stderr, "[svc-wait] th=%#x h=%#x n=%d to=%lld r=%lld idx=%d ev=%p sig=%d thr=%p exited=%d\n",
+                        t->handle, h, n, (long long)ns, (long long)r, idx, (void *)e,
+                        e ? e->signaled : -1, (void *)th, th ? th->exited : -1);
+            }
+        }
         regs[0] = (uint64_t)r; regs[1] = idx >= 0 ? (uint64_t)idx : 0; return 1;
     }
     case 0x19: {  // CancelSynchronization(w0 线程) | CancelSynchronization(w0 thread)
