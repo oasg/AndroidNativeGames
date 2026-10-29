@@ -18,6 +18,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "gfx_backend_android.h"
 #include "host_window_api.h"
 
 #define TAG "totk-shell"
@@ -32,6 +33,7 @@ extern int totk_android_loader_entry(void *host_window, int argc, char **argv)
 
 static ANativeWindow *g_window;
 static void *g_host_window;
+static GfxOffscreenTarget *g_present_target;
 
 static pthread_t g_present_thread;
 static pthread_t g_loader_thread;
@@ -44,15 +46,21 @@ static atomic_uint g_failed;
 
 static void *present_loop(void *arg) {
     void *host = arg;
+    GfxOffscreenTarget *target = g_present_target;
+    GfxTrianglePipeline *triangle = gfx_backend_builtin_triangle_pipeline();
     unsigned frame = 0;
-    LOGI("present loop enter host=%p", host);
+    unsigned draw_failures = 0;
+    LOGI("present loop enter host=%p target=%p", host, (void *)target);
     while (atomic_load(&g_present_run)) {
-        /* 120-frame ramp: red up, blue down, keeps the clear visibly animated
-         * so a screenshot/recording shows a real presented frame. */
+        /* Draw a real scene into the renderer-owned offscreen target, then hand
+         * that target to the swapchain.  The 120-frame ramp keeps the clear
+         * colour animated so a capture differs between frames; the triangle
+         * proves this is not the old clear-only present. */
         float t = (float)(frame % 120) / 119.0f;
-        float rgba[4] = { 0.08f + 0.30f * t, 0.12f, 0.34f - 0.24f * t, 1.0f };
-        if (!runtime_native_window_clear_rgba(host, rgba)) {
-            if (atomic_fetch_add(&g_failed, 1) < 4) LOGE("clear failed at frame %u", frame);
+        if (!target || !triangle ||
+            !gfx_backend_triangle_draw(triangle, target,
+                                       0.04f + 0.30f * t, 0.10f, 0.30f - 0.22f * t, 1.0f)) {
+            if (draw_failures++ < 4) LOGE("triangle draw failed at frame %u", frame);
         }
         if (runtime_native_window_present(host)) {
             unsigned n = atomic_fetch_add(&g_presented, 1) + 1;
@@ -131,6 +139,22 @@ Java_com_totk_surfacetest_MainActivity_nativeStart(JNIEnv *env, jobject thiz,
     else
         LOGI("surface attached anw=%p host=%p", (void *)win, host);
 
+    /* A renderer-owned target, separate from the host window's own image, so
+     * this exercises the same handoff NVN will use: draw into the target, set
+     * it as the present source, then present through the host window. */
+    g_present_target = gfx_backend_offscreen_create(1280, 720, 0x25);
+    if (!g_present_target)
+        LOGE("offscreen present target creation failed; using host target");
+    else {
+        runtime_native_window_set_present_target(host, g_present_target);
+        LOGI("present target set target=%p %ux%u %s routed=%p",
+             (void *)g_present_target,
+             gfx_backend_offscreen_width(g_present_target),
+             gfx_backend_offscreen_height(g_present_target),
+             gfx_backend_offscreen_format_name(g_present_target),
+             runtime_native_window_present_target(host));
+    }
+
     g_window = win;
     g_host_window = host;
     atomic_store(&g_presented, 0);
@@ -140,6 +164,8 @@ Java_com_totk_surfacetest_MainActivity_nativeStart(JNIEnv *env, jobject thiz,
     if (pthread_create(&g_present_thread, NULL, present_loop, host) != 0) {
         LOGE("pthread_create(present) failed");
         atomic_store(&g_present_run, 0);
+        runtime_native_window_set_present_target(host, NULL);
+        if (g_present_target) { gfx_backend_offscreen_destroy(g_present_target); g_present_target = NULL; }
         runtime_native_window_attach_android(NULL, host, 0, 0, 0);
         runtime_native_window_destroy(host);
         g_window = NULL;
@@ -155,9 +181,15 @@ Java_com_totk_surfacetest_MainActivity_nativeStop(JNIEnv *env, jobject thiz) {
     if (g_window) {
         pthread_join(g_present_thread, NULL);
         if (g_host_window) {
+            /* Stop borrowing the renderer target before destroying either. */
+            runtime_native_window_set_present_target(g_host_window, NULL);
             runtime_native_window_attach_android(NULL, g_host_window, 0, 0, 0);
             runtime_native_window_destroy(g_host_window);
             g_host_window = NULL;
+        }
+        if (g_present_target) {
+            gfx_backend_offscreen_destroy(g_present_target);
+            g_present_target = NULL;
         }
         ANativeWindow_release(g_window);
         g_window = NULL;
