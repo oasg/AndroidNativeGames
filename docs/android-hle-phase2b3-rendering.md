@@ -78,6 +78,22 @@ Android destroyed the Surface after one frame.  Unlock the phone and keep the
 screen on before measuring the physical on-screen clear; the emulator result
 above uses the same native library and backend.
 
+The surface path now also presents a real offscreen target, not only a clear:
+
+- `gfx_backend_surface_present_target(target, GFX_SURFACE_SCALE_FIT)` blits or
+  converts color attachment 0 into the swapchain (RGBA8 direct blit;
+  R11G11B10F through an embedded fullscreen conversion pass), with FIT
+  letterboxing and explicit out-of-date/suboptimal handling;
+- `runtime_native_window_set_present_target(host, target)` routes the NVN frame
+  to that path; `NULL` restores the host window's own target.  Without a
+  Surface the offscreen present path is unchanged.
+
+Device evidence: 3200x1440 surface, 5 swapchain images, **720 frames, 0
+failures** with a 1280x720 offscreen triangle target; `probe-vulkan-surface-target`
+passes RGBA8 FIT/STRETCH and R11 FIT/STRETCH cases.  Swapchain `preTransform`
+still needs verification (the captured triangle can appear rotated on the
+physical panel).
+
 ## 4. Triangle
 
 The triangle is a repository-owned GLSL pair, compiled to SPIR-V with the
@@ -579,6 +595,18 @@ first reflected frame -> first.ppm (ok)
 center `(128,128,127)`, corner `(128,128,128)`, and the quad covers the whole
 window.  The content is a boot compositor gradient, not the game scene.
 
+After that milestone the render-target bridge was completed: retired command
+buffers are split at `SetRenderTargets` boundaries, each segment renders into
+its own host target, and the compositor samples the `0x3f` target the engine
+actually drew.  Current title/menu state is **black**: the `0x3f` pass is a
+6-vertex fade whose PS constant colour is `(0,0,0,1)` (intentional), and the
+UI atlas segments execute but their source atlases are still zero.  The game
+accepts scripted Npad A/Plus input (HID ABI fixed), but no input transition or
+save slot advances to gameplay; a 1.4.3 macOS save is not compatible with the
+1.0.0 Android image and crashes the worker.  The first non-clear evidence
+therefore remains the boot-compositor frame; the 0x3f scene content is the next
+goal.
+
 Remaining first-frame/scene work:
 
 - The submitted quad samples the `0x3f` HDR target, but the engine's HDR/source
@@ -659,23 +687,27 @@ Expected:
 
 ## 8. Next
 
-1. Get the HDR/source pass submitted so the first frame shows game content
-   instead of the boot compositor gradient.  The current window quad samples
-   the `0x3f` target; the pass that renders it is still recorded/recycled
-   before submit in this state.
-2. Implement the NVN upper-left-origin Y transform correctly: create the
-   Vulkan instance/device at 1.1 or enable `VK_KHR_maintenance1`, then emit the
-   negative-height viewport for origin mode 1.  The current frame is
-   vertically mirrored; the winding fix does not flip the image.
-3. Grow/stream the per-binding UBO/SSBO arena for very large or heavily
+1. Fix the title/menu UI content: the per-target segments execute, but their
+   `360x69`/`180x34` targets read back zero.  Trace the bound PS textures'
+   guest storage and the multi-texture slot remap; the first UI segment must
+   show its atlas content before input can start a game.
+2. The `0x3f` 6-vertex pass is an intentional black fade (PS constant
+   `(0,0,0,1)`); confirm whether its fade parameter/host time advances.  A real
+   3D draw list to `0x3f` is still not recorded in the current title state.
+3. Reach gameplay: the HID ABI is fixed and scripted A/Plus reaches the guest,
+   but the title does not transition.  A 1.4.3 macOS save is incompatible with
+   the 1.0.0 Android image (worker SIGSEGV); use a 1.0.0 save or a host
+   new-game flow instead of importing that save.
+4. Grow/stream the per-binding UBO/SSBO arena for very large or heavily
    re-bound storage buffers, and add the remaining fixed state (stencil
    compare/write masks, alpha-to-coverage, logic op, MSAA).
-4. Keep the startup/title shader cache current for the new draws; the
+5. Keep the startup/title shader cache current for the new draws; the
    BAHS-offset resolver and `<key>-<suffix>` variants are in place
    (`probe-nvn-frame`, `probe-nvn-state`, `probe-shader-cache`).
-5. Add array/3D/cube/mip texture upload and generate the offline `attr`/`tex`
+6. Add array/3D/cube/mip texture upload and generate the offline `attr`/`tex`
    answer rows from the game's bound state so the variant files exist for the
    scene shaders.
-6. Unlock the physical device and keep the screen on, then run the Surface
-   shell against the first game frame; `adb install` now succeeds on the
-   Xiaomi device.
+7. Verify swapchain `preTransform` on the physical panel, then run the Surface
+   shell against the first non-black game frame; `adb install` works on the
+   Xiaomi device, and `probe-vulkan-surface-target` covers the target-present
+   path.
