@@ -29,6 +29,7 @@ typedef struct HostNativeWindow {
     void *android;          /* ANativeWindow*, set by the app shell */
     int surface_ok;         /* VkSwapchainKHR created for `android` */
     void *gfx_target;       /* GfxOffscreenTarget* or NULL for the software path */
+    void *present_target;   /* borrowed GfxOffscreenTarget* to present, or NULL */
     unsigned presents;      /* successful surface/offscreen presents */
     unsigned surface_presents; /* presents that went through the swapchain */
     float clear[4];
@@ -236,6 +237,37 @@ void *runtime_native_window_android(const void *p) {
     return w && w->magic == HOST_NW_MAGIC ? w->android : NULL;
 }
 
+/* Route present() to the target the renderer actually produced.  NVN owns the
+ * scene/window target; the host window only borrows it, so destroying the host
+ * window never destroys this image.  Passing NULL restores the host window's
+ * own offscreen target (the pre-surface behaviour). */
+void runtime_native_window_set_present_target(void *p, GfxOffscreenTarget *target) {
+    HostNativeWindow *w = p;
+    if (!w || w->magic != HOST_NW_MAGIC) return;
+    if (w->present_target == target) return;
+    w->present_target = target;
+    if (target)
+        fprintf(stderr, "[totk-vi] present target host=%p target=%p %ux%u\n",
+                (void *)w, (void *)target,
+                gfx_backend_offscreen_width(target),
+                gfx_backend_offscreen_height(target));
+    else
+        fprintf(stderr, "[totk-vi] present target cleared host=%p; using host offscreen target\n",
+                (void *)w);
+}
+
+GfxOffscreenTarget *runtime_native_window_present_target(const void *p) {
+    const HostNativeWindow *w = p;
+    return w && w->magic == HOST_NW_MAGIC ? (GfxOffscreenTarget *)w->present_target : NULL;
+}
+
+/* The host window's own offscreen target (what NVN draws into through the
+ * runtime_native_window_draw_* helpers). */
+GfxOffscreenTarget *runtime_native_window_gfx_target(const void *p) {
+    const HostNativeWindow *w = p;
+    return w && w->magic == HOST_NW_MAGIC ? (GfxOffscreenTarget *)w->gfx_target : NULL;
+}
+
 /* A CPU clear is the smallest observable "frame" for the offscreen milestone.
  * The real renderer will replace this with a Vulkan/GL target; keeping it here
  * means present can be validated without pretending the GPU executed. */
@@ -265,8 +297,16 @@ int runtime_native_window_present(void *p) {
     HostNativeWindow *w = p;
     if (!w || w->magic != HOST_NW_MAGIC) return 0;
     if (w->surface_ok && gfx_backend_surface_ready()) {
-        if (!gfx_backend_surface_present(w->clear[0], w->clear[1], w->clear[2], w->clear[3]))
-            return 0;
+        /* Present the rendered image, not a synthetic clear.  The target is
+         * either the renderer-supplied one or the host window's own offscreen
+         * target; the clear-colour present remains only for windows that have
+         * no Vulkan target at all. */
+        const GfxOffscreenTarget *target =
+            (const GfxOffscreenTarget *)(w->present_target ? w->present_target : w->gfx_target);
+        int ok = target
+            ? gfx_backend_surface_present_target(target, GFX_SURFACE_SCALE_FIT)
+            : gfx_backend_surface_present(w->clear[0], w->clear[1], w->clear[2], w->clear[3]);
+        if (!ok) return 0;
         w->presents++;
         w->surface_presents++;
         return 1;
