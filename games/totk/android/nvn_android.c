@@ -890,6 +890,10 @@ static void nvn_frame_submit_trace(int n, const uint64_t *cmds);
 static void nvn_frame_ubo_trace(int n, const uint64_t *cmds);
 static void nvn_frame_report_orphans(void);
 static void nvnQueueSubmitCommands(queue_t *q, int n, const uint64_t *cmds) { nvn_api("nvnQueueSubmitCommands");
+    if (nvn_trace_frame())
+        fprintf(stderr, "[totk-frame] submit-call thread=%#x queue=%p n=%d h0=%#llx\n",
+                runtime_thread_current_handle(), (void *)q, n,
+                n > 0 && cmds ? (unsigned long long)cmds[0] : 0);
     if (!nvn_obj(q, NVN_MAGIC('Q', 'U', 'E', 'U'), "nvnQueueSubmitCommands")) return;
     if (!cmds && n) { nvn_fail("nvnQueueSubmitCommands", "null command handle array"); return; }
     q->submits += (uint64_t)n;
@@ -2161,6 +2165,9 @@ typedef struct {
     const cb_t *cb;
     uint64_t record_lr;
     uint32_t record_thread, record_commands, submit_count;
+    /* Last render-target set recorded into this command buffer. */
+    const void *rt_color0;
+    uint32_t rt_nvn_format, rt_width, rt_height, rt_draws;
 } cb_meta_t;
 #define NVN_CB_META_MAX 128
 static cb_meta_t g_cb_meta[NVN_CB_META_MAX];
@@ -2772,10 +2779,13 @@ static uint64_t nvnCommandBufferEndRecording(cb_t *c) {
         runtime_thread_probe(rec_thread, &wk, &wa, whs, &nwh, &svc, &svc_lr, &svc_fp, &nsvc, &ex);
         rec_lr = svc_lr;
         if (meta) meta->record_lr = svc_lr;
-        fprintf(stderr, "[totk-frame] end cb=%p handle=%#llx thread=%#x cmds=%u draws=%d prog=%p win=%p lr=%#llx"
-                        " svc_lr=%#llx last_svc=%#x\n",
+        fprintf(stderr, "[totk-frame] end cb=%p handle=%#llx thread=%#x cmds=%u draws=%d prog=%p win=%p"
+                        " rt0=%p fmt=%#x %ux%u rt_draws=%u lr=%#llx svc_lr=%#llx last_svc=%#x\n",
                 (void *)c, (unsigned long long)h, rec_thread, c->ncmds,
-                c->draw_count, c->prog, c->win, (unsigned long long)rec_lr,
+                c->draw_count, c->prog, c->win,
+                meta ? meta->rt_color0 : NULL, meta ? meta->rt_nvn_format : 0,
+                meta ? meta->rt_width : 0, meta ? meta->rt_height : 0,
+                meta ? meta->rt_draws : 0, (unsigned long long)rec_lr,
                 (unsigned long long)svc_lr, svc);
     }
     if (nvn_trace_frame() && c->draw_count) {
@@ -2886,6 +2896,18 @@ static void nvnCommandBufferSetWindow(cb_t *c, win_t *w) {
         fprintf(stderr, "[totk-nvn] SetWindow cb=%p rec=%u win=%p native=%p\n",
                 (void *)c, c->recording, (void *)w, w->native);
 }
+static void nvn_frame_draw_trace(cb_t *c, const char *what, int count) {
+    if (!nvn_trace_frame() || !c) return;
+    cb_meta_t *m = nvn_cb_meta(c, 1);
+    if (m) m->rt_draws++;
+    static unsigned logged;
+    if (logged++ >= 64 && (!m || m->rt_nvn_format != 0x3f)) return;
+    fprintf(stderr, "[totk-frame] draw cb=%p thread=%#x what=%s count=%d rt0=%p fmt=%#x"
+                    " %ux%u draws=%u\n",
+            (void *)c, runtime_thread_current_handle(), what, count,
+            m ? m->rt_color0 : NULL, m ? m->rt_nvn_format : 0,
+            m ? m->rt_width : 0, m ? m->rt_height : 0, m ? m->rt_draws : 0);
+}
 static void nvnCommandBufferDrawArrays(cb_t *c, int mode, int first, int count) {
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) {
         nvn_fail("nvnCommandBufferDrawArrays", "invalid command buffer");
@@ -2906,6 +2928,7 @@ static void nvnCommandBufferDrawArrays(cb_t *c, int mode, int first, int count) 
     c->draw_first = first;
     c->draw_count += count;
     nvn_cb_draw_snapshot(c);
+    nvn_frame_draw_trace(c, "arrays", count);
     if (nvn_trace() || (nvn_trace_first() && nvn_draw_trace++ < 32))
         fprintf(stderr, "[totk-nvn] CommandBufferDrawArrays cb=%p rec=%u mode=%d first=%d count=%d"
                         " va_mask=%#x vs_mask=%#x\n", (void *)c, c->recording, mode, first, count,
@@ -2934,11 +2957,16 @@ static void nvnCommandBufferDrawArraysInstanced(cb_t *c, int mode, int first, in
     c->draw_first = first;
     c->draw_count += count;
     nvn_cb_draw_snapshot(c);
+    nvn_frame_draw_trace(c, "arrays", count);
     if (nvn_trace() || (nvn_trace_first() && nvn_draw_trace++ < 32))
         fprintf(stderr, "[totk-nvn] DrawArraysInstanced cb=%p rec=%u mode=%d first=%d count=%d base=%d instances=%d\n",
                 (void *)c, c->recording, mode, first, count, base_instance, instances);
 }
-static void nvnCommandBufferSetRenderEnable(cb_t *c, int e) { (void)c; (void)e; }
+static void nvnCommandBufferSetRenderEnable(cb_t *c, int e) {
+    (void)c;
+    if (nvn_trace_frame()) fprintf(stderr, "[totk-frame] render-enable cb=%p thread=%#x enable=%d\n",
+                                    (void *)c, runtime_thread_current_handle(), e);
+}
 #define NVN_ST(T, x) ((T *)(x))
 
 static void nvnBlendStateSetDefaults(void *s) {
@@ -3207,6 +3235,24 @@ static void nvnCommandBufferSetRenderTargets(cb_t *c, int n, const void *const *
     if (n > 0 && t && t[0]) {
         win_t *w = nvn_window_for_texture(t[0]);
         if (w) { c->win = w; if (cbt) cbt->window_texture = 1; }
+    }
+    cb_meta_t *m = nvn_cb_meta(c, 1);
+    const tex_t *t0m = (n > 0 && t && t[0]) ? nvn_tex_registry_find(t[0]) : NULL;
+    if (m && n > 0) {
+        m->rt_color0 = t[0];
+        m->rt_nvn_format = t0m ? (uint32_t)t0m->d.format : 0;
+        m->rt_width = t0m ? t0m->d.width : (cbt ? cbt->width : 0);
+        m->rt_height = t0m ? t0m->d.height : (cbt ? cbt->height : 0);
+        m->rt_draws = 0;
+    }
+    if (nvn_trace_frame() && n) {
+        const tex_t *dt = nvn_tex_registry_find(depth);
+        fprintf(stderr, "[totk-frame] rt cb=%p thread=%#x n=%d color0=%p fmt=%#x %ux%u"
+                        " depth=%p dfmt=%#x %ux%u window=%p\n",
+                (void *)c, runtime_thread_current_handle(), n, t[0],
+                t0m ? t0m->d.format : 0, t0m ? t0m->d.width : 0, t0m ? t0m->d.height : 0,
+                depth, dt ? dt->d.format : 0, dt ? dt->d.width : 0, dt ? dt->d.height : 0,
+                (void *)c->win);
     }
     if (nvn_trace_first() && nvn_rt_trace++ < 32 && n) {
         const tex_t *ti = nvn_tex_registry_find(t[0]);
@@ -3606,6 +3652,7 @@ static void nvnCommandBufferDrawElements(cb_t *c, int mode, int type, int count,
     }
     c->draw_count += count;
     nvn_cb_draw_snapshot(c);
+    nvn_frame_draw_trace(c, "elements", count);
     if (nvn_trace() || (nvn_trace_first() && nvn_draw_trace++ < 32))
         fprintf(stderr, "[totk-nvn] DrawElements cb=%p rec=%u mode=%d type=%d count=%d index=%#llx"
                         " va_mask=%#x vs_mask=%#x\n", (void *)c, c->recording, mode, type, count,
@@ -3794,6 +3841,20 @@ static void nvnCommandBufferBindTexture(cb_t *c, int stage, int i, uint64_t hand
                             " handle=%#llx tex=%d(%p) samp=%d(%p) texture-not-in-pool\n",
                     (void *)c, (const void *)c->tex_pool, (const void *)c->samp_pool,
                     stage, i, (unsigned long long)handle, tid, (const void *)t, sid, (const void *)s);
+    }
+    if (nvn_trace_frame()) {
+        int tid = (int)(handle & 0xfffff);
+        const tex_pool_t *tp = nvn_tex_pool_for(c);
+        const tex_t *t = tp ? nvn_tex_pool_lookup(tp, tid) : NULL;
+        if (t && (t->d.format == 0x3f || t->d.width >= 1024)) {
+            static unsigned n;
+            if (n++ < 32)
+                fprintf(stderr, "[totk-frame] bind tex cb=%p thread=%#x stage=%d index=%d handle=%#llx"
+                                " fmt=%#x %ux%u target=%d levels=%u\n",
+                        (void *)c, runtime_thread_current_handle(), stage, i,
+                        (unsigned long long)handle, t->d.format, t->d.width,
+                        t->d.height, t->d.target, t->d.levels);
+        }
     }
 }
 static void nvnCommandBufferBindTextures(cb_t *c, int stage, int first, int n, const uint64_t *handles) {
@@ -6956,6 +7017,9 @@ static int nvn_sync_complete(sync_t *s, const char *what) {
 }
 
 static int nvnQueueFenceSync(queue_t *q, sync_t *s, int condition, int flags) { nvn_api("nvnQueueFenceSync");
+    if (nvn_trace_frame())
+        fprintf(stderr, "[totk-frame] fence thread=%#x queue=%p sync=%p cond=%d\n",
+                runtime_thread_current_handle(), (void *)q, (void *)s, condition);
     (void)flags;
     if (!nvn_obj(q, NVN_MAGIC('Q', 'U', 'E', 'U'), "nvnQueueFenceSync(queue)")) return 0;
     if (!nvn_obj(s, NVN_MAGIC('S', 'Y', 'N', 'C'), "nvnQueueFenceSync(sync)")) return 0;
@@ -7038,6 +7102,75 @@ static int64_t nvnEventGetMemoryOffset(const ev_t *e) { return e ? e->off : 0; }
 /* ------------------------------------------------------------------ */
 /* Proc-address table                                                  */
 
+/* Trace-only shims for NVN commands that are still unimplemented.  The
+ * engine receives a non-NULL entry from nvn_lookup even for a missing proc, so
+ * a silent nvn_zero64 hides whether the scene path actually calls it.  These
+ * shims log the first call (TRACE_FRAME) and keep the old no-op behaviour. */
+static void nvn_zero_call(const char *name) {
+    static char seen[32][48];
+    static unsigned n;
+    for (unsigned i = 0; i < n; i++) if (!strcmp(seen[i], name)) return;
+    if (n < sizeof seen / sizeof seen[0]) snprintf(seen[n++], sizeof seen[0], "%s", name);
+    if (nvn_trace_frame()) fprintf(stderr, "[totk-frame] call %s (unimplemented no-op)\n", name);
+}
+static void nvn_trace_dispatch_compute(void *c, int x, int y, int z) {
+    (void)c; nvn_zero_call("nvnCommandBufferDispatchCompute");
+    if (nvn_trace_frame()) fprintf(stderr, "[totk-frame] dispatch compute %dx%dx%d\n", x, y, z);
+}
+static void nvn_trace_dispatch_indirect(void *c, void *a) {
+    (void)c; (void)a; nvn_zero_call("nvnCommandBufferDispatchComputeIndirect");
+}
+static void nvn_trace_draw_instanced(void *c, int p, int t, int count, void *idx,
+                                     int bv, int bi, int inst) {
+    (void)c; (void)p; (void)t; (void)bv; (void)bi;
+    nvn_zero_call("nvnCommandBufferDrawElementsInstanced");
+    if (nvn_trace_frame())
+        fprintf(stderr, "[totk-frame] draw indexed instanced count=%d index=%p instances=%d\n",
+                count, idx, inst);
+}
+static void nvn_trace_draw_indirect(void *c, void *a) {
+    (void)c; (void)a; nvn_zero_call("nvnCommandBufferDrawElementsIndirect");
+}
+static void nvn_trace_draw_arrays_indirect(void *c, void *a) {
+    (void)c; (void)a; nvn_zero_call("nvnCommandBufferDrawArraysIndirect");
+}
+static void nvn_trace_draw_texture(void *c, void *h, void *src, void *dst) {
+    (void)c; (void)h; (void)src; (void)dst;
+    nvn_zero_call("nvnCommandBufferDrawTexture");
+}
+static void nvn_trace_clear_texture(void *c, void *t, void *v, void *r, void *color, int mask) {
+    (void)c; (void)t; (void)v; (void)r; (void)color; (void)mask;
+    nvn_zero_call("nvnCommandBufferClearTexture");
+}
+static void nvn_trace_copy_b2t(void *c, void *buf, void *t, void *v, void *r, int flags) {
+    (void)c; (void)buf; (void)t; (void)v; (void)r; (void)flags;
+    nvn_zero_call("nvnCommandBufferCopyBufferToTexture");
+}
+static void nvn_trace_copy_t2b(void *c, void *t, void *v, void *r, void *buf, int flags) {
+    (void)c; (void)t; (void)v; (void)r; (void)buf; (void)flags;
+    nvn_zero_call("nvnCommandBufferCopyTextureToBuffer");
+}
+static void nvn_trace_cb_fence(void *c, void *sync, int condition, int flags) {
+    (void)c; (void)sync; (void)condition; (void)flags;
+    nvn_zero_call("nvnCommandBufferFenceSync");
+}
+static void nvn_trace_cb_wait_sync(void *c, void *sync) {
+    (void)c; (void)sync; nvn_zero_call("nvnCommandBufferWaitSync");
+}
+static void nvn_trace_cb_signal_event(void *c, void *event, int value) {
+    (void)c; (void)event; (void)value; nvn_zero_call("nvnCommandBufferSignalEvent");
+}
+static void nvn_trace_cb_wait_event(void *c, void *event, int value, int flags) {
+    (void)c; (void)event; (void)value; (void)flags; nvn_zero_call("nvnCommandBufferWaitEvent");
+}
+static void nvn_trace_barrier(void *c, int bits) {
+    (void)c; (void)bits; nvn_zero_call("nvnCommandBufferBarrier");
+}
+static void nvn_trace_render_enable_cond(void *c, int mode, void *addr) {
+    (void)c; (void)addr;
+    nvn_zero_call("nvnCommandBufferSetRenderEnableConditional");
+    if (nvn_trace_frame()) fprintf(stderr, "[totk-frame] render enable conditional mode=%d\n", mode);
+}
 typedef struct { const char *name; void (*fn)(void); } nvn_entry;
 
 #define NVN_E(x) { #x, (void (*)(void))x }
@@ -7193,6 +7326,14 @@ static const nvn_entry nvn_entries[] = {
     NVN_E(nvnCommandBufferGetControlMemoryUsed), NVN_E(nvnCommandBufferGetCommandMemorySize),
     NVN_E(nvnCommandBufferGetCommandMemoryUsed), NVN_E(nvnCommandBufferBeginRecording),
     NVN_E(nvnCommandBufferEndRecording), NVN_E(nvnCommandBufferSetRenderEnable),
+    NVN_E(nvn_trace_dispatch_compute), NVN_E(nvn_trace_dispatch_indirect),
+    NVN_E(nvn_trace_draw_instanced), NVN_E(nvn_trace_draw_indirect),
+    NVN_E(nvn_trace_draw_arrays_indirect), NVN_E(nvn_trace_draw_texture),
+    NVN_E(nvn_trace_clear_texture), NVN_E(nvn_trace_copy_b2t),
+    NVN_E(nvn_trace_copy_t2b), NVN_E(nvn_trace_barrier),
+    NVN_E(nvn_trace_cb_fence), NVN_E(nvn_trace_cb_wait_sync),
+    NVN_E(nvn_trace_cb_signal_event), NVN_E(nvn_trace_cb_wait_event),
+    NVN_E(nvn_trace_render_enable_cond),
     NVN_E(nvnCommandBufferSetRenderTargets), NVN_E(nvnCommandBufferClearColor),
     NVN_E(nvnCommandBufferClearColori), NVN_E(nvnCommandBufferClearColorui),
     NVN_E(nvnCommandBufferDrawArrays), NVN_E(nvnCommandBufferDrawArraysInstanced),
@@ -7280,7 +7421,16 @@ static void *nvnDeviceGetProcAddress(const nvn_dev_t *d, const char *name) {
     (void)d;
     if (!name) return NULL;
     if (!strcmp(name, "nvnDeviceGetProcAddress")) return (void *)nvnDeviceGetProcAddress;
-    return nvn_lookup(name);
+    void *fn = nvn_lookup(name);
+    if (nvn_trace_frame()) {
+        static char seen[512][56];
+        static unsigned nseen;
+        for (unsigned i = 0; i < nseen; i++) if (!strcmp(seen[i], name)) return fn;
+        if (nseen < sizeof seen / sizeof seen[0]) snprintf(seen[nseen++], sizeof seen[0], "%s", name);
+        fprintf(stderr, "[totk-frame] proc %s %s\n", name,
+                fn == (void *)nvn_zero64 ? "UNIMPLEMENTED" : "ok");
+    }
+    return fn;
 }
 
 void *runtime_nvn_bootstrap(const char *name) {
