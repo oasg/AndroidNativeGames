@@ -5683,6 +5683,15 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
     /* Associate only after the segment actually drew: a queued segment whose
      * pipeline was missing must not become the compositor's sample source. */
     if (drew && ctex) nvn_tex_set_rt(ctex, rt, &layout, lw, lh);
+    if (nvn_trace_frame() && lw <= 512) {
+        static unsigned ui_log;
+        if (ui_log++ < 4)
+            fprintf(stderr, "[totk-frame] ui-seg %ux%u color0=%p program=%p texmask=%#x/%#x"
+                            " ubomask=%#x/%#x va=%#x vb=%#x draws=%u\n",
+                    lw, lh, sg->color0_tex, (void *)p, bs->tex_mask[0][0],
+                    bs->tex_mask[1][0], bs->ubo_mask[0], bs->ubo_mask[1],
+                    bs->va_mask, bs->vb_mask, sg->draw_count);
+    }
     if (drew) {
         uint8_t px[4] = { 0 };
         int have_px = gfx_backend_offscreen_read_pixel_index(rt, 0, lw / 2, lh / 2, px) != 0;
