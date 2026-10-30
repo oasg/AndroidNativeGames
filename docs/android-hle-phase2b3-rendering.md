@@ -597,15 +597,32 @@ window.  The content is a boot compositor gradient, not the game scene.
 
 After that milestone the render-target bridge was completed: retired command
 buffers are split at `SetRenderTargets` boundaries, each segment renders into
-its own host target, and the compositor samples the `0x3f` target the engine
-actually drew.  Current title/menu state is **black**: the `0x3f` pass is a
-6-vertex fade whose PS constant colour is `(0,0,0,1)` (intentional), and the
-UI atlas segments execute but their source atlases are still zero.  The game
-accepts scripted Npad A/Plus input (HID ABI fixed), but no input transition or
-save slot advances to gameplay; a 1.4.3 macOS save is not compatible with the
-1.0.0 Android image and crashes the worker.  The first non-clear evidence
-therefore remains the boot-compositor frame; the 0x3f scene content is the next
-goal.
+its own host target, clear-only segments execute in order, and the compositor
+samples the `0x3f` target the engine actually drew.
+
+The UI atlas investigation is **no longer an upload problem**:
+
+- the 96x96 BC4 font atlas has non-zero guest storage and uploads to a host
+  texture;
+- the 180x34 mask target is zero because it starts as a transparent-black
+  clear, not because the uploaded atlas is missing;
+- UBO inheritance from the state-only command buffer now feeds the UI VS
+  `vp_c1`/`vp_c3` slots, and clear-only retired segments are executed;
+- the first 360x69 UI target now has **42 unique colours** (sparse content),
+  and `probe-nvn-segment-targets` proves clear-only + alias sampling.
+
+The window is still **black** in this boot state: the `0x3f` pass is a
+6-vertex fade whose PS constant colour is `(0,0,0,1)` and whose VS scale is
+~0.001, so it is an intentional black/fade layer; the UI targets are not
+composited into `0x3f` yet.  The game accepts scripted Npad A/Plus input (HID
+ABI fixed), but it stays in a pre-title UI/loading loop: FS reads stop at
+`save:/option.sav`, no new asset/program/save appears, and input does not
+advance the state machine.  A 1.4.3 macOS save is not compatible with the
+1.0.0 Android image and crashes the worker; no 1.0.0 save is present.
+
+The next blocker is therefore the **pre-title state machine / UI composite**,
+not texture upload.  The 0x3f scene content still has no 3D draw list in this
+state.
 
 Remaining first-frame/scene work:
 
@@ -687,13 +704,15 @@ Expected:
 
 ## 8. Next
 
-1. Fix the title/menu UI content: the per-target segments execute, but their
-   `360x69`/`180x34` targets read back zero.  Trace the bound PS textures'
-   guest storage and the multi-texture slot remap; the first UI segment must
-   show its atlas content before input can start a game.
+1. Finish the pre-title UI composite: the 96x96 BC4 font atlas uploads and
+   the first 360x69 UI target has sparse content, but the glyph/style inputs
+   and the final composite into `0x3f` are still zero.  Trace the UI vertex
+   stream/UI2F attributes and the title's composite pass rather than the atlas
+   upload.
 2. The `0x3f` 6-vertex pass is an intentional black fade (PS constant
-   `(0,0,0,1)`); confirm whether its fade parameter/host time advances.  A real
-   3D draw list to `0x3f` is still not recorded in the current title state.
+   `(0,0,0,1)`, VS scale ~0.001); confirm whether its fade parameter/host time
+   advances and what event ends the pre-title loop.  A real 3D draw list to
+   `0x3f` is still not recorded in this state.
 3. Reach gameplay: the HID ABI is fixed and scripted A/Plus reaches the guest,
    but the title does not transition.  A 1.4.3 macOS save is incompatible with
    the 1.0.0 Android image (worker SIGSEGV); use a 1.0.0 save or a host
