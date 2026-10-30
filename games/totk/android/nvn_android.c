@@ -63,6 +63,7 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index);
 static int nvn_is_empty_target(const void *tex);
 static int nvn_trace_inputs(void);
 static int nvn_trace_composite(void);
+static int nvn_trace_save_ui(void);
 static uint32_t nvn_first_nonzero(const uint8_t *p, size_t n, size_t cap);
 /* Evidence counters for the title/UI input trace. */
 static unsigned nvn_tex_writes, nvn_buf_maps, nvn_cb_copy_b2b, nvn_cb_copy_b2t;
@@ -274,6 +275,39 @@ static int nvn_global_ubo_get(int stage, int index, uint64_t *address, size_t *s
 /* Diagnostic crash context for the retired-pass investigation.  Enabled only
  * by TOTK_ANDROID_HOST_CRASH=1; the loader owns the production observer. */
 void runtime_guest_frame_report(uint64_t fp, uint64_t lr);
+static int nvn_crash_read_mem(uintptr_t addr, void *out, size_t n) {
+    int fd = open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ssize_t got = pread(fd, out, n, (off_t)addr);
+    close(fd);
+    return got == (ssize_t)n;
+}
+static uint64_t nvn_crash_u64(uintptr_t addr) {
+    uint64_t v = 0;
+    if (!nvn_crash_read_mem(addr, &v, sizeof v)) return 0;
+    return v;
+}
+static void nvn_crash_x8_dump(uint64_t x8) {
+    if (!x8) return;
+    uint64_t w[8] = {0};
+    if (!nvn_crash_read_mem((uintptr_t)x8, w, sizeof w)) return;
+    dprintf(2, "[guest-x8] %#llx: %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx\n",
+            (unsigned long long)x8, (unsigned long long)w[0], (unsigned long long)w[1],
+            (unsigned long long)w[2], (unsigned long long)w[3], (unsigned long long)w[4],
+            (unsigned long long)w[5], (unsigned long long)w[6], (unsigned long long)w[7]);
+    uint64_t p = nvn_crash_u64((uintptr_t)x8 + 0x30);
+    uint64_t c = nvn_crash_u64((uintptr_t)x8 + 0x28);
+    dprintf(2, "[guest-x8] +0x28=%#llx +0x30=%#llx\n",
+            (unsigned long long)c, (unsigned long long)p);
+    if (p) {
+        uint64_t q[6] = {0};
+        if (nvn_crash_read_mem((uintptr_t)p, q, sizeof q))
+            dprintf(2, "[guest-x8] data %#llx: %#llx %#llx %#llx %#llx %#llx %#llx\n",
+                    (unsigned long long)p, (unsigned long long)q[0], (unsigned long long)q[1],
+                    (unsigned long long)q[2], (unsigned long long)q[3],
+                    (unsigned long long)q[4], (unsigned long long)q[5]);
+    }
+}
 static void nvn_host_crash_raw(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *u = ctx;
     uintptr_t pc = 0, lr = 0, sp = 0;
@@ -288,6 +322,13 @@ static void nvn_host_crash_raw(int sig, siginfo_t *si, void *ctx) {
     dprintf(2, "[host-crash] raw sig=%d pc=%p lr=%p sp=%p fault=%p\n",
             sig, (void *)pc, (void *)lr, (void *)sp,
             si ? si->si_addr : NULL);
+    if (getenv("TOTK_ANDROID_CRASH_X8")) {
+        uint64_t x8 = 0;
+#if defined(__aarch64__)
+        x8 = u->uc_mcontext.regs[8];
+#endif
+        nvn_crash_x8_dump(x8);
+    }
     Dl_info di;
     uintptr_t base = 0;
     const char *name = "?";
@@ -953,6 +994,11 @@ static void nvnDeviceGetInteger(const nvn_dev_t *d, int what, int *out) { nvn_ap
     if (!d || !nvn_obj(d, NVN_MAGIC('D', 'E', 'V', 0), "nvnDeviceGetInteger") || !out) return;
     if (what >= 0 && (size_t)what < sizeof nvn_devinfo / sizeof *nvn_devinfo) *out = nvn_devinfo[what];
     else *out = 0;
+    if (nvn_trace_save_ui()) {
+        extern const char *runtime_fs_last_op(void);
+        fprintf(stderr, "[totk-save-ui] GetInteger what=%d -> %d fs=\"%s\"\n",
+                what, *out, runtime_fs_last_op());
+    }
 }
 static uint64_t nvnDeviceGetCurrentTimestampInNanoseconds(const nvn_dev_t *d) {
     (void)d;
@@ -1610,6 +1656,12 @@ static void nvnTextureBuilderSetGLTextureName(tex_builder_t *b, uint32_t n) { (v
 static size_t nvnTextureBuilderGetStorageSize(const tex_builder_t *b) { nvn_api("nvnTextureBuilderGetStorageSize");
     if (!b) return 0;
     tex_layout L; nvn_tex_layout(&b->d, &L);
+    if (nvn_trace_save_ui()) {
+        extern const char *runtime_fs_last_op(void);
+        fprintf(stderr, "[totk-save-ui] StorageSize target=%d fmt=%#x %ux%ux%u lv=%u size=%zu fs=\"%s\"\n",
+                b->d.target, b->d.format, b->d.width, b->d.height, b->d.depth,
+                b->d.levels, (size_t)L.size, runtime_fs_last_op());
+    }
     return (size_t)L.size;
 }
 static size_t nvnTextureBuilderGetStorageAlignment(const tex_builder_t *b) {
@@ -2920,6 +2972,15 @@ static void nvn_cb_draw_snapshot(cb_t *c) {
     d->window_texture = t->window_texture;
     d->color0_tex = t->color0_tex;
     d->cmd_index = c->ncmds ? c->ncmds - 1 : 0;
+    if (nvn_trace_save_ui()) {
+        const nvn_bind_state_t *b = d->have_state ? &d->state : NULL;
+        fprintf(stderr, "[totk-save-ui] draw cb=%p prog=%p tgt=%p %ux%u win=%d fmt=%#x"
+                        " draws=%d va=%#x ubo=%#x/%#x tex=%#x/%#x\n",
+                (void *)c, (void *)c->prog, (void *)d->color0_tex, d->width, d->height,
+                d->window_texture, d->layout.color_formats[0], c->draw_count,
+                b ? b->va_mask : 0, b ? b->ubo_mask[0] : 0, b ? b->ubo_mask[1] : 0,
+                b ? b->tex_mask[0][0] : 0, b ? b->tex_mask[1][0] : 0);
+    }
 }
 static const nvn_draw_snap_t *nvn_cb_last_draw(const cb_t *cb) {
     nvn_cb_target_t *t = nvn_cb_target(cb, 0);
@@ -4983,6 +5044,7 @@ static void nvnProgramFinalize(prog_t *p) {
         gfx_backend_reflected_pipeline_destroy((GfxReflectedPipeline *)p->gfx_reflected_pipeline);
         p->gfx_reflected_pipeline = NULL;
     }
+
     pthread_mutex_lock(&g_prog_lock);
     prog_shader_state_t *s = prog_state_remove(p);
     if (nvn_trace())
@@ -5042,6 +5104,12 @@ static uint32_t nvn_program_set_shaders(prog_t *p, int n, const void *shaders,
     if (nvn_trace())
         fprintf(stderr, "[totk-nvn] %s entry p=%p n=%d stride=%zu thread=%#x\n",
                 what, (void *)p, n, stride, runtime_thread_current_handle());
+    if (nvn_trace_save_ui()) {
+        uint64_t d0 = 0; const void *c0 = NULL;
+        if (n > 0 && shaders) { memcpy(&d0, shaders, 8); memcpy(&c0, (const uint8_t *)shaders + 8, 8); }
+        fprintf(stderr, "[totk-save-ui] set-shaders p=%p n=%d stride=%zu before_nstage=%u data0=%#llx ctl0=%p\n",
+                (void *)p, n, stride, p->nstage, (unsigned long long)d0, c0);
+    }
     p->nstage = (uint32_t)n;
 
     pthread_mutex_lock(&g_prog_lock);
@@ -5094,7 +5162,11 @@ static uint32_t nvn_program_set_shaders(prog_t *p, int n, const void *shaders,
             have_code = 1;
             resolved.why = "probe-synthetic";
         }
-        if (!have_code || !runtime_shader_identity(control, code, &id)) {
+        int have_id = have_code && runtime_shader_identity(control, code, &id);
+        if (nvn_trace_save_ui())
+            fprintf(stderr, "[totk-save-ui] stage-resolve p=%p slot=%d have_code=%d have_id=%d stage=%u code=%p\n",
+                    (void *)p, i, have_code, have_id, have_id ? id.stage : 99u, code);
+        if (!have_id) {
             fprintf(stderr, "[totk-nvn] %s program=%p slot=%d: no NVN shader identity"
                             " (control=%p data=%#llx code=%p why=%s)\n",
                     what, (void *)p, i, control, (unsigned long long)data, code,
@@ -5161,6 +5233,16 @@ static uint32_t nvn_program_set_shaders(prog_t *p, int n, const void *shaders,
                 fprintf(stderr, "[totk-nvn] warm pipeline program=%p -> %p\n",
                         (void *)p, (void *)rp);
         }
+    }
+    if (nvn_trace_save_ui()) {
+        uint64_t f28 = 0, f30 = 0, f38 = 0;
+        memcpy(&f28, (const uint8_t *)p + 0x28, 8);
+        memcpy(&f30, (const uint8_t *)p + 0x30, 8);
+        memcpy(&f38, (const uint8_t *)p + 0x38, 8);
+        fprintf(stderr, "[totk-save-ui] prog-fields %p n=%d nstage=%u data0=%#llx ctl0=%p f28=%#llx f30=%#llx f38=%#llx\n",
+                (void *)p, n, p->nstage, (unsigned long long)p->data[0],
+                (void *)p->control[0], (unsigned long long)f28,
+                (unsigned long long)f30, (unsigned long long)f38);
     }
     return 1;
 }
@@ -6325,6 +6407,14 @@ static int nvn_trace_inputs(void) {
     return enabled;
 }
 
+static int nvn_trace_save_ui(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("TOTK_ANDROID_TRACE_SAVE_UI");
+        enabled = e && *e;
+    }
+    return enabled;
+}
 static int nvn_trace_composite(void) {
     static int enabled = -1;
     if (enabled < 0) {
