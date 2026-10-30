@@ -611,18 +611,34 @@ The UI atlas investigation is **no longer an upload problem**:
 - the first 360x69 UI target now has **42 unique colours** (sparse content),
   and `probe-nvn-segment-targets` proves clear-only + alias sampling.
 
-The window is still **black** in this boot state: the `0x3f` pass is a
-6-vertex fade whose PS constant colour is `(0,0,0,1)` and whose VS scale is
-~0.001, so it is an intentional black/fade layer; the UI targets are not
-composited into `0x3f` yet.  The game accepts scripted Npad A/Plus input (HID
-ABI fixed), but it stays in a pre-title UI/loading loop: FS reads stop at
-`save:/option.sav`, no new asset/program/save appears, and input does not
-advance the state machine.  A 1.4.3 macOS save is not compatible with the
-1.0.0 Android image and crashes the worker; no 1.0.0 save is present.
+The UI composite into `0x3f` **exists**:
 
-The next blocker is therefore the **pre-title state machine / UI composite**,
-not texture upload.  The 0x3f scene content still has no 3D draw list in this
-state.
+```
+composite seg ... target=1920x1080 color0=0x336d9ad68 draws=12/78 nui=1
+  samples 180x34 mask + 96x96 BC4 font, UBO/VP 1920x1080
+composite-target 1920x1080 drew=1 first_nz=0 center=a68a565f
+```
+
+Immediately afterwards the engine records the 41-cmd **black fade**
+(`program=0x3670e7148`, 6 vertices, PS colour `(0,0,0,1)`, VS scale ~0.001)
+against the same `0x3f` texture, and that pass zeroes the target.  The window
+is therefore black even though the UI composite ran: the fade is a loading
+overlay, not a missing composite or texture.
+
+This is a **stuck pre-title loading screen**, not an atlas/upload problem:
+
+- the first 360x69 target contains only a 66x5 multicolour loading strip
+  (103 colours); later UI layers and the 180x34 mask are black;
+- FS operations stay at 11 and the last path is `save:/option.sav`; no new
+  asset, program, shader, save file or applet event follows;
+- scripted Npad A/Plus reaches the guest main thread (`buttons=0x1`) but does
+  not advance the state machine;
+- a 1.4.3 macOS save is incompatible with the 1.0.0 Android image (worker
+  SIGSEGV); no 1.0.0 save is present.
+
+The next blocker is the **guest pre-title load/job barrier** that should
+complete the loading fade and let the UI composite survive.  No 3D draw list
+to `0x3f` is recorded in this state.
 
 Remaining first-frame/scene work:
 
@@ -704,15 +720,15 @@ Expected:
 
 ## 8. Next
 
-1. Finish the pre-title UI composite: the 96x96 BC4 font atlas uploads and
-   the first 360x69 UI target has sparse content, but the glyph/style inputs
-   and the final composite into `0x3f` are still zero.  Trace the UI vertex
-   stream/UI2F attributes and the title's composite pass rather than the atlas
-   upload.
-2. The `0x3f` 6-vertex pass is an intentional black fade (PS constant
-   `(0,0,0,1)`, VS scale ~0.001); confirm whether its fade parameter/host time
-   advances and what event ends the pre-title loop.  A real 3D draw list to
-   `0x3f` is still not recorded in this state.
+1. Fix the stuck pre-title load/job barrier: the UI composite into `0x3f`
+   works (`center=a68a565f`), but the later black fade overwrites it and the
+   loading strip never advances.  Trace the guest load job/thread and the
+   `save:/option.sav` path; the renderer/composite is not the missing edge.
+2. Only the first 360x69 target has a 66x5 loading strip; later UI layers and
+   the 180x34 mask stay black.  If the loading barrier completes, re-check the
+   UI vertex/UI2F and glyph/style inputs before expecting title text.
+3. A real 3D draw list to `0x3f` is still not recorded in this state; it should
+   appear after the pre-title load completes and a new game/save is selected.
 3. Reach gameplay: the HID ABI is fixed and scripted A/Plus reaches the guest,
    but the title does not transition.  A 1.4.3 macOS save is incompatible with
    the 1.0.0 Android image (worker SIGSEGV); use a 1.0.0 save or a host
