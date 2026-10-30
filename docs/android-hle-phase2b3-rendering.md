@@ -636,9 +636,41 @@ This is a **stuck pre-title loading screen**, not an atlas/upload problem:
 - a 1.4.3 macOS save is incompatible with the 1.0.0 Android image (worker
   SIGSEGV); no 1.0.0 save is present.
 
-The next blocker is the **guest pre-title load/job barrier** that should
-complete the loading fade and let the UI composite survive.  No 3D draw list
-to `0x3f` is recorded in this state.
+The next blocker was a **guest pre-title load/job barrier**, not the
+renderer.  `TOTK_ANDROID_TRACE_LOAD=2` shows the load job *is* running: the
+address-arbiter signals reach every worker wait address, and the game streams
+RomFS assets after `option.sav`.  It stopped on missing base-XCI event assets,
+notably:
+
+```
+Event/EventFlow/Dm_OP_0001.bfevfl.zs
+Event/EventFlow/Dm_OP_0001_Effect.bfevfl.zs
+Sound/Resource/Pack_SpecialPower.bars.zs
+UI/CtrlGuideSetTable/...
+UI/Album/Default_00_Photo.jpg.zs
+```
+
+Those files were extracted selectively from the base XCI (without writing the
+full 17 GB RomFS) and pushed to the device tree; the FS path then advanced and
+the game wrote `save:/album/000_Photo.jpg`.  It still does not reach the title
+or record a 3D draw list to `0x3f`; the loading strip remains at its first
+fill.  The remaining missing paths are mostly update-only event-setting/UI
+resources (`Event/EventSetting/.../RecordMovieEventSetting/*`, TexToGo, world
+manager) and should be checked against a real 1.0.0 tree before treating them
+as required.
+
+Host-side work in this round:
+
+- texture-pool registrations are now generation/epoch bounded
+  (`probe-nvn-pool-lifetime`: 40,000 registrations, max 32,768, no map-full);
+- retired scene drains are serialized and the texture bridge is locked
+  (`probe-nvn-retired-stress`: 500 iterations);
+- the scripted Npad path now parses input before the SDK state-count check and
+  connects the JoyDual/JoyLeft/JoyRight states, so a title that polls one of
+  those sees the scripted A/Plus.
+
+No 3D draw list to `0x3f` is recorded in this state.  A 1.0.0 save is still
+absent; the 1.4.3 macOS save is incompatible and crashes a worker.
 
 Remaining first-frame/scene work:
 
