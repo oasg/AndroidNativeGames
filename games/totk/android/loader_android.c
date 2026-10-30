@@ -362,6 +362,39 @@ static void *probe_thread(void *unused) {
     return NULL;
 }
 
+/* Guest frame names for the thread dump (threads.c calls this weak hook).
+ * Prefer the nearest defined symbol in the mapped module, so a dump names
+ * the load/job function instead of only main+0x.... */
+void runtime_describe_address(uint64_t addr, char *out, size_t cap) {
+    for (unsigned i = 0; i < NMODULES; i++) {
+        uintptr_t b = (uintptr_t)modules[i].base;
+        if (addr < b || addr >= b + modules[i].size) continue;
+        uint64_t off = addr - b;
+        const Symbol *best = NULL;
+        for (unsigned k = 1; k < modules[i].nsym; k++) {
+            const Symbol *sy = &modules[i].symbols[k];
+            if (!sy->defined || !sy->name || sy->value > off) continue;
+            if (sy->size && off < sy->value + sy->size &&
+                (!best || sy->value > best->value))
+                best = sy;
+        }
+        if (best)
+            snprintf(out, cap, "%s+0x%llx", best->name,
+                     (unsigned long long)(off - best->value));
+        else
+            snprintf(out, cap, "%s+0x%llx", modules[i].name, (unsigned long long)off);
+        return;
+    }
+    Dl_info di;
+    if (dladdr((void *)(uintptr_t)addr, &di) && di.dli_fname) {
+        const char *base = strrchr(di.dli_fname, '/');
+        snprintf(out, cap, "%s+0x%llx", base ? base + 1 : di.dli_fname,
+                 (unsigned long long)(addr - (uintptr_t)di.dli_fbase));
+        return;
+    }
+    snprintf(out, cap, "0x%llx", (unsigned long long)addr);
+}
+
 /* Module-relative name for a crash address, with a host symbol fallback. */
 static void describe_address(uint64_t addr, char *out, size_t cap) {
     for (unsigned i = 0; i < NMODULES; i++) {
@@ -2268,6 +2301,17 @@ int main(int argc, char **argv) {
             return 1;
         }
         printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-cb-call\"}\n");
+        return 0;
+    }
+    if (!strcmp(argv[2], "probe-nvn-pool-lifetime")) {
+        int runtime_nvn_pool_lifetime_selftest(void);
+        unsigned runtime_nvn_tex_pool_max(void);
+        if (!runtime_nvn_pool_lifetime_selftest()) {
+            fprintf(stderr, "[totk-nvn] pool lifetime selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-pool-lifetime\","
+               "\"registrations\":40000,\"max_entries\":%u}\n", runtime_nvn_tex_pool_max());
         return 0;
     }
     if (!strcmp(argv[2], "probe-vi")) {

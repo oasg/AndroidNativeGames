@@ -7,6 +7,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <time.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -28,7 +30,15 @@ static uint64_t language_code(void) {
     else memcpy(code, "en-US", 5);
     uint64_t v; memcpy(&v, code, sizeof v); return v;
 }
-static void oe_init(void) { fprintf(stderr, "[totk-android] nn::oe initialized on the host\n"); }
+static void oe_push_message(uint32_t message);
+static int oe_focus_pushed;
+static void oe_init(void) {
+    fprintf(stderr, "[totk-android] nn::oe initialized on the host\n");
+    if (!oe_focus_pushed) {
+        oe_focus_pushed = 1;
+        oe_push_message(15);   /* focus gained, as the macOS window delegate sends */
+    }
+}
 static uint64_t oe_desired_language(void) { return language_code(); }
 static int oe_operation_mode(void) { return handheld() ? 0 : 1; }
 static int oe_performance_mode(void) { return handheld() ? 0 : 1; }
@@ -46,13 +56,52 @@ static uint64_t oe_set_expected_volume_balance(float main_volume, float library_
     (void)library_volume;
     return 0;
 }
-/* The SDK implementation waits on a notification SystemEvent that the host
- * nn::oe::Initialize does not attach.  There are no host notifications yet. */
-static int oe_try_pop_notification_message(uint32_t *message) {
-    if (message) *message = 0;
-    return 0;
+/* nn::oe notification queue.  The macOS frontend pushes message 15 when the
+ * window gains focus; the game enables focus handling and its pre-title loop
+ * waits for that notification.  Android has no window-focus callback, so
+ * deliver one queued focus message from oe::Initialize. */
+static pthread_mutex_t oe_msg_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t oe_msg_cv = PTHREAD_COND_INITIALIZER;
+static uint32_t oe_msgs[16];
+static unsigned oe_msg_head, oe_msg_tail;
+static unsigned oe_try_calls, oe_pop_calls;
+static void oe_push_message(uint32_t message) {
+    pthread_mutex_lock(&oe_msg_lock);
+    if (oe_msg_tail - oe_msg_head < 16) oe_msgs[oe_msg_tail++ % 16] = message;
+    pthread_cond_broadcast(&oe_msg_cv);
+    pthread_mutex_unlock(&oe_msg_lock);
 }
-static uint64_t oe_pop_notification_message(void) { return 0; }
+unsigned runtime_oe_try_calls(void) { return __atomic_load_n(&oe_try_calls, __ATOMIC_RELAXED); }
+unsigned runtime_oe_pop_calls(void) { return __atomic_load_n(&oe_pop_calls, __ATOMIC_RELAXED); }
+static int oe_load_trace(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("TOTK_ANDROID_TRACE_LOAD") != NULL;
+    return on;
+}
+static int oe_try_pop_notification_message(uint32_t *message) {
+    pthread_mutex_lock(&oe_msg_lock);
+    int ok = oe_msg_head != oe_msg_tail;
+    uint32_t m = ok ? oe_msgs[oe_msg_head++ % 16] : 0;
+    pthread_mutex_unlock(&oe_msg_lock);
+    if (message) *message = m;
+    if (oe_load_trace() && oe_try_calls++ < 24)
+        fprintf(stderr, "[totk-load] oe TryPopNotification -> %d msg=%u\n", ok, m);
+    return ok;
+}
+static uint64_t oe_pop_notification_message(void) {
+    pthread_mutex_lock(&oe_msg_lock);
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += 100000000;
+    if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+    while (oe_msg_head == oe_msg_tail &&
+           pthread_cond_timedwait(&oe_msg_cv, &oe_msg_lock, &ts) == 0) {}
+    uint64_t m = oe_msg_head != oe_msg_tail ? oe_msgs[oe_msg_head++ % 16] : 0;
+    pthread_mutex_unlock(&oe_msg_lock);
+    if (oe_load_trace() && oe_pop_calls++ < 24)
+        fprintf(stderr, "[totk-load] oe PopNotification -> %llu\n", (unsigned long long)m);
+    return m;
+}
 static int oe_focus_mode(int mode) { fprintf(stderr, "[totk-android] focus handling mode %d\n", mode); return 0; }
 static int oe_performance_config(int mode, int config) { fprintf(stderr, "[totk-android] performance configuration mode=%d config=%#x\n", mode, config); return 0; }
 static int oe_cpu_boost(int mode) { fprintf(stderr, "[totk-android] CPU boost mode %d\n", mode); return 0; }
