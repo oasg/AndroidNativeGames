@@ -22,7 +22,13 @@
  * immediately, so only the busy-state tracking remains. */
 static void runtime_autoload_save_file_opened(const char *path) { (void)path; }
 void dm_guest_write_prepare(void *addr, size_t n) { (void)addr; (void)n; }
+static unsigned long g_fs_ops;
+static char g_fs_last[192];
+unsigned long runtime_fs_ops(void) { return __atomic_load_n(&g_fs_ops, __ATOMIC_RELAXED); }
+const char *runtime_fs_last_op(void) { return g_fs_last; }
 void runtime_fs_log(const char *what, const char *path) {
+    __atomic_add_fetch(&g_fs_ops, 1, __ATOMIC_RELAXED);
+    snprintf(g_fs_last, sizeof g_fs_last, "%s %s", what, path ? path : "?");
     fprintf(stderr, "[totk-android] fs %s %s\n", what, path ? path : "?");
 }
 /* The guest's account service is not implemented yet; a single local user is

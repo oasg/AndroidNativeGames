@@ -5841,13 +5841,44 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
         }
     }
     if (rp) {
-        uint32_t cap = sg->ncmds ? sg->ncmds : 1;
+        /* UI recordings usually set their 360x69 viewport/scissor once, before
+         * the first SetRenderTargets.  The per-target split starts each later
+         * segment at its SetRenderTargets, so without this replay those
+         * segments rasterize with the 0x0 default viewport. */
+        nvn_cmd_t prefix[2];
+        uint32_t npre = 0;
+        if (lw <= 512) {
+            const nvn_cmd_t *vp = NULL, *sc = NULL;
+            int seg_vp = 0, seg_sc = 0;
+            for (uint32_t ci = 0; ci < sg->first_cmd; ci++) {
+                if (e->cmds[ci].kind == NVN_CMD_SET_VIEWPORT) vp = &e->cmds[ci];
+                else if (e->cmds[ci].kind == NVN_CMD_SET_SCISSOR) sc = &e->cmds[ci];
+            }
+            for (uint32_t ci = sg->first_cmd; ci < sg->first_cmd + sg->ncmds; ci++) {
+                if (e->cmds[ci].kind == NVN_CMD_SET_VIEWPORT) seg_vp = 1;
+                else if (e->cmds[ci].kind == NVN_CMD_SET_SCISSOR) seg_sc = 1;
+            }
+            if (vp && !seg_vp) prefix[npre++] = *vp;
+            if (sc && !seg_sc) prefix[npre++] = *sc;
+        }
+        uint32_t cap = (sg->ncmds ? sg->ncmds : 1) + npre;
         GfxCmd *translated = calloc(cap, sizeof *translated);
         if (translated) {
             float clear[4] = { 0.05f, 0.08f, 0.12f, 1.0f };
             int has_clear = 0;
-            uint32_t count = nvn_translate_commands(&view, translated, cap, rt,
-                                                    clear, &has_clear);
+            uint32_t base = 0;
+            if (npre) {
+                cb_t pv = view;
+                nvn_cmd_t pre[2];
+                memcpy(pre, prefix, npre * sizeof *pre);
+                pv.cmds = pre;
+                pv.ncmds = npre;
+                float pclear[4] = { 0, 0, 0, 0 };
+                int phas_clear = 0;
+                base = nvn_translate_commands(&pv, translated, npre, rt, pclear, &phas_clear);
+            }
+            uint32_t count = nvn_translate_commands(&view, translated + base,
+                                                    cap - base, rt, clear, &has_clear) + base;
             nvn_remap_texture_bind_cmds(translated, count, rp);
             nvn_apply_bind_state(p, rp, bs, &view);
             GfxVertexStream streams[16];
@@ -6222,6 +6253,17 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                         l2_frame, shot ? "ok" : "failed");
         }
         unsigned total = __atomic_add_fetch(&nvn_nvn_draws, 1, __ATOMIC_RELAXED);
+        if (getenv("TOTK_ANDROID_TRACE_TITLE") && (total % 300) == 0) {
+            extern unsigned long runtime_fs_ops(void);
+            extern const char *runtime_fs_last_op(void);
+            extern unsigned long runtime_hid_polls(void);
+            extern uint32_t runtime_hid_buttons(void);
+            fprintf(stderr, "[totk-title] draw=%u record=%u scene=%u/%u queued=%u empty=%u"
+                            " fs=%lu last=\"%s\" hid=%lu buttons=%#x\n",
+                    total, nvn_record_count, nvn_scene_rendered, nvn_scene_submits,
+                    nvn_scene_queued, nvn_empty_sampled, runtime_fs_ops(),
+                    runtime_fs_last_op(), runtime_hid_polls(), runtime_hid_buttons());
+        }
         if (total <= 32 || (total % 300) == 0 || nvn_trace())
             fprintf(stderr, "[totk-nvn] NVN draw #%u program=%p window=%p vertices=%d%s%s\n",
                     total, (void *)p, (void *)w, cb->draw_count,
