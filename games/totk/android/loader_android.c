@@ -2303,6 +2303,17 @@ int main(int argc, char **argv) {
         printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-cb-call\"}\n");
         return 0;
     }
+    if (!strcmp(argv[2], "probe-nvn-pool-lifetime")) {
+        int runtime_nvn_pool_lifetime_selftest(void);
+        unsigned runtime_nvn_tex_pool_max(void);
+        if (!runtime_nvn_pool_lifetime_selftest()) {
+            fprintf(stderr, "[totk-nvn] pool lifetime selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-pool-lifetime\","
+               "\"registrations\":40000,\"max_entries\":%u}\n", runtime_nvn_tex_pool_max());
+        return 0;
+    }
     if (!strcmp(argv[2], "probe-vi")) {
         int runtime_vi_selftest(void);
         if (!runtime_vi_selftest()) { fprintf(stderr, "[totk-vi] selftest FAIL\n"); return 1; }

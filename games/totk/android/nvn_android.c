@@ -466,6 +466,7 @@ static const tex_t *nvn_tex_registry_find(const void *p) {
 
 typedef struct {
     uint32_t magic, n;
+    uint32_t gen, epoch;      /* host-side generation and last-use frame */
     pool_t *pool;
     int64_t off;
 } tex_pool_t;
@@ -588,22 +589,34 @@ typedef struct { uint32_t magic; samp_par p; } samp_t;
 typedef struct { const samp_t *samp; GfxSampler *gfx; } samp_bridge_t;
 static samp_bridge_t g_samp_bridges[64];
 static unsigned g_samp_bridge_count;
-typedef struct { uint32_t magic, n; pool_t *pool; int64_t off; } samp_pool_t;
+typedef struct { uint32_t magic, n; uint32_t gen, epoch; pool_t *pool; int64_t off; } samp_pool_t;
 
-/* NVN texture/sampler pool registrations.  The pool objects themselves are
- * guest-sized (0x20 bytes), so the id -> object map lives on the host. */
-typedef struct { const tex_pool_t *pool; int id; const tex_t *tex; } tex_pool_map_t;
-typedef struct { const samp_pool_t *pool; int id; const samp_t *samp; } samp_pool_map_t;
-/* The boot scene registers more than a thousand textures (810 by the first
- * NVN submit in the 1.0.0 boot path) plus samplers, so the old 256-entry
- * tables silently dropped registrations and every later BindTexture resolved
- * to NULL.  Keep enough room for a full scene and report overflow instead of
- * hiding it. */
-#define NVN_POOL_MAP_MAX 16384
+/* NVN texture/sampler pool registrations.  The pool object itself is
+ * guest-sized (0x20 bytes); the host map is generation-aware and bounded. */
+#define NVN_POOL_MAP_MAX 32768
+#define NVN_POOL_BUCKETS 8192
+typedef struct {
+    const tex_pool_t *pool;
+    const tex_t *tex;
+    uint32_t id, gen, sig, age;
+    int32_t next;
+} tex_pool_map_t;
+typedef struct {
+    const samp_pool_t *pool;
+    const samp_t *samp;
+    uint32_t id, gen, age;
+    int32_t next;
+} samp_pool_map_t;
 static tex_pool_map_t g_tex_pool_map[NVN_POOL_MAP_MAX];
-static unsigned g_tex_pool_map_count;
 static samp_pool_map_t g_samp_pool_map[NVN_POOL_MAP_MAX];
-static unsigned g_samp_pool_map_count;
+static int32_t g_tex_buckets[NVN_POOL_BUCKETS];
+static int32_t g_samp_buckets[NVN_POOL_BUCKETS];
+static int32_t g_tex_free, g_samp_free;
+static unsigned g_tex_pool_map_count, g_samp_pool_map_count;
+static unsigned g_tex_pool_full, g_samp_pool_full, g_tex_pool_max;
+static uint32_t g_pool_clock = 1, g_pool_epoch = 1;
+static int g_pool_map_ready;
+static pthread_mutex_t g_pool_map_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
     uint32_t magic, nstage;
@@ -2211,69 +2224,252 @@ static uint32_t nvnSamplerCompare(const samp_t *a, const samp_t *b) {
 }
 static uint64_t nvnSamplerGetDebugID(const samp_t *s) { return s ? (uint64_t)(uintptr_t)s : 0; }
 
-/* Pools of descriptors. */
-static void nvn_tex_pool_forget(const tex_pool_t *p) {
-    unsigned n = 0;
-    for (unsigned i = 0; i < g_tex_pool_map_count; i++)
-        if (g_tex_pool_map[i].pool != p) g_tex_pool_map[n++] = g_tex_pool_map[i];
-    g_tex_pool_map_count = n;
+/* Pools of descriptors.  The map is a chained hash keyed by (pool,id), with
+ * a host generation and last-use frame in each pool.  A pool object reused
+ * without Initialize has a different n/off/pool signature, so old entries
+ * cannot resolve to the new contents.  At cap only stale generations and
+ * pools unused for more than two frames are pruned; a live current entry is
+ * never evicted. */
+static int tex_pool_valid(const tex_pool_t *p) {
+    return p && p->magic == NVN_MAGIC('T', 'P', 'O', 'L') &&
+           p->n > 0 && p->n <= 0x100000 && p->off >= 0 && !(p->off & 3);
 }
-static void nvn_tex_pool_add(const tex_pool_t *p, int id, const tex_t *t) {
-    for (unsigned i = 0; i < g_tex_pool_map_count; i++)
-        if (g_tex_pool_map[i].pool == p && g_tex_pool_map[i].id == id) {
-            g_tex_pool_map[i].tex = t;
+static uint32_t tex_pool_sig(const tex_pool_t *p) {
+    return (uint32_t)((uintptr_t)p->pool >> 4) * 2654435761u ^
+           (uint32_t)p->off ^ p->n * 40503u;
+}
+static unsigned pool_home(const void *p, int id) {
+    uint64_t h = (uint64_t)(uintptr_t)p ^ ((uint64_t)(uint32_t)id << 32);
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33;
+    return (unsigned)h & (NVN_POOL_BUCKETS - 1);
+}
+static int pool_old(const tex_pool_t *p) {
+    return (int32_t)(g_pool_epoch - p->epoch) > 2;
+}
+static void pool_map_init_locked(void) {
+    if (g_pool_map_ready) return;
+    for (unsigned i = 0; i < NVN_POOL_BUCKETS; i++) {
+        g_tex_buckets[i] = g_samp_buckets[i] = -1;
+    }
+    for (unsigned i = 0; i < NVN_POOL_MAP_MAX; i++) {
+        g_tex_pool_map[i].next = i + 1 < NVN_POOL_MAP_MAX ? (int32_t)i + 1 : -1;
+        g_samp_pool_map[i].next = i + 1 < NVN_POOL_MAP_MAX ? (int32_t)i + 1 : -1;
+    }
+    g_tex_free = g_samp_free = 0;
+    g_pool_map_ready = 1;
+}
+static void tex_pool_unlink_locked(int32_t idx) {
+    unsigned b = pool_home(g_tex_pool_map[idx].pool, (int)g_tex_pool_map[idx].id);
+    int32_t prev = -1, cur = g_tex_buckets[b];
+    while (cur >= 0) {
+        if (cur == idx) {
+            if (prev < 0) g_tex_buckets[b] = g_tex_pool_map[cur].next;
+            else g_tex_pool_map[prev].next = g_tex_pool_map[cur].next;
+            g_tex_pool_map[cur].next = g_tex_free;
+            g_tex_free = cur;
+            if (g_tex_pool_map_count) g_tex_pool_map_count--;
             return;
         }
-    if (g_tex_pool_map_count < sizeof g_tex_pool_map / sizeof g_tex_pool_map[0]) {
-        g_tex_pool_map[g_tex_pool_map_count++] = (tex_pool_map_t){ p, id, t };
-    } else {
-        static int warned;
-        if (!warned++) fprintf(stderr, "[totk-nvn] ERROR texture pool map full (%u registrations); later binds resolve NULL\n",
-                               g_tex_pool_map_count);
+        prev = cur; cur = g_tex_pool_map[cur].next;
     }
 }
+static void tex_pool_prune_locked(void) {
+    for (unsigned b = 0; b < NVN_POOL_BUCKETS; b++) {
+        int32_t prev = -1, cur = g_tex_buckets[b];
+        while (cur >= 0) {
+            tex_pool_map_t *e = &g_tex_pool_map[cur];
+            const tex_pool_t *p = e->pool;
+            int dead = !tex_pool_valid(p) || e->gen != p->gen ||
+                       e->sig != tex_pool_sig(p) || pool_old(p);
+            int32_t next = e->next;
+            if (dead) {
+                if (prev < 0) g_tex_buckets[b] = next;
+                else g_tex_pool_map[prev].next = next;
+                e->next = g_tex_free; g_tex_free = cur;
+                if (g_tex_pool_map_count) g_tex_pool_map_count--;
+            } else {
+                prev = cur;
+            }
+            cur = next;
+        }
+    }
+}
+static void nvn_tex_pool_forget(const tex_pool_t *p) {
+    pthread_mutex_lock(&g_pool_map_lock);
+    pool_map_init_locked();
+    for (unsigned b = 0; b < NVN_POOL_BUCKETS; b++) {
+        int32_t prev = -1, cur = g_tex_buckets[b];
+        while (cur >= 0) {
+            tex_pool_map_t *e = &g_tex_pool_map[cur];
+            int32_t next = e->next;
+            if (e->pool == p) {
+                if (prev < 0) g_tex_buckets[b] = next;
+                else g_tex_pool_map[prev].next = next;
+                e->next = g_tex_free; g_tex_free = cur;
+                if (g_tex_pool_map_count) g_tex_pool_map_count--;
+            } else {
+                prev = cur;
+            }
+            cur = next;
+        }
+    }
+    pthread_mutex_unlock(&g_pool_map_lock);
+}
+static void nvn_tex_pool_add(const tex_pool_t *p, int id, const tex_t *t) {
+    if (!tex_pool_valid(p)) return;
+    pthread_mutex_lock(&g_pool_map_lock);
+    pool_map_init_locked();
+    uint32_t sig = tex_pool_sig(p);
+    unsigned b = pool_home(p, id);
+    for (int32_t cur = g_tex_buckets[b]; cur >= 0; cur = g_tex_pool_map[cur].next) {
+        tex_pool_map_t *e = &g_tex_pool_map[cur];
+        if (e->pool == p && e->id == (uint32_t)id) {
+            e->tex = t; e->gen = p->gen; e->sig = sig;
+            e->age = ++g_pool_clock; ((tex_pool_t *)p)->epoch = g_pool_epoch;
+            pthread_mutex_unlock(&g_pool_map_lock);
+            return;
+        }
+    }
+    if (g_tex_free < 0) {
+        tex_pool_prune_locked();
+        if (g_tex_free < 0) {
+            g_tex_pool_full++;
+            static int warned;
+            if (!warned++) fprintf(stderr, "[totk-nvn] ERROR texture pool map full (%u registrations); later binds resolve NULL\n",
+                                   g_tex_pool_map_count);
+            pthread_mutex_unlock(&g_pool_map_lock);
+            return;
+        }
+    }
+    int32_t idx = g_tex_free;
+    g_tex_free = g_tex_pool_map[idx].next;
+    tex_pool_map_t *e = &g_tex_pool_map[idx];
+    e->pool = p; e->tex = t; e->id = (uint32_t)id; e->gen = p->gen; e->sig = sig;
+    e->age = ++g_pool_clock;
+    e->next = g_tex_buckets[b];
+    g_tex_buckets[b] = idx;
+    g_tex_pool_map_count++;
+    if (g_tex_pool_map_count > g_tex_pool_max) g_tex_pool_max = g_tex_pool_map_count;
+    ((tex_pool_t *)p)->epoch = g_pool_epoch;
+    pthread_mutex_unlock(&g_pool_map_lock);
+}
 static const tex_t *nvn_tex_pool_lookup(const tex_pool_t *p, int id) {
-    for (unsigned i = 0; i < g_tex_pool_map_count; i++)
-        if (g_tex_pool_map[i].pool == p && g_tex_pool_map[i].id == id)
-            return g_tex_pool_map[i].tex;
+    if (!tex_pool_valid(p)) return NULL;
+    pthread_mutex_lock(&g_pool_map_lock);
+    pool_map_init_locked();
+    uint32_t sig = tex_pool_sig(p);
+    unsigned b = pool_home(p, id);
+    int32_t prev = -1, cur = g_tex_buckets[b];
+    while (cur >= 0) {
+        tex_pool_map_t *e = &g_tex_pool_map[cur];
+        int32_t next = e->next;
+        if (e->pool == p && e->id == (uint32_t)id) {
+            if (e->gen != p->gen || e->sig != sig) {
+                if (prev < 0) g_tex_buckets[b] = next;
+                else g_tex_pool_map[prev].next = next;
+                e->next = g_tex_free; g_tex_free = cur;
+                if (g_tex_pool_map_count) g_tex_pool_map_count--;
+                pthread_mutex_unlock(&g_pool_map_lock);
+                return NULL;
+            }
+            e->age = ++g_pool_clock; ((tex_pool_t *)p)->epoch = g_pool_epoch;
+            const tex_t *t = e->tex;
+            pthread_mutex_unlock(&g_pool_map_lock);
+            return t;
+        }
+        prev = cur; cur = next;
+    }
+    pthread_mutex_unlock(&g_pool_map_lock);
     return NULL;
 }
 unsigned runtime_nvn_tex_pool_regs(void) { return g_tex_pool_map_count; }
+unsigned runtime_nvn_tex_pool_full(void) { return g_tex_pool_full; }
+unsigned runtime_nvn_tex_pool_max(void) { return g_tex_pool_max; }
+
+static int samp_pool_valid(const samp_pool_t *p) {
+    return p && p->magic == NVN_MAGIC('S', 'P', 'O', 'L') &&
+           p->n > 0 && p->n <= 0x100000 && p->off >= 0 && !(p->off & 3);
+}
 static void nvn_samp_pool_forget(const samp_pool_t *p) {
+    pthread_mutex_lock(&g_pool_map_lock);
+    pool_map_init_locked();
+    int32_t prev = -1, cur = -1;
+    (void)prev; (void)cur;
     unsigned n = 0;
     for (unsigned i = 0; i < g_samp_pool_map_count; i++)
         if (g_samp_pool_map[i].pool != p) g_samp_pool_map[n++] = g_samp_pool_map[i];
     g_samp_pool_map_count = n;
+    pthread_mutex_unlock(&g_pool_map_lock);
 }
 static void nvn_samp_pool_add(const samp_pool_t *p, int id, const samp_t *s) {
+    if (!samp_pool_valid(p)) return;
+    pthread_mutex_lock(&g_pool_map_lock);
+    pool_map_init_locked();
     for (unsigned i = 0; i < g_samp_pool_map_count; i++)
-        if (g_samp_pool_map[i].pool == p && g_samp_pool_map[i].id == id) {
-            g_samp_pool_map[i].samp = s;
+        if (g_samp_pool_map[i].pool == p && g_samp_pool_map[i].id == (uint32_t)id) {
+            g_samp_pool_map[i].samp = s; g_samp_pool_map[i].gen = p->gen;
+            g_samp_pool_map[i].age = ++g_pool_clock; ((samp_pool_t *)p)->epoch = g_pool_epoch;
+            pthread_mutex_unlock(&g_pool_map_lock);
             return;
         }
-    if (g_samp_pool_map_count < sizeof g_samp_pool_map / sizeof g_samp_pool_map[0]) {
-        g_samp_pool_map[g_samp_pool_map_count++] = (samp_pool_map_t){ p, id, s };
-    } else {
-        static int warned;
-        if (!warned++) fprintf(stderr, "[totk-nvn] ERROR sampler pool map full (%u registrations); later binds resolve NULL\n",
-                               g_samp_pool_map_count);
+    unsigned n = 0;
+    for (unsigned i = 0; i < g_samp_pool_map_count; i++) {
+        samp_pool_map_t *e = &g_samp_pool_map[i];
+        if (!samp_pool_valid(e->pool) || e->gen != e->pool->gen ||
+            (int32_t)(g_pool_epoch - e->pool->epoch) > 2) continue;
+        if (n != i) g_samp_pool_map[n] = *e;
+        n++;
     }
+    g_samp_pool_map_count = n;
+    if (g_samp_pool_map_count >= NVN_POOL_MAP_MAX) {
+        g_samp_pool_full++;
+        pthread_mutex_unlock(&g_pool_map_lock);
+        return;
+    }
+    samp_pool_map_t *e = &g_samp_pool_map[g_samp_pool_map_count++];
+    e->pool = p; e->samp = s; e->id = (uint32_t)id; e->gen = p->gen;
+    e->age = ++g_pool_clock;
+    ((samp_pool_t *)p)->epoch = g_pool_epoch;
+    pthread_mutex_unlock(&g_pool_map_lock);
 }
 static const samp_t *nvn_samp_pool_lookup(const samp_pool_t *p, int id) {
-    for (unsigned i = 0; i < g_samp_pool_map_count; i++)
-        if (g_samp_pool_map[i].pool == p && g_samp_pool_map[i].id == id)
-            return g_samp_pool_map[i].samp;
+    if (!samp_pool_valid(p)) return NULL;
+    pthread_mutex_lock(&g_pool_map_lock);
+    pool_map_init_locked();
+    for (unsigned i = 0; i < g_samp_pool_map_count; i++) {
+        samp_pool_map_t *e = &g_samp_pool_map[i];
+        if (e->pool == p && e->id == (uint32_t)id) {
+            if (e->gen != p->gen) { pthread_mutex_unlock(&g_pool_map_lock); return NULL; }
+            e->age = ++g_pool_clock; ((tex_pool_t *)p)->epoch = g_pool_epoch;
+            const samp_t *s = e->samp;
+            pthread_mutex_unlock(&g_pool_map_lock);
+            return s;
+        }
+    }
+    pthread_mutex_unlock(&g_pool_map_lock);
     return NULL;
+}
+static void nvn_pool_epoch_tick(void) {
+    uint32_t e = __atomic_add_fetch(&g_pool_epoch, 1, __ATOMIC_RELAXED);
+    if (!e) __atomic_store_n(&g_pool_epoch, 1, __ATOMIC_RELAXED);
 }
 
 static uint32_t nvnTexturePoolInitialize(tex_pool_t *p, const pool_t *pool, ptrdiff_t off, int n) { nvn_api("nvnTexturePoolInitialize");
     if (!p || !nvn_obj(pool, NVN_MAGIC('P', 'O', 'O', 'L'), "nvnTexturePoolInitialize(pool)")) return 0;
     if (n < 0) { nvn_fail("nvnTexturePoolInitialize", "negative count"); return 0; }
+    uint32_t gen = p->magic == NVN_MAGIC('T', 'P', 'O', 'L') ? p->gen + 1 : 1;
+    if (!gen) gen = 1;
     memset(p, 0, sizeof *p);
     p->magic = NVN_MAGIC('T', 'P', 'O', 'L'); p->pool = (pool_t *)pool; p->off = off; p->n = (uint32_t)n;
+    p->gen = gen; p->epoch = g_pool_epoch;
     return 1;
 }
-static void nvnTexturePoolFinalize(tex_pool_t *p) { if (p) { nvn_tex_pool_forget(p); nvn_pool_forget(p); p->magic = 0; } }
+static void nvnTexturePoolFinalize(tex_pool_t *p) {
+    if (!p) return;
+    nvn_tex_pool_forget(p);
+    if (p->magic == NVN_MAGIC('T', 'P', 'O', 'L')) p->gen++;
+    nvn_pool_forget(p); p->magic = 0;
+}
 static void nvnTexturePoolSetDebugLabel(tex_pool_t *p, const char *l) { (void)p; (void)l; }
 static void nvnTexturePoolRegisterTexture(const tex_pool_t *p, int id, const tex_t *t, const void *v) { nvn_api("nvnTexturePoolRegisterTexture");
     (void)v;
@@ -2291,12 +2487,20 @@ static int nvnTexturePoolGetSize(const tex_pool_t *p) { return p ? (int)p->n : 0
 static uint32_t nvnSamplerPoolInitialize(samp_pool_t *p, const pool_t *pool, ptrdiff_t off, int n) { nvn_api("nvnSamplerPoolInitialize");
     if (!p || !nvn_obj(pool, NVN_MAGIC('P', 'O', 'O', 'L'), "nvnSamplerPoolInitialize(pool)")) return 0;
     if (n < 0) { nvn_fail("nvnSamplerPoolInitialize", "negative count"); return 0; }
+    uint32_t gen = p->magic == NVN_MAGIC('S', 'P', 'O', 'L') ? p->gen + 1 : 1;
+    if (!gen) gen = 1;
     nvn_samp_pool_forget(p);
     memset(p, 0, sizeof *p);
     p->magic = NVN_MAGIC('S', 'P', 'O', 'L'); p->pool = (pool_t *)pool; p->off = off; p->n = (uint32_t)n;
+    p->gen = gen; p->epoch = g_pool_epoch;
     return 1;
 }
-static void nvnSamplerPoolFinalize(samp_pool_t *p) { if (p) { nvn_samp_pool_forget(p); nvn_pool_forget(p); p->magic = 0; } }
+static void nvnSamplerPoolFinalize(samp_pool_t *p) {
+    if (!p) return;
+    nvn_samp_pool_forget(p);
+    if (p->magic == NVN_MAGIC('S', 'P', 'O', 'L')) p->gen++;
+    nvn_pool_forget(p); p->magic = 0;
+}
 static void nvnSamplerPoolSetDebugLabel(samp_pool_t *p, const char *l) { (void)p; (void)l; }
 static void nvnSamplerPoolRegisterSampler(const samp_pool_t *p, int id, const samp_t *s) { nvn_api("nvnSamplerPoolRegisterSampler");
     if (getenv("TOTK_ANDROID_TRACE_NVN"))
@@ -6621,6 +6825,7 @@ static void nvn_scene_submit_pending(void) {
 }
 
 static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
+    nvn_pool_epoch_tick();
     for (int i = 0; i < n; i++) {
         cb_t *cb = NULL;
         for (unsigned j = 0; j < g_ncbs; j++) {
@@ -7189,6 +7394,43 @@ int runtime_nvn_cb_call_selftest(void) {
     return ok;
 }
 
+int runtime_nvn_pool_lifetime_selftest(void) {
+    enum { POOLS = 40, PER_POOL = 1000 };
+    tex_pool_t pools[POOLS];
+    pool_t mem;
+    tex_t tex;
+    memset(&mem, 0, sizeof mem);
+    mem.magic = NVN_MAGIC('P', 'O', 'O', 'L');
+    memset(&tex, 0, sizeof tex);
+    tex.magic = NVN_MAGIC('T', 'E', 'X', 0);
+    int ok = 1;
+    g_tex_pool_max = g_tex_pool_map_count;
+    for (unsigned g = 0; g < POOLS; g++) {
+        if (!nvnTexturePoolInitialize(&pools[g], &mem, 0, 100000)) { ok = 0; break; }
+        for (unsigned i = 0; i < PER_POOL; i++)
+            nvnTexturePoolRegisterTexture(&pools[g], (int)(g * PER_POOL + i), &tex, NULL);
+        if (nvn_tex_pool_lookup(&pools[g], (int)(g * PER_POOL + PER_POOL - 1)) != &tex) ok = 0;
+        nvn_pool_epoch_tick();
+        nvn_pool_epoch_tick();
+    }
+    /* The current pool resolves; a pool unused for many epochs is pruned. */
+    if (nvn_tex_pool_lookup(&pools[POOLS - 1], (int)((POOLS - 1) * PER_POOL)) != &tex) ok = 0;
+    if (nvn_tex_pool_lookup(&pools[0], 0) != NULL) ok = 0;
+    /* Same pool object, next generation: old ids must not resolve. */
+    if (!nvnTexturePoolInitialize(&pools[0], &mem, 0, 100000)) ok = 0;
+    nvnTexturePoolRegisterTexture(&pools[0], 7, &tex, NULL);
+    if (nvn_tex_pool_lookup(&pools[0], 7) != &tex) ok = 0;
+    if (!nvnTexturePoolInitialize(&pools[0], &mem, 0, 100000)) ok = 0;
+    if (nvn_tex_pool_lookup(&pools[0], 7) != NULL) ok = 0;
+    if (runtime_nvn_tex_pool_regs() > NVN_POOL_MAP_MAX) ok = 0;
+    if (runtime_nvn_tex_pool_full() != 0) ok = 0;
+    for (unsigned g = 0; g < POOLS; g++) nvnTexturePoolFinalize(&pools[g]);
+    if (nvn_trace())
+        fprintf(stderr, "[totk-nvn] pool lifetime selftest %s regs=%u max=%u full=%u\n",
+                ok ? "PASS" : "FAIL", runtime_nvn_tex_pool_regs(),
+                runtime_nvn_tex_pool_max(), runtime_nvn_tex_pool_full());
+    return ok;
+}
 int runtime_nvn_bind_selftest(void) {    tex_t tex;
     samp_t samp;
     tex_pool_t tp;
