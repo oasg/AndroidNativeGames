@@ -62,6 +62,22 @@ static int oe_notification(unsigned char enabled) { (void)enabled; return 0; }
  * when that host service has no logo session (sdk+0x39b080 after the
  * controller-support applet). */
 static void oe_finish_startup_logo(void) { fprintf(stderr, "[totk-android] startup logo finished\n"); }
+static uint64_t program_total_active_time(void) {
+    static uint64_t start;
+    if (!start) start = runtime_now_ns();
+    return runtime_now_ns() - start;
+}
+/* The single native executable was launched directly, not by an applet
+ * ExecuteProgram chain; -1 keeps the game's normal user-open path. */
+static int applet_previous_program_index(void) { return -1; }
+/* Boot has no pending launch parameter.  The macOS applet host answers this
+ * synchronously; leaving the SDK implementation to talk to an unimplemented
+ * applet proxy can stall the title. */
+static int oe_try_pop_launch_parameter(uint64_t *size, void *buffer, uint64_t capacity) {
+    (void)buffer; (void)capacity;
+    if (size) *size = 0;
+    return 0;
+}
 static uint64_t applet_resource_user_id(void) { return 1; }
 void *runtime_nvn_bootstrap(const char *name);
 void *runtime_hid_override(const char *name);
@@ -164,6 +180,23 @@ static int aoc_list(int *out, int offset, int count) {
 }
 static void pctl_init(void) { fprintf(stderr, "[totk-android] parental controls: disabled\n"); }
 static void err_init(void) { fprintf(stderr, "[totk-android] error contexts: local diagnostics\n"); }
+/* The system error applet has no Android host.  Log the result instead of
+ * letting the SDK open an applet whose completion event never arrives. */
+static void err_show_error(uint32_t result) {
+    fprintf(stderr, "[totk-android] nn::err::ShowError result=%#x (%u-%u)\n",
+            result, 2000 + (result & 0x1ff), (result >> 9) & 0x1fff);
+}
+static uint64_t prepo_save(const void *report) {
+    (void)report;
+    static unsigned n;
+    if (n++ < 8) fprintf(stderr, "[totk-android] play report kept local\n");
+    return 0;
+}
+static uint64_t prepo_noop(void) { return 0; }
+static uint64_t prepo_connection_status(void *report, const char *a, const char *b, const char *c) {
+    (void)report; (void)a; (void)b; (void)c;
+    return 0;
+}
 static void diag_abort_init(void) { fprintf(stderr, "[totk-android] native crash observer initialized\n"); }
 
 /* The launch-parameter channel is an applet storage object.  Boot has no
@@ -208,6 +241,14 @@ void *runtime_override(const char *name) {
         {"_ZN2nn2oe24SetExpectedVolumeBalanceEff", oe_set_expected_volume_balance},
         {"_ZN2nn2oe25TryPopNotificationMessageEPj", oe_try_pop_notification_message},
         {"_ZN2nn2oe22PopNotificationMessageEv", oe_pop_notification_message},
+        {"_ZN2nn2oe21TryPopLaunchParameterEPmPvm", oe_try_pop_launch_parameter},
+        {"_ZN2nn2oe25GetProgramTotalActiveTimeEv", program_total_active_time},
+        {"_ZN2nn6applet23GetPreviousProgramIndexEv", applet_previous_program_index},
+        {"_ZN2nn3err9ShowErrorENS_6ResultE", err_show_error},
+        {"_ZN2nn5prepo10PlayReport4SaveEv", prepo_save},
+        {"_ZN2nn5prepo10PlayReport4SaveERKNS_7account3UidE", prepo_save},
+        {"_ZN2nn5prepo28RequestImmediateTransmissionEv", prepo_noop},
+        {"_ZN2nn5prepo27AddInternetConnectionStatusEPNS0_10PlayReportEPKcS4_S4_", prepo_connection_status},
         {"_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE", oe_focus_mode},
         {"_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", oe_performance_config},
         {"_ZN2nn2oe15SetCpuBoostModeENS0_12CpuBoostModeE", oe_cpu_boost},
