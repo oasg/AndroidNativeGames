@@ -246,7 +246,7 @@ static void nvn_global_ubo_set(int stage, int index, uint64_t address, size_t si
     pthread_mutex_lock(&g_global_ubo_lock);
     g_global_ubo[stage][index].address = address;
     g_global_ubo[stage][index].size = size;
-    g_global_ubo[stage][index].valid = 1;
+    g_global_ubo[stage][index].valid = (address != 0 && size != 0);
     pthread_mutex_unlock(&g_global_ubo_lock);
 }
 static int nvn_global_ubo_get(int stage, int index, uint64_t *address, size_t *size) {
@@ -4258,15 +4258,23 @@ static void nvnCommandBufferUpdateUniformBuffer(cb_t *c, uint64_t buffer, size_t
 static void nvnCommandBufferBindUniformBuffer(cb_t *c, int stage, int i, uint64_t address, size_t size) {
     nvn_api("nvnCommandBufferBindUniformBuffer");
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferBindUniformBuffer", "invalid command buffer"); return; }
-    if (stage < 0 || stage >= 6 || i < 0 || i >= 16 || !address || !size) { nvn_fail("nvnCommandBufferBindUniformBuffer", "invalid binding"); return; }
+    if (stage < 0 || stage >= 6 || i < 0 || i >= 16) { nvn_fail("nvnCommandBufferBindUniformBuffer", "invalid binding"); return; }
     nvn_bind_state_t *b = nvn_cb_bind_state(c);
     if (!b) return;
+    if (!address || !size) {
+        b->ubo[stage][i].address = 0;
+        b->ubo[stage][i].size = 0;
+        b->ubo_mask[stage] &= ~(1u << i);
+        nvn_global_ubo_set(stage, i, 0, 0);
+        nvn_cb_desc_event(c, (uint32_t)stage, 0, (uint32_t)i, 0, 0, 0);
+        return;
+    }
     b->ubo[stage][i].address = address;
     b->ubo[stage][i].size = size;
     b->ubo_mask[stage] |= 1u << i;
     nvn_global_ubo_set(stage, i, address, size);
     nvn_cb_desc_event(c, (uint32_t)stage, 0, (uint32_t)i, address, size, 0);
-    if (nvn_trace() || (nvn_trace_first() && nvn_ubo_trace++ < 8192)) {
+    if (nvn_trace() || ((nvn_trace_first() || nvn_trace_inputs()) && nvn_ubo_trace++ < 8192)) {
         const uint32_t *u = (const uint32_t *)(uintptr_t)address;
         fprintf(stderr, "[totk-nvn] BindUniformBuffer cb=%p rec=%u stage=%d index=%d addr=%#llx size=%zu",
                 (void *)c, c->recording, stage, i, (unsigned long long)address, size);
@@ -4289,7 +4297,7 @@ static void nvnCommandBufferBindUniformBuffers(cb_t *c, int stage, int first, in
         nvn_cb_desc_event(c, (uint32_t)stage, 0, (uint32_t)(first + i),
                           r[i * 2], (size_t)r[i * 2 + 1], 0);
     }
-    if (nvn_trace() || (nvn_trace_first() && nvn_ubo_trace++ < 8192)) {
+    if (nvn_trace() || ((nvn_trace_first() || nvn_trace_inputs()) && nvn_ubo_trace++ < 8192)) {
         fprintf(stderr, "[totk-nvn] BindUniformBuffers cb=%p rec=%u stage=%d first=%d count=%d",
                 (void *)c, c->recording, stage, first, n);
         for (int i = 0; i < n; i++)
@@ -5399,6 +5407,27 @@ static void nvn_remap_texture_bind_cmds(GfxCmd *cmds, uint32_t n,
     }
 }
 
+/* NVN UBO state is queue-scoped: the engine binds the per-frame table on a
+ * state-only recording and draw buffers often carry only the changed slot.
+ * Fill the compact indices the shader expects from the process-wide table. */
+static void nvn_inherit_ubo_slots(nvn_bind_state_t *b, GfxReflectedPipeline *rp) {
+    if (!b || !rp) return;
+    const nvn_pipe_ubo_t *ps = nvn_pipe_ubo_get(rp);
+    if (!ps) return;
+    for (int st = 0; st < 2; st++) {
+        uint32_t n = ps->nubo[st] < 16 ? ps->nubo[st] : 16;
+        for (uint32_t k = 0; k < n; k++) {
+            if (b->ubo_mask[st] & (1u << k)) continue;
+            uint64_t a = 0;
+            size_t sz = 0;
+            if (!nvn_global_ubo_get(st, (int)k, &a, &sz) || !a || !sz) continue;
+            b->ubo[st][k].address = a;
+            b->ubo[st][k].size = sz;
+            b->ubo_mask[st] |= 1u << k;
+        }
+    }
+}
+
 static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
                                  const nvn_bind_state_t *b, cb_t *cb) {
     (void)p;
@@ -6160,6 +6189,43 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
                                          0, input.nattributes ? &input : NULL, sig,
                                          variant, 0);
     }
+    nvn_inherit_ubo_slots(&eff, rp);
+    uint32_t draw_mask0 = seed->ubo_mask[0];
+    if (nvn_trace_inputs() && lw <= 512) {
+        static unsigned ubo_traces;
+        if (ubo_traces++ < 4) {
+            const nvn_pipe_ubo_t *ps = nvn_pipe_ubo_get(rp);
+            fprintf(stderr, "[totk-frame] ubo-inherit %ux%u drawmask0=%#x drawmask1=%#x"
+                            " shader_slots0=", lw, lh, draw_mask0, seed->ubo_mask[1]);
+            if (ps) for (uint32_t k = 0; k < ps->nubo[0]; k++)
+                fprintf(stderr, " %d", ps->ubo_slot[0][k]);
+            fprintf(stderr, " nspec0=%u aftermask0=%#x\n", ps ? ps->nubo[0] : 0,
+                    bs->ubo_mask[0]);
+            for (int slot = 0; slot < 8; slot++) {
+                uint64_t ga = 0;
+                size_t gn = 0;
+                int gv = nvn_global_ubo_get(0, slot, &ga, &gn);
+                int dv = (draw_mask0 & (1u << slot)) != 0;
+                int iv = !dv && (bs->ubo_mask[0] & (1u << slot)) != 0;
+                int used = 0;
+                if (ps) for (uint32_t k = 0; k < ps->nubo[0]; k++)
+                    if (ps->ubo_slot[0][k] == slot) used = 1;
+                uint64_t a = dv ? seed->ubo[0][slot].address : ga;
+                size_t n = dv ? seed->ubo[0][slot].size : gn;
+                uint32_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+                if (a) {
+                    memcpy(&w0, (const void *)(uintptr_t)a, 4);
+                    memcpy(&w1, (const void *)(uintptr_t)a + 4, 4);
+                    memcpy(&w2, (const void *)(uintptr_t)a + 8, 4);
+                    memcpy(&w3, (const void *)(uintptr_t)a + 12, 4);
+                }
+                fprintf(stderr, "[totk-frame] ubo-inherit   slot%d src=%s addr=%#llx size=%zu"
+                                " first=%08x %08x %08x %08x global=%d used=%d\n",
+                        slot, dv ? "draw" : (iv ? "inherit" : (gv ? "default" : "none")),
+                        (unsigned long long)a, n, w0, w1, w2, w3, gv, used);
+            }
+        }
+    }
     int traced = 0;
     if (nvn_trace_frame() || nvn_trace_inputs()) {
         if (lw <= 512) {
@@ -6245,7 +6311,7 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
         const char *seg_ppm = getenv("TOTK_ANDROID_SEG_PPM");
         if (seg_ppm && *seg_ppm && lw <= 512 && (ui_drawn % 50 == 1)) {
             char path[PATH_MAX];
-            snprintf(path, sizeof path, "%s-%ux%u.ppm", seg_ppm, lw, lh);
+            snprintf(path, sizeof path, "%s-%ux%u-%u.ppm", seg_ppm, lw, lh, ui_drawn);
             int ok = gfx_backend_offscreen_write_ppm_index(rt, 0, path);
             fprintf(stderr, "[totk-frame] segment target -> %s (%s)\n", path,
                     ok ? "ok" : "failed");
@@ -6508,7 +6574,9 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                                                     window_pass ? NULL : rt,
                                                     clear, &has_clear);
             nvn_remap_texture_bind_cmds(translated, count, reflected);
-            nvn_apply_bind_state(p, reflected, bs, cb);
+            nvn_bind_state_t bend = bs ? *bs : (nvn_bind_state_t){0};
+            nvn_inherit_ubo_slots(&bend, reflected);
+            nvn_apply_bind_state(p, reflected, &bend, cb);
             GfxVertexStream streams[24];
             void *owned[16];
             uint32_t nowned = 0;
