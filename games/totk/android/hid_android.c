@@ -132,8 +132,11 @@ unsigned long runtime_hid_polls(void) { return __atomic_load_n(&g_poll_count, __
 uint32_t runtime_hid_buttons(void) { return __atomic_load_n(&g_poll_buttons, __ATOMIC_RELAXED); }
 static int hid_states_core(void *states, int count, const void *id, uint32_t want_style) {
     __atomic_add_fetch(&g_poll_count, 1, __ATOMIC_RELAXED);
-    if (!states || count <= 0 || count > 16) return 0;
+    /* Parse the script before the caller-size check: some SDK paths ask for
+     * more than 16 states, and returning early used to skip input entirely. */
     hid_input_parse();
+    if (!states || count <= 0) return 0;
+    if (count > 16) count = 16;
     if (!g_npresses) {
         /* No script: keep the old no-device behaviour, but still report one
          * state (attributes 0), as nn::hid does for a disconnected pad. */
@@ -173,15 +176,19 @@ static int hid_states_core(void *states, int count, const void *id, uint32_t wan
             fprintf(stderr, "[totk-hid] poll thread=%#x id=%#x want=%u connected=%d buttons=%#llx\n",
                     runtime_thread_current_handle(), pid ? *pid : 0, want_style,
                     g_enabled && g_allowed && pid && *pid == hid_pad_id() &&
-                    want_style == hid_pad_style() && (g_styles & want_style),
+                    (want_style == 0 || want_style == hid_pad_style()) &&
+                    (want_style == 0 || (g_styles & want_style)),
                     (unsigned long long)bits);
         last_bits = bits;
     }
     static uint64_t sample;
     uint64_t sampling = ++sample;
     const uint32_t *pid = id;
+    /* want_style 0 is the JoyDual/left/right family: the same scripted pad is
+     * valid there too, so a title that polls one of those states sees input. */
     int connected = g_enabled && g_allowed && pid && *pid == hid_pad_id() &&
-                    want_style == hid_pad_style() && (g_styles & want_style);
+                    (want_style == 0 || want_style == hid_pad_style()) &&
+                    (want_style == 0 || (g_styles & want_style));
     if (connected) __atomic_store_n(&g_poll_buttons, (uint32_t)bits, __ATOMIC_RELAXED);
     /* Only the first state is valid when the return value is 1.  Leave the
      * caller's older samples alone: nn::hid's history is what the game compares
