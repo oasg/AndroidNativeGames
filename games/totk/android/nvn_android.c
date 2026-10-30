@@ -2357,7 +2357,7 @@ static void pool_map_init_locked(void) {
     g_tex_free = g_samp_free = 0;
     g_pool_map_ready = 1;
 }
-static void tex_pool_unlink_locked(int32_t idx) {
+__attribute__((unused)) static void tex_pool_unlink_locked(int32_t idx) {
     unsigned b = pool_home(g_tex_pool_map[idx].pool, (int)g_tex_pool_map[idx].id);
     int32_t prev = -1, cur = g_tex_buckets[b];
     while (cur >= 0) {
