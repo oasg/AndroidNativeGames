@@ -865,7 +865,9 @@ static uint64_t nvnDeviceGetCurrentTimestampInNanoseconds(const nvn_dev_t *d) {
 }
 static uint64_t nvnDeviceGetTimestampInNanoseconds(const nvn_dev_t *d, const void *counter) {
     (void)d; (void)counter;
-    return 0;
+    /* Guest timing (loading/fade progress) must advance; returning 0 made a
+     * timestamp-based wait look permanently expired. */
+    return runtime_now_ns();
 }
 /* NVN texture handles pack the texture pool id in the low 20 bits and the
  * sampler pool id in bits 20..31 (see TextureHandle.Unpack* in the translator).
@@ -2236,6 +2238,7 @@ static const tex_t *nvn_tex_pool_lookup(const tex_pool_t *p, int id) {
             return g_tex_pool_map[i].tex;
     return NULL;
 }
+unsigned runtime_nvn_tex_pool_regs(void) { return g_tex_pool_map_count; }
 static void nvn_samp_pool_forget(const samp_pool_t *p) {
     unsigned n = 0;
     for (unsigned i = 0; i < g_samp_pool_map_count; i++)
@@ -2288,6 +2291,7 @@ static int nvnTexturePoolGetSize(const tex_pool_t *p) { return p ? (int)p->n : 0
 static uint32_t nvnSamplerPoolInitialize(samp_pool_t *p, const pool_t *pool, ptrdiff_t off, int n) { nvn_api("nvnSamplerPoolInitialize");
     if (!p || !nvn_obj(pool, NVN_MAGIC('P', 'O', 'O', 'L'), "nvnSamplerPoolInitialize(pool)")) return 0;
     if (n < 0) { nvn_fail("nvnSamplerPoolInitialize", "negative count"); return 0; }
+    nvn_samp_pool_forget(p);
     memset(p, 0, sizeof *p);
     p->magic = NVN_MAGIC('S', 'P', 'O', 'L'); p->pool = (pool_t *)pool; p->off = off; p->n = (uint32_t)n;
     return 1;
@@ -6935,6 +6939,21 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                         l2_frame, shot ? "ok" : "failed");
         }
         unsigned total = __atomic_add_fetch(&nvn_nvn_draws, 1, __ATOMIC_RELAXED);
+        if (getenv("TOTK_ANDROID_TRACE_LOAD") && (total % 300) == 0) {
+            extern unsigned long runtime_fs_ops(void);
+            extern const char *runtime_fs_last_op(void);
+            extern unsigned long runtime_hid_polls(void);
+            extern uint32_t runtime_hid_buttons(void);
+            extern unsigned runtime_nvn_tex_pool_regs(void);
+            extern unsigned runtime_oe_try_calls(void);
+            extern unsigned runtime_oe_pop_calls(void);
+            fprintf(stderr, "[totk-load] draw=%u fs=%lu last=\"%s\" texpool=%u"
+                            " oe_try=%u oe_pop=%u hid=%lu buttons=%#x scene=%u/%u\n",
+                    total, runtime_fs_ops(), runtime_fs_last_op(),
+                    runtime_nvn_tex_pool_regs(), runtime_oe_try_calls(),
+                    runtime_oe_pop_calls(), runtime_hid_polls(), runtime_hid_buttons(),
+                    nvn_scene_rendered, nvn_scene_submits);
+        }
         if (getenv("TOTK_ANDROID_TRACE_TITLE") && (total % 300) == 0) {
             extern unsigned long runtime_fs_ops(void);
             extern const char *runtime_fs_last_op(void);
