@@ -7,9 +7,41 @@
 #include "ipc.h"
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-static const uint8_t local_uid[16] = {0};
+static uint8_t local_uid[16];
+/* Test hook: TOTK_ANDROID_ACCOUNT_UID=<32 hex chars> makes the host account
+ * report the same nn::account::Uid as the save-data export.  The UID is a
+ * 128-bit value printed high word first by fs_host_android. */
+static void account_uid_init(void) {
+    const char *e = getenv("TOTK_ANDROID_ACCOUNT_UID");
+    if (!e || strlen(e) != 32) return;
+    uint8_t raw[16];
+    for (unsigned i = 0; i < 16; i++) {
+        unsigned v = 0;
+        for (unsigned k = 0; k < 2; k++) {
+            char c = e[i * 2 + k];
+            v <<= 4;
+            if (c >= '0' && c <= '9') v |= (unsigned)(c - '0');
+            else if (c >= 'a' && c <= 'f') v |= (unsigned)(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') v |= (unsigned)(c - 'A' + 10);
+            else return;
+        }
+        raw[i] = (uint8_t)v;
+    }
+    /* fs_host prints uid[1] then uid[0], so store the low/high 64-bit halves
+     * little-endian. */
+    for (unsigned i = 0; i < 8; i++) {
+        local_uid[i] = raw[15 - i];
+        local_uid[8 + i] = raw[7 - i];
+    }
+    fprintf(stderr, "[totk-account] uid=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+            local_uid[15], local_uid[14], local_uid[13], local_uid[12],
+            local_uid[11], local_uid[10], local_uid[9], local_uid[8],
+            local_uid[7], local_uid[6], local_uid[5], local_uid[4],
+            local_uid[3], local_uid[2], local_uid[1], local_uid[0]);
+}
 
 static unsigned account_logged;
 static void account_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
@@ -50,6 +82,7 @@ static void account_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs
 }
 
 __attribute__((constructor)) static void register_account(void) {
+    account_uid_init();
     runtime_ipc_register("acc:u0", account_handler, NULL, NULL);
     runtime_ipc_register("acc:u1", account_handler, NULL, NULL);
     runtime_ipc_register("acc:u2", account_handler, NULL, NULL);
