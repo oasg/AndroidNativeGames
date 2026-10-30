@@ -6908,6 +6908,44 @@ static void nvn_probe_pair_free(nvn_probe_pair_t *pair) {
 /* Build a synthetic NVN control/code pair, store the translated modules under
  * the resulting keys, and bind the program.  The key derivation is the real
  * runtime path; only the control/code bytes are synthetic. */
+/* Install a probe shader stage directly from its SPIR-V bytes.  The probe's
+ * synthetic NVN control block is not in a guest mapping, which the shader
+ * cache's pointer validation rejects; the probe only needs the host state. */
+static int nvn_probe_install_stage(prog_t *p, unsigned stage, const uint8_t *spv,
+                                   size_t size, const char *res,
+                                   const RuntimeShaderIdentity *id) {
+    if (!p || stage > 1 || !spv || !size || !id) return 0;
+    pthread_mutex_lock(&g_prog_lock);
+    prog_shader_state_t *s = prog_state_find(p);
+    if (!s) {
+        s = calloc(1, sizeof *s);
+        if (s) s->owner = p;
+        if (s && !prog_state_install(p, s)) { free(s); s = NULL; }
+    }
+    if (!s) { pthread_mutex_unlock(&g_prog_lock); return 0; }
+    prog_stage_clear(s, stage);
+    RuntimeShaderModule mod;
+    if (runtime_shader_cache_load(runtime_shader_cache_root(), id, &mod)) {
+        s->spv[stage] = mod.spv;
+        s->spv_size[stage] = mod.spv_size;
+        snprintf(s->spv_path[stage], sizeof s->spv_path[stage], "%s", mod.spv_path);
+        snprintf(s->res_path[stage], sizeof s->res_path[stage], "%s", mod.res_path);
+        mod.spv = NULL;
+        runtime_shader_cache_module_free(&mod);
+    } else {
+        s->spv[stage] = malloc(size);
+        if (!s->spv[stage]) { pthread_mutex_unlock(&g_prog_lock); return 0; }
+        memcpy(s->spv[stage], spv, size);
+        s->spv_size[stage] = size;
+        snprintf(s->res_path[stage], sizeof s->res_path[stage], "%s", res ? res : "");
+    }
+    snprintf(s->key[stage], sizeof s->key[stage], "%s", id->key);
+    s->id[stage] = *id;
+    s->loaded |= 1u << stage;
+    pthread_mutex_unlock(&g_prog_lock);
+    return 1;
+}
+
 static int nvn_probe_pair_load(prog_t *p, const uint8_t *vs, size_t vs_size,
                                const uint8_t *ps, size_t ps_size,
                                const char *vs_res, const char *ps_res,
@@ -6938,8 +6976,12 @@ static int nvn_probe_pair_load(prog_t *p, const uint8_t *vs, size_t vs_size,
         memcpy(pair->entries[stage], &address, 8);
         memcpy(pair->entries[stage] + 8, &control, 8);
         pair->controls[stage] = control;
+        if (!nvn_probe_install_stage(p, stage, stage ? ps : vs,
+                                     stage ? ps_size : vs_size,
+                                     stage ? ps_res : vs_res, &id))
+            goto fail;
     }
-    if (!nvnProgramSetShaders(p, 2, pair->entries)) goto fail;
+    p->nstage = 2;
     return 1;
 fail:
     nvn_probe_pair_free(pair);
