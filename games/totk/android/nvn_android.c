@@ -467,6 +467,33 @@ typedef struct {
     int64_t off;
 } tex_pool_t;
 
+/* Queue-scoped texture binds.  TOTK binds resources on a state-only command
+ * buffer and the draw buffers rely on them staying live; the draw's own
+ * descriptor snapshot often contains only the subset it changed.  Keep the
+ * last resolved object per (stage, slot) so a segment can inherit the rest. */
+typedef struct { uint64_t handle; const tex_t *tex; } nvn_global_tex_t;
+static nvn_global_tex_t g_global_tex[6][128];
+static pthread_mutex_t g_global_tex_lock = PTHREAD_MUTEX_INITIALIZER;
+static void nvn_global_tex_set(int stage, int slot, uint64_t handle, const tex_t *tex) {
+    if (stage < 0 || stage >= 6 || slot < 0 || slot >= 128) return;
+    pthread_mutex_lock(&g_global_tex_lock);
+    g_global_tex[stage][slot].handle = handle;
+    g_global_tex[stage][slot].tex = tex;
+    pthread_mutex_unlock(&g_global_tex_lock);
+}
+static int nvn_global_tex_get(int stage, int slot, uint64_t *handle, const tex_t **tex) {
+    int ok = 0;
+    if (stage < 0 || stage >= 6 || slot < 0 || slot >= 128) return 0;
+    pthread_mutex_lock(&g_global_tex_lock);
+    if (g_global_tex[stage][slot].tex) {
+        if (handle) *handle = g_global_tex[stage][slot].handle;
+        if (tex) *tex = g_global_tex[stage][slot].tex;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&g_global_tex_lock);
+    return ok;
+}
+
 /* Host bridge for the NVN texture path; kept out of tex_t so the guest's
  * NVN_TEXTURE_SIZE contract is unchanged.  `gfx` is the sampled GfxTexture;
  * `rt` is the host render target this texture owns as colour attachment 0.
@@ -481,19 +508,45 @@ typedef struct {
     uint64_t rt_frame, rt_uploaded;   /* render generation / uploaded generation */
     int rt_valid;
 } tex_bridge_t;
-static tex_bridge_t g_tex_bridges[64];
-static unsigned g_tex_bridge_count;
+static tex_bridge_t *g_tex_bridges;
+static unsigned g_tex_bridge_count, g_tex_bridge_cap;
+static unsigned nvn_upload_traces;
 /* Set when the compositor samples a target that no segment drew to.  The L2
  * frame dump uses it to capture the title/clear state instead of waiting for a
  * scene pass that does not exist yet. */
 static unsigned nvn_empty_sampled;
 
+/* Two NVN texture objects can alias one pool range (a render target and the
+ * sampled view of it are often different tex_t objects).  Share the bridge
+ * entry so the RT association and sampled GfxTexture are visible through
+ * every alias. */
+static int nvn_tex_same_resource(const tex_t *a, const tex_t *b) {
+    if (!a || !b) return 0;
+    if (a == b) return 1;
+    if (a->d.target != b->d.target || a->d.format != b->d.format ||
+        a->d.width != b->d.width || a->d.height != b->d.height ||
+        a->d.levels != b->d.levels)
+        return 0;
+    if (a->mem && a->mem == b->mem && a->L.size && a->L.size == b->L.size) return 1;
+    if (a->pool && a->pool == b->pool && a->off == b->off &&
+        a->L.size && a->L.size == b->L.size)
+        return 1;
+    return 0;
+}
 static tex_bridge_t *nvn_tex_bridge(const tex_t *t, int create) {
     if (!t) return NULL;
     for (unsigned i = 0; i < g_tex_bridge_count; i++)
         if (g_tex_bridges[i].tex == t) return &g_tex_bridges[i];
-    if (!create || g_tex_bridge_count >= sizeof g_tex_bridges / sizeof g_tex_bridges[0])
-        return NULL;
+    for (unsigned i = 0; i < g_tex_bridge_count; i++)
+        if (nvn_tex_same_resource(g_tex_bridges[i].tex, t)) return &g_tex_bridges[i];
+    if (!create) return NULL;
+    if (g_tex_bridge_count == g_tex_bridge_cap) {
+        unsigned cap = g_tex_bridge_cap ? g_tex_bridge_cap * 2 : 64;
+        tex_bridge_t *n = realloc(g_tex_bridges, (size_t)cap * sizeof *n);
+        if (!n) return NULL;
+        g_tex_bridges = n;
+        g_tex_bridge_cap = cap;
+    }
     memset(&g_tex_bridges[g_tex_bridge_count], 0, sizeof g_tex_bridges[0]);
     g_tex_bridges[g_tex_bridge_count].tex = t;
     return &g_tex_bridges[g_tex_bridge_count++];
@@ -1700,6 +1753,23 @@ int runtime_nvn_texture_upload_guest(void *texture) {
                     ok = 0;
                     break;
                 }
+                if (l == 0 && layer == 0 && z == 0 && t->d.width == 96 && t->d.height == 96 &&
+                    t->d.format == 0x49) {
+                    const char *dp = getenv("TOTK_ANDROID_TEX_DUMP");
+                    static int dumped;
+                    if (dp && *dp && !dumped) {
+                        dumped = 1;
+                        char path[PATH_MAX];
+                        snprintf(path, sizeof path, "%s-96x96.bin", dp);
+                        FILE *df = fopen(path, "wb");
+                        if (df) {
+                            fwrite(buf, 1, slice_bytes, df);
+                            fclose(df);
+                            fprintf(stderr, "[totk-nvn] dumped font atlas %s (%zu bytes)\n",
+                                    path, slice_bytes);
+                        }
+                    }
+                }
                 blocks[nsub] = buf;
                 subs[nsub].level = l;
                 subs[nsub].layer = is_3d ? z : layer;
@@ -1738,9 +1808,15 @@ int runtime_nvn_texture_upload_guest(void *texture) {
 }
 
 static void *nvn_texture_gfx(const tex_t *t) {
-    for (unsigned i = 0; i < g_tex_bridge_count; i++)
-        if (g_tex_bridges[i].tex == t) return g_tex_bridges[i].gfx;
-    return NULL;
+    tex_bridge_t *b = nvn_tex_bridge(t, 0);
+    return b ? b->gfx : NULL;
+}
+
+static void nvn_upload_trace_result(int on, const tex_t *t, const char *what,
+                                    GfxTexture *g) {
+    if (!on) return;
+    fprintf(stderr, "[totk-frame] upload result=%s tex=%p gfx=%p bridge=%u/%u\n",
+            what, (const void *)t, (void *)g, g_tex_bridge_count, g_tex_bridge_cap);
 }
 
 /* First bind uploads the guest block-linear texture.  The macOS runtime does
@@ -1751,6 +1827,24 @@ static void *nvn_texture_gfx(const tex_t *t) {
 static GfxTexture *nvn_texture_gfx_ready(const tex_t *t) {
     if (!t || t->magic != NVN_MAGIC('T', 'E', 'X', 0)) return NULL;
     tex_bridge_t *b = nvn_tex_bridge(t, 0);
+    int utr = nvn_trace_inputs() && nvn_upload_traces < 512 &&
+              t->d.width <= 1024 && t->d.height <= 1024;
+    if (utr) {
+        nvn_upload_traces++;
+        size_t ms = t->L.size ? (size_t)t->L.size
+                              : (size_t)t->d.width * t->d.height * 4;
+        uint32_t nz = nvn_first_nonzero(t->mem, ms, 1u << 20);
+        fprintf(stderr, "[totk-frame] upload begin tex=%p fmt=%#x tgt=%d %ux%u lv=%u"
+                        " layers=%u mem=%p off=%lld msize=%zu first_nz=%s%u"
+                        " bridge=%u/%u gfx=%p rt=%d gen=%llu/%llu\n",
+                (const void *)t, t->d.format, t->d.target, t->d.width, t->d.height,
+                t->d.levels, t->L.layers, (void *)t->mem, (long long)t->off, ms,
+                nz == UINT32_MAX ? "none " : "", nz == UINT32_MAX ? 0 : nz,
+                g_tex_bridge_count, g_tex_bridge_cap, (void *)nvn_texture_gfx(t),
+                b ? b->rt_valid : 0,
+                b ? (unsigned long long)b->rt_frame : 0,
+                b ? (unsigned long long)b->rt_uploaded : 0);
+    }
     /* A target that only received clears/state in the latest recording has no
      * segment to render.  Say so instead of presenting stale guest bytes as
      * if a scene pass had drawn to it. */
@@ -1804,10 +1898,12 @@ static GfxTexture *nvn_texture_gfx_ready(const tex_t *t) {
                                 w0[0], w0[1], w0[2], w0[3],
                                 nz == need / 4 ? "none " : "", nz == need / 4 ? 0 : nz * 4);
                     }
+                    nvn_upload_trace_result(utr, t, "rt", g);
                     return g;
                 }
             }
         }
+        nvn_upload_trace_result(utr, t, "rt-fallback", NULL);
         if (nvn_trace_frame())
             fprintf(stderr, "[totk-frame] tex-from-rt fallback tex=%p fmt=%#x vkfmt=%#x"
                             " rtfmt=%#x %ux%u vs %ux%u levels=%u\n", (const void *)t,
@@ -1816,9 +1912,11 @@ static GfxTexture *nvn_texture_gfx_ready(const tex_t *t) {
                     b->rt_width, b->rt_height, t->d.width, t->d.height, t->d.levels);
     }
     GfxTexture *g = nvn_texture_gfx(t);
-    if (g) return g;
-    if (!runtime_nvn_texture_upload_guest((void *)t)) return NULL;
-    return nvn_texture_gfx(t);
+    if (g) { nvn_upload_trace_result(utr, t, "cached", g); return g; }
+    int up = runtime_nvn_texture_upload_guest((void *)t);
+    g = nvn_texture_gfx(t);
+    nvn_upload_trace_result(utr, t, up ? "guest" : "fail", g);
+    return up ? g : NULL;
 }
 
 static GfxSampler *nvn_sampler_gfx(const samp_t *s) {
@@ -2844,7 +2942,7 @@ static void nvn_note_empty_target(const void *tex) {
     pthread_mutex_lock(&g_empty_lock);
     g_empty_targets[g_empty_next++ % NVN_EMPTY_TARGET_MAX].tex = tex;
     pthread_mutex_unlock(&g_empty_lock);
-    if (nvn_trace_frame())
+    if (nvn_trace_frame() || nvn_trace_inputs())
         fprintf(stderr, "[totk-frame] target-empty tex=%p (clears/state only, no draws)\n",
                 tex);
 }
@@ -2998,6 +3096,41 @@ static void nvn_cb_retire(cb_t *c) {
         nvn_frame_target_hist(c, e->color0_tex);
     uint64_t scene_handle = e->handle;
     pthread_mutex_unlock(&g_retired_lock);
+    if (nvn_trace_inputs() && copied >= 200) {
+        static unsigned seg_dumps;
+        if (seg_dumps++ < 1) {
+            fprintf(stderr, "[totk-frame] segs handle=%#llx nseg=%u\n",
+                    (unsigned long long)c->handle, e->nseg);
+            for (uint32_t si = 0; si < e->nseg; si++) {
+                nvn_seg_t *sg = &e->seg[si];
+                uint32_t clears = 0, cmask = 0;
+                float clr[4] = { 0, 0, 0, 0 };
+                for (uint32_t ci = sg->first_cmd; ci < sg->first_cmd + sg->ncmds; ci++) {
+                    const nvn_cmd_t *cc = &e->cmds[ci];
+                    if (cc->kind != NVN_CMD_CLEAR_COLOR) continue;
+                    clears++;
+                    if (cc->u.clear.index == 0) {
+                        memcpy(clr, cc->u.clear.rgba, sizeof clr);
+                        cmask = cc->u.clear.mask;
+                    }
+                }
+                fprintf(stderr, "[totk-frame] segs  %u cmd=[%u,%u) draws=%u tex=%p"
+                                " %ux%u win=%d clear=%u rgba=%.3f,%.3f,%.3f,%.3f mask=%#x\n",
+                        si, sg->first_cmd, sg->first_cmd + sg->ncmds, sg->draw_count,
+                        sg->color0_tex, sg->width, sg->height, sg->window_texture,
+                        clears, clr[0], clr[1], clr[2], clr[3], cmask);
+                for (uint32_t ci = sg->first_cmd; ci < sg->first_cmd + sg->ncmds; ci++) {
+                    const nvn_cmd_t *cc = &e->cmds[ci];
+                    if (cc->kind != NVN_CMD_CLEAR_COLOR) continue;
+                    fprintf(stderr, "[totk-frame] segs    clear idx=%d mask=%#x"
+                                    " rgba=%.3f,%.3f,%.3f,%.3f\n",
+                            cc->u.clear.index, cc->u.clear.mask,
+                            cc->u.clear.rgba[0], cc->u.clear.rgba[1],
+                            cc->u.clear.rgba[2], cc->u.clear.rgba[3]);
+                }
+            }
+        }
+    }
     if (nvn_trace_frame() || nvn_trace_inputs())
         fprintf(stderr, "[totk-frame] retire cb=%p handle=%#llx cmds=%u draws=%u bind=%d"
                         " rt0=%p segs=%u queued=%u empty=%u\n", (void *)c,
@@ -4202,12 +4335,16 @@ static void nvnCommandBufferBindTexture(cb_t *c, int stage, int i, uint64_t hand
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferBindTexture", "invalid command buffer"); return; }
     if (stage < 0 || stage >= 6 || i < 0 || i >= 128) { nvn_fail("nvnCommandBufferBindTexture", "invalid binding"); return; }
     nvn_bind_state_t *b = nvn_cb_bind_state(c);
+    const tex_pool_t *bind_pool = nvn_tex_pool_for(c);
+    const tex_t *bind_tex = (handle && bind_pool)
+                          ? nvn_tex_pool_lookup(bind_pool, (int)(handle & 0xfffff)) : NULL;
     if (b) {
         b->tex[stage][i] = handle;
         if (handle) b->tex_mask[stage][i / 32] |= 1u << (i % 32);
         else b->tex_mask[stage][i / 32] &= ~(1u << (i % 32));
         nvn_cb_desc_event(c, (uint32_t)stage, 2, (uint32_t)i, 0, 0, handle);
     }
+    nvn_global_tex_set(stage, i, handle, bind_tex);
     if (nvn_trace() || (nvn_trace_first() && nvn_tex_trace++ < 64)) {
         int tid = (int)(handle & 0xfffff), sid = (int)((handle >> 20) & 0xfff);
         const tex_pool_t *tpool = nvn_tex_pool_for(c);
@@ -4256,6 +4393,10 @@ static void nvnCommandBufferBindTextures(cb_t *c, int stage, int first, int n, c
             if (handles[i]) b->tex_mask[stage][index / 32] |= 1u << (index % 32);
             else b->tex_mask[stage][index / 32] &= ~(1u << (index % 32));
             nvn_cb_desc_event(c, (uint32_t)stage, 2, (uint32_t)index, 0, 0, handles[i]);
+            const tex_pool_t *bp = nvn_tex_pool_for(c);
+            const tex_t *bt = (handles[i] && bp)
+                            ? nvn_tex_pool_lookup(bp, (int)(handles[i] & 0xfffff)) : NULL;
+            nvn_global_tex_set(stage, index, handles[i], bt);
         }
     }
     if (nvn_trace()) {
@@ -4999,12 +5140,37 @@ static uint64_t nvn_vertex_signature(const GfxVertexLayout *layout) {
 
 /* Decode the recorded NVN attribute/stream state.  `va_st` is packed as
  * {fmt:8, offset:19, stream:5}; `vs_st` is {stride, divisor}. */
+/* NVN *_UI2F / *_I2F vertex formats store unnormalised integers but the
+ * shader reads floats.  Vulkan has no equivalent vertex-input conversion, so
+ * the attribute is expanded into a private float stream (float bits reinterpret
+ * the integer bytes otherwise, which collapses UI quads to near-zero size). */
+typedef struct { uint8_t comps, bytes, is_signed, convert; } nvn_vfmt_t;
+static nvn_vfmt_t nvn_vfmt_of(int f) {
+    if (f >= 0x51 && f <= 0x68) {
+        static const uint8_t comps[24] = {1,1,1,1,1,1,2,2,2,2,2,2,3,3,3,3,3,3,4,4,4,4,4,4};
+        static const uint8_t bytes[24] = {1,1,2,2,4,4,1,1,2,2,4,4,1,1,2,2,4,4,1,1,2,2,4,4};
+        int k = f - 0x51;
+        return (nvn_vfmt_t){ comps[k], bytes[k], (uint8_t)(k & 1), 1 };
+    }
+    return (nvn_vfmt_t){ 0, 0, 0, 0 };
+}
+static int nvn_float_vk_format(int comps) {
+    switch (comps) {
+    case 1: return gfx_backend_vk_format_for_nvn(0x0A);   /* R32F */
+    case 2: return gfx_backend_vk_format_for_nvn(0x16);   /* RG32F */
+    case 3: return gfx_backend_vk_format_for_nvn(0x22);   /* RGB32F */
+    case 4: return gfx_backend_vk_format_for_nvn(0x2E);   /* RGBA32F */
+    default: return 0;
+    }
+}
+
 static void nvn_build_vertex_layout(const nvn_bind_state_t *b, GfxVertexLayout *out, uint64_t *sig) {
     memset(out, 0, sizeof *out);
     *sig = 0;
     if (!b || !b->va_mask) return;
     uint32_t used_streams = 0;
     uint32_t valid_streams = 0;
+    uint32_t conv = 0;
     for (int i = 0; i < 16; i++) {
         if (!(b->va_mask & (1u << i))) continue;
         uint32_t va = b->va[i];
@@ -5014,6 +5180,22 @@ static void nvn_build_vertex_layout(const nvn_bind_state_t *b, GfxVertexLayout *
         if (!fmt) continue;
         if (stream >= 16) {
             nvn_fail("nvnQueueSubmitCommands", "vertex attribute stream out of range");
+            continue;
+        }
+        nvn_vfmt_t vf = nvn_vfmt_of((int)fmt);
+        if (vf.convert) {
+            int vkfmt = nvn_float_vk_format(vf.comps);
+            if (!vkfmt || out->nbindings >= 16 || out->nattributes >= 16) { conv++; continue; }
+            uint32_t bind = 24u + conv++;
+            GfxVertexAttribute *a = &out->attributes[out->nattributes++];
+            a->location = (uint32_t)i;
+            a->binding = bind;
+            a->format = vkfmt;
+            a->offset = 0;
+            GfxVertexBinding *v = &out->bindings[out->nbindings++];
+            v->binding = bind;
+            v->stride = (uint32_t)vf.comps * 4u;
+            v->input_rate = 0;
             continue;
         }
         int vkfmt = gfx_backend_vk_format_for_nvn(fmt);
@@ -5058,9 +5240,55 @@ static void nvn_build_vertex_layout(const nvn_bind_state_t *b, GfxVertexLayout *
     *sig = nvn_vertex_signature(out);
 }
 
-static uint32_t nvn_build_vertex_streams(const nvn_bind_state_t *b, GfxVertexStream *out, uint32_t max) {
+static uint32_t nvn_build_vertex_streams(const nvn_bind_state_t *b, GfxVertexStream *out,
+                                         uint32_t max, void **owned, uint32_t max_owned,
+                                         uint32_t *nowned) {
+    if (nowned) *nowned = 0;
     if (!b) return 0;
-    uint32_t n = 0;
+    uint32_t n = 0, no = 0, conv = 0;
+    for (int i = 0; i < 16 && n < max; i++) {
+        if (!(b->va_mask & (1u << i))) continue;
+        uint32_t va = b->va[i];
+        uint32_t fmt = va & 0xffu;
+        uint32_t off = (va >> 8) & 0x7ffffu;
+        uint32_t stream = (va >> 27) & 0x1fu;
+        nvn_vfmt_t vf = nvn_vfmt_of((int)fmt);
+        if (!vf.convert) continue;
+        uint32_t bind = 24u + conv++;
+        if (stream >= 16 || !(b->vb_mask & (1u << stream))) continue;
+        uint64_t addr = b->vb[stream].address;
+        size_t size = (size_t)b->vb[stream].size;
+        uint32_t stride = (uint32_t)b->vs[stream];
+        if (!addr || !stride) continue;
+        uint32_t verts = (uint32_t)(size / stride);
+        if (verts > (1u << 20)) verts = 1u << 20;
+        size_t outsz = (size_t)verts * vf.comps * 4u;
+        float *buf = outsz ? malloc(outsz) : NULL;
+        if (!buf) continue;
+        for (uint32_t v = 0; v < verts; v++) {
+            const uint8_t *src = (const uint8_t *)(uintptr_t)addr + (size_t)v * stride + off;
+            for (uint32_t c = 0; c < vf.comps; c++) {
+                float fv = 0.0f;
+                if (vf.bytes == 1) {
+                    if (vf.is_signed) fv = (float)(int8_t)src[c];
+                    else fv = (float)src[c];
+                } else if (vf.bytes == 2) {
+                    if (vf.is_signed) { int16_t x; memcpy(&x, src + c * 2, 2); fv = (float)x; }
+                    else { uint16_t x; memcpy(&x, src + c * 2, 2); fv = (float)x; }
+                } else {
+                    if (vf.is_signed) { int32_t x; memcpy(&x, src + c * 4, 4); fv = (float)x; }
+                    else { uint32_t x; memcpy(&x, src + c * 4, 4); fv = (float)x; }
+                }
+                buf[(size_t)v * vf.comps + c] = fv;
+            }
+        }
+        out[n].binding = bind;
+        out[n].data = buf;
+        out[n].size = outsz;
+        n++;
+        if (owned && no < max_owned) owned[no++] = buf;
+        else free(buf);
+    }
     for (int i = 0; i < 16 && n < max; i++) {
         if (!(b->vb_mask & (1u << i))) continue;
         if (!b->vb[i].address || !b->vb[i].size) continue;
@@ -5071,6 +5299,7 @@ static uint32_t nvn_build_vertex_streams(const nvn_bind_state_t *b, GfxVertexStr
         out[n].size = size;
         n++;
     }
+    if (nowned) *nowned = no;
     return n;
 }
 
@@ -5187,10 +5416,14 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
         const void *failed_data = NULL;
         size_t failed_size = 0;
         int nbound = 0;
+        int bidx[16];
+        const void *bdata[16];
+        size_t bsize[16];
         for (int i = 0; i < 16; i++) {
             if (!(b->ubo_mask[stage] & (1u << i))) continue;
             const void *data = (const void *)(uintptr_t)b->ubo[stage][i].address;
             size_t size = b->ubo[stage][i].size;
+            if (nbound < 16) { bidx[nbound] = i; bdata[nbound] = data; bsize[nbound] = size; }
             nbound++;
             failed_slot = i;
             failed_data = data;
@@ -5209,6 +5442,28 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
          * bind it to the reflected slot instead of silently leaving the shader
          * with the dummy buffer.  (Observed TOTK frame draw: NVN index 0,
          * shader cbuf slot 3.) */
+        if (pspec && nbound > 1 && (uint32_t)nbound == nspec) {
+            int compact = 1;
+            for (int k = 0; k < nbound && k < 16; k++)
+                if (bidx[k] >= nbound) compact = 0;
+            if (compact) {
+                for (int k = 0; k < nbound && k < 16; k++) {
+                    int target = pspec->ubo_slot[stage][k];
+                    if (target < 0 || target == bidx[k]) continue;
+                    if (gfx_backend_reflected_bind_ubo_slot(rp, (uint32_t)stage,
+                                                            (uint32_t)target,
+                                                            bdata[k], bsize[k])) {
+                        if (nvn_trace_inputs()) {
+                            static unsigned mlog;
+                            if (mlog++ < 8)
+                                fprintf(stderr, "[totk-frame] UBO stage=%d index=%d ->"
+                                                " cbuf slot=%d (multi)\n",
+                                        stage, bidx[k], target);
+                        }
+                    }
+                }
+            }
+        }
         if (nbound == 1 && nspec == 1) {
             int target = pspec->ubo_slot[stage][0];
             /* The NVN bind address is the shader cbuf base: never rebase
@@ -5247,6 +5502,11 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
             int tid = (int)(handle & 0xfffff);
             const tex_pool_t *tpool = nvn_tex_pool_for(cb);
             const tex_t *t = tpool ? nvn_tex_pool_lookup(tpool, tid) : NULL;
+            if (!t) {
+                uint64_t gh = 0;
+                const tex_t *gt = NULL;
+                if (nvn_global_tex_get(stage, i, &gh, &gt) && gt && gh == handle) t = gt;
+            }
             if ((nvn_trace_first() || (nvn_trace_frame() && nvn_scene_rendered > 0)) &&
                 nvn_tex_apply_trace++ < 24)
                 fprintf(stderr, "[totk-frame] ApplyTex stage=%d slot=%d handle=%#llx tid=%d"
@@ -5286,6 +5546,14 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
          * reads the c2 table slots the translator recorded (e.g. indices 0/1
          * vs slots 10/8).  When the counts match and every bound index is
          * compact, map the k-th bind to the k-th reflected texture slot. */
+        if (nvn_trace_inputs() && stage == 1 && pspec && pspec->ntex[stage] > 1) {
+            static unsigned mlog;
+            if (mlog++ < 8)
+                fprintf(stderr, "[totk-frame] apply-tex stage=1 rp=%p pspec=%p ntex=%u"
+                                " bound=%d idx=%d,%d mask=%#x\n", (void *)rp,
+                        (const void *)pspec, pspec ? pspec->ntex[stage] : 0,
+                        bound_tex, bound_idx[0], bound_idx[1], b->tex_mask[stage][0]);
+        }
         if (pspec && bound_tex > 0 && (uint32_t)bound_tex == pspec->ntex[stage]) {
             int compact = 1;
             for (int k = 0; k < bound_tex && k < 8; k++)
@@ -5721,6 +5989,16 @@ static void nvn_trace_segment_inputs(const char *tag, cb_t *view,
                             " first=%08x %08x %08x %08x first_nz=%s%u\n",
                     tag, st, i, (unsigned long long)a, n, w0, w1, w2, w3,
                     nz == UINT32_MAX ? "none " : "", nz == UINT32_MAX ? 0 : nz);
+            if (a && st == 0 && n >= 224) {
+                const uint32_t *w = (const uint32_t *)(uintptr_t)a;
+                fprintf(stderr, "[totk-frame] %s   vs-ubo idx9=%08x %08x %08x %08x"
+                                " idx10=%08x %08x %08x %08x idx13=%08x %08x %08x %08x"
+                                " idx34=%08x %08x %08x %08x\n", tag,
+                        w[9*4+0], w[9*4+1], w[9*4+2], w[9*4+3],
+                        w[10*4+0], w[10*4+1], w[10*4+2], w[10*4+3],
+                        w[13*4+0], w[13*4+1], w[13*4+2], w[13*4+3],
+                        w[34*4+0], w[34*4+1], w[34*4+2], w[34*4+3]);
+            }
             if (a && st == 1 && n >= 16) {
                 uint32_t words[36] = { 0 };
                 size_t nw = n / 4;
@@ -5755,6 +6033,29 @@ static void nvn_trace_segment_inputs(const char *tag, cb_t *view,
             (unsigned long long)bs->rs.blend.eq_rgb, (unsigned)bs->rs.poly.cull,
             (unsigned)bs->rs.poly.front, bs->rs.chmask.mask, bs->va_mask,
             bs->vb_mask, input.nattributes, input.nbindings);
+    for (uint32_t ai = 0; ai < input.nattributes; ai++)
+        fprintf(stderr, "[totk-frame] %s   attr %u loc=%u bind=%u fmt=%#x off=%u va=%#x nvnfmt=%#x\n",
+                tag, ai, input.attributes[ai].location, input.attributes[ai].binding,
+                input.attributes[ai].format, input.attributes[ai].offset,
+                bs->va[input.attributes[ai].location],
+                bs->va[input.attributes[ai].location] & 0xff);
+    for (uint32_t bi = 0; bi < input.nbindings; bi++)
+        fprintf(stderr, "[totk-frame] %s   vbind %u b=%u stride=%u rate=%u\n", tag, bi,
+                input.bindings[bi].binding, input.bindings[bi].stride,
+                input.bindings[bi].input_rate);
+    for (int vi = 0; vi < 16; vi++) {
+        if (!(bs->vb_mask & (1u << vi))) continue;
+        uint64_t va = bs->vb[vi].address;
+        uint32_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+        if (va) {
+            memcpy(&w0, (const void *)(uintptr_t)va, 4);
+            memcpy(&w1, (const void *)(uintptr_t)va + 4, 4);
+            memcpy(&w2, (const void *)(uintptr_t)va + 8, 4);
+            memcpy(&w3, (const void *)(uintptr_t)va + 12, 4);
+        }
+        fprintf(stderr, "[totk-frame] %s   vb %d addr=%#llx size=%zu first=%08x %08x %08x %08x\n",
+                tag, vi, (unsigned long long)va, bs->vb[vi].size, w0, w1, w2, w3);
+    }
 }
 
 /* Render one retired offscreen segment from its immutable snapshot.  Each
@@ -5776,12 +6077,42 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
         pthread_mutex_unlock(&g_retired_lock);
         return 0;
     }
-    const nvn_bind_state_t *bs = (sg->have_last && sg->last.have_state)
-                               ? &sg->last.state : e->bind;
-    if (!bs) {
+    const nvn_bind_state_t *seed = (sg->have_last && sg->last.have_state)
+                                 ? &sg->last.state : e->bind;
+    if (!seed) {
         pthread_mutex_unlock(&g_retired_lock);
         return 0;
     }
+    /* Fill texture slots the draw buffer did not rebind from the queue-scoped
+     * bind state.  TOTK binds the font/atlas on a state-only recording and
+     * relies on it staying live for later draw buffers. */
+    nvn_bind_state_t eff = *seed;
+    prog_t *p = e->prog;
+    uint32_t ntex_spec[2] = { 0, 0 };
+    if (p && p->magic == NVN_MAGIC('P', 'R', 'O', 'G')) {
+        pthread_mutex_lock(&g_prog_lock);
+        prog_shader_state_t *ss = prog_state_find(p);
+        if (ss) {
+            for (int st = 0; st < 2; st++)
+                for (uint32_t k = 0; k < ss->nspecs[st]; k++)
+                    if (ss->specs[st][k].kind == GFX_BIND_COMBINED_IMAGE_SAMPLER ||
+                        ss->specs[st][k].kind == GFX_BIND_SAMPLED_IMAGE)
+                        ntex_spec[st]++;
+        }
+        pthread_mutex_unlock(&g_prog_lock);
+    }
+    for (int st = 0; st < 2; st++) {
+        uint32_t limit = ntex_spec[st] < 8 ? ntex_spec[st] : 8;
+        for (uint32_t slot = 0; slot < limit; slot++) {
+            if (eff.tex_mask[st][slot / 32] & (1u << (slot % 32))) continue;
+            uint64_t gh = 0;
+            const tex_t *gt = NULL;
+            if (!nvn_global_tex_get(st, (int)slot, &gh, &gt) || !gt || !gh) continue;
+            eff.tex[st][slot] = gh;
+            eff.tex_mask[st][slot / 32] |= 1u << (slot % 32);
+        }
+    }
+    const nvn_bind_state_t *bs = &eff;
     /* Read-only view of the segment for the translation helpers. */
     cb_t view;
     memset(&view, 0, sizeof view);
@@ -5797,7 +6128,14 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
     view.draw_count = (int)sg->draw_count;
     view.handle = e->handle;
     view.serial = e->handle;
-    nvn_cb_apply_uniform_updates(&view);
+    /* Replay every uniform update from the start of the recording up to this
+     * segment.  Draw-less prefix segments (clear/state only) are skipped by the
+     * queue, but the engine records the per-frame UBO table there; replaying
+     * only the segment's own range leaves the later draws reading zeros. */
+    cb_t upd = view;
+    upd.cmds = e->cmds;
+    upd.ncmds = sg->first_cmd + sg->ncmds;
+    nvn_cb_apply_uniform_updates(&upd);
 
     GfxRenderTargetLayout layout = sg->layout;
     uint32_t lw = sg->width, lh = sg->height;
@@ -5809,8 +6147,6 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
         return 0;
     }
     const tex_t *ctex = nvn_tex_registry_find(sg->color0_tex);
-
-    prog_t *p = e->prog;
     int has_program = p && p->magic == NVN_MAGIC('P', 'R', 'O', 'G');
     GfxVertexLayout input;
     uint64_t sig = 0;
@@ -5827,9 +6163,12 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
     int traced = 0;
     if (nvn_trace_frame() || nvn_trace_inputs()) {
         if (lw <= 512) {
-            static unsigned ui_traces;
-            if (ui_traces++ < 3) {
-                nvn_trace_segment_inputs("ui-inputs", &view, bs, p, rp);
+            static unsigned ui_traces, ui180;
+            int want = ui_traces++ < 20 || (lw == 180 && ui180++ < 4);
+            if (want) {
+                char tag[48];
+                snprintf(tag, sizeof tag, "ui-inputs[%ux%u]", lw, lh);
+                nvn_trace_segment_inputs(tag, &view, bs, p, rp);
                 traced = 1;
             }
         } else if (lw >= 1000) {
@@ -5850,8 +6189,10 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
                                                     clear, &has_clear);
             nvn_remap_texture_bind_cmds(translated, count, rp);
             nvn_apply_bind_state(p, rp, bs, &view);
-            GfxVertexStream streams[16];
-            uint32_t nstreams = nvn_build_vertex_streams(bs, streams, 16);
+            GfxVertexStream streams[24];
+            void *owned[16];
+            uint32_t nowned = 0;
+            uint32_t nstreams = nvn_build_vertex_streams(bs, streams, 24, owned, 16, &nowned);
             drew = gfx_backend_reflected_execute_ex(rp, rt, translated, count,
                                                     has_clear ? clear : NULL,
                                                     streams, nstreams);
@@ -5880,6 +6221,8 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
                     bs->va_mask, bs->vb_mask, sg->draw_count);
     }
     if (drew) {
+        static unsigned ui_drawn;
+        if (lw <= 512) ui_drawn++;
         uint8_t px[4] = { 0 };
         int have_px = gfx_backend_offscreen_read_pixel_index(rt, 0, lw / 2, lh / 2, px) != 0;
         if (have_px && nvn_trace_frame()) {
@@ -5888,16 +6231,24 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
                 fprintf(stderr, "[totk-frame] segment px %ux%u center=%02x%02x%02x%02x\n",
                         lw, lh, px[0], px[1], px[2], px[3]);
         }
+        int ui_probe = lw <= 512 && (ui_drawn % 50 == 1) &&
+                       (nvn_trace_inputs() || nvn_trace_frame());
+        if (ui_probe) {
+            size_t rn = 0;
+            const uint8_t *rpix = gfx_backend_offscreen_pixels(rt, &rn);
+            uint32_t rnz = nvn_first_nonzero(rpix, rn, 1u << 20);
+            fprintf(stderr, "[totk-frame] ui-target n=%u %ux%u bytes=%zu first_nz=%s%u"
+                            " center=%02x%02x%02x%02x\n", ui_drawn, lw, lh, rn,
+                    rnz == UINT32_MAX ? "none " : "", rnz == UINT32_MAX ? 0 : rnz,
+                    px[0], px[1], px[2], px[3]);
+        }
         const char *seg_ppm = getenv("TOTK_ANDROID_SEG_PPM");
-        if (seg_ppm && *seg_ppm && lw <= 512) {
-            static unsigned dumps;
-            if (dumps++ < 4) {
-                char path[PATH_MAX];
-                snprintf(path, sizeof path, "%s-%ux%u.ppm", seg_ppm, lw, lh);
-                int ok = gfx_backend_offscreen_write_ppm_index(rt, 0, path);
-                fprintf(stderr, "[totk-frame] segment target -> %s (%s)\n", path,
-                        ok ? "ok" : "failed");
-            }
+        if (seg_ppm && *seg_ppm && lw <= 512 && (ui_drawn % 50 == 1)) {
+            char path[PATH_MAX];
+            snprintf(path, sizeof path, "%s-%ux%u.ppm", seg_ppm, lw, lh);
+            int ok = gfx_backend_offscreen_write_ppm_index(rt, 0, path);
+            fprintf(stderr, "[totk-frame] segment target -> %s (%s)\n", path,
+                    ok ? "ok" : "failed");
         }
     }
     e->age = ++g_retired_age;
@@ -6158,8 +6509,10 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                                                     clear, &has_clear);
             nvn_remap_texture_bind_cmds(translated, count, reflected);
             nvn_apply_bind_state(p, reflected, bs, cb);
-            GfxVertexStream streams[16];
-            uint32_t nstreams = nvn_build_vertex_streams(bs, streams, 16);
+            GfxVertexStream streams[24];
+            void *owned[16];
+            uint32_t nowned = 0;
+            uint32_t nstreams = nvn_build_vertex_streams(bs, streams, 24, owned, 16, &nowned);
             if (window_pass)
                 drew = runtime_native_window_execute_reflected_ex(w->native, reflected,
                                                                   translated, count,
@@ -6169,6 +6522,7 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                 drew = gfx_backend_reflected_execute_ex(reflected, rt, translated, count,
                                                         has_clear ? clear : NULL,
                                                         streams, nstreams);
+            for (uint32_t oi = 0; oi < nowned; oi++) free(owned[oi]);
             free(translated);
             if (drew && !window_pass) nvn_window_mirror_target(w, rt);
         } else if (has_program && p->textured && p->gfx_textured_pipeline && p->gfx_texture) {
