@@ -2692,6 +2692,9 @@ static void nvn_window_layout(const win_t *w, GfxRenderTargetLayout *layout,
 typedef struct {
     uint32_t first_cmd, ncmds;
     uint32_t draw_count;             /* vertices referenced by draws */
+    uint32_t clear_count;            /* color-0 clear commands */
+    uint32_t clear_mask;
+    float clear_rgba[4];
     const void *color0_tex;
     GfxRenderTargetLayout layout;
     uint32_t width, height;
@@ -2707,6 +2710,11 @@ static void nvn_seg_fill(const cb_t *c, nvn_seg_t *s, uint32_t first, uint32_t e
         const nvn_cmd_t *cc = &c->cmds[i];
         if (cc->kind == NVN_CMD_DRAW) s->draw_count += cc->u.draw.count;
         else if (cc->kind == NVN_CMD_DRAW_INDEXED) s->draw_count += cc->u.draw_indexed.count;
+        else if (cc->kind == NVN_CMD_CLEAR_COLOR && cc->u.clear.index == 0) {
+            s->clear_count++;
+            s->clear_mask = cc->u.clear.mask;
+            memcpy(s->clear_rgba, cc->u.clear.rgba, sizeof s->clear_rgba);
+        }
     }
     nvn_cb_target_t *t = nvn_cb_target(c, 0);
     if (!t || !t->draws) return;
@@ -3087,7 +3095,7 @@ static void nvn_cb_retire(cb_t *c) {
     for (uint32_t i = 0; i < e->nseg; i++) {
         nvn_seg_t *sg = &e->seg[i];
         if (!sg->have_layout || sg->window_texture || !sg->color0_tex) continue;
-        if (sg->draw_count > 0) {
+        if (sg->draw_count > 0 || sg->clear_count > 0) {
             if (nqueue < sizeof queue_segs / sizeof queue_segs[0]) queue_segs[nqueue++] = i;
         } else {
             if (nempty < sizeof empty_segs / sizeof empty_segs[0]) empty_segs[nempty++] = i;
@@ -6111,9 +6119,80 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
         return 0;
     }
     nvn_seg_t *sg = &e->seg[seg_index];
-    if (!sg->draw_count || !sg->have_layout || sg->window_texture ||
-        !sg->color0_tex || !sg->ncmds) {
+    if ((!sg->draw_count && !sg->clear_count) || !sg->have_layout ||
+        sg->window_texture || !sg->color0_tex || !sg->ncmds) {
         pthread_mutex_unlock(&g_retired_lock);
+        return 0;
+    }
+    /* A segment that only clears its target still changes the image later
+     * draws sample.  Execute the clear in recording order and associate the
+     * RT, but do not count it as a rendered scene pass. */
+    if (sg->draw_count == 0) {
+        GfxRenderTargetLayout clayout = sg->layout;
+        GfxOffscreenTarget *crt = nvn_host_rt_get_owner(sg->width, sg->height,
+                                                        &clayout, sg->color0_tex);
+        if (!crt) {
+            pthread_mutex_unlock(&g_retired_lock);
+            return 0;
+        }
+        int cleared = 0;
+        if (sg->clear_count) {
+            if (nvn_trace_inputs())
+                fprintf(stderr, "[totk-frame] clear-begin %ux%u rgba=%.3f,%.3f,%.3f,%.3f\n",
+                        sg->width, sg->height, sg->clear_rgba[0], sg->clear_rgba[1],
+                        sg->clear_rgba[2], sg->clear_rgba[3]);
+            cleared = gfx_backend_offscreen_clear(crt, sg->clear_rgba[0],
+                                                  sg->clear_rgba[1], sg->clear_rgba[2],
+                                                  sg->clear_rgba[3]);
+            if (nvn_trace_inputs())
+                fprintf(stderr, "[totk-frame] clear-done %ux%u ok=%d\n",
+                        sg->width, sg->height, cleared);
+        }
+        const tex_t *cctex = nvn_tex_registry_find(sg->color0_tex);
+        if (cleared && cctex)
+            nvn_tex_set_rt(cctex, crt, &clayout, sg->width, sg->height);
+        int sampled = 0;
+        if (cctex) {
+            for (uint32_t j = seg_index + 1; j < e->nseg && !sampled; j++) {
+                const nvn_seg_t *later = &e->seg[j];
+                if (!later->have_last) continue;
+                const nvn_bind_state_t *lb = &later->last.state;
+                for (int st = 0; st < 2 && !sampled; st++)
+                    for (int slot = 0; slot < 128; slot++) {
+                        if (!(lb->tex_mask[st][slot / 32] & (1u << (slot % 32)))) continue;
+                        const tex_t *lt = e->tex_pool
+                            ? nvn_tex_pool_lookup(e->tex_pool,
+                                                  (int)(lb->tex[st][slot] & 0xfffff))
+                            : NULL;
+                        if (!lt) {
+                            uint64_t gh = 0;
+                            const tex_t *gt = NULL;
+                            if (nvn_global_tex_get(st, slot, &gh, &gt) &&
+                                gh == lb->tex[st][slot])
+                                lt = gt;
+                        }
+                        if (lt && (lt == cctex || nvn_tex_same_resource(lt, cctex))) {
+                            sampled = 1;
+                            break;
+                        }
+                    }
+            }
+        }
+        e->age = ++g_retired_age;
+        nvn_scene_submits++;
+        uint32_t ncmds = sg->ncmds, ccount = sg->clear_count;
+        float cr = sg->clear_rgba[0], cg = sg->clear_rgba[1];
+        float cb = sg->clear_rgba[2], ca = sg->clear_rgba[3];
+        uint32_t cmask = sg->clear_mask;
+        uint32_t first = sg->first_cmd;
+        pthread_mutex_unlock(&g_retired_lock);
+        if (nvn_trace_frame() || nvn_trace_inputs())
+            fprintf(stderr, "[totk-frame] clear-seg handle=%#llx seg=%u cmd=[%u,%u)"
+                            " target=%p %ux%u clears=%u rgba=%.3f,%.3f,%.3f,%.3f"
+                            " mask=%#x cleared=%d sampled_later=%d\n",
+                    (unsigned long long)handle, seg_index, first, first + ncmds,
+                    sg->color0_tex, sg->width, sg->height, ccount, cr, cg, cb, ca,
+                    cmask, cleared, sampled);
         return 0;
     }
     const nvn_bind_state_t *seed = (sg->have_last && sg->last.have_state)
@@ -8851,6 +8930,9 @@ static int nvn_seg_probe_tex(tex_t *t, uint32_t w, uint32_t h) {
     t->d.levels = 1;
     t->d.samples = 1;
     t->d.stride = w;
+    t->L.size = (uint64_t)w * h * 4;
+    t->L.layer_size = t->L.size;
+    t->L.layers = 1;
     t->mem = calloc(1, (size_t)w * h * 4);
     if (!t->mem) return 0;
     nvn_tex_registry_add(t);
@@ -8866,11 +8948,14 @@ int runtime_nvn_segment_selftest(const char *screenshot, int frames) {
     if (!nvnDeviceInitialize(&d, &db)) return 0;
     if (!gfx_backend_vulkan_available()) return 0;
     const uint32_t W = 64, H = 64;
-    tex_t A, B, C;
+    tex_t A, B, C, D;
     if (!nvn_seg_probe_tex(&A, W, H) || !nvn_seg_probe_tex(&B, W, H) ||
-        !nvn_seg_probe_tex(&C, W, H)) {
+        !nvn_seg_probe_tex(&C, W, H) || !nvn_seg_probe_tex(&D, W, H)) {
         return 0;
     }
+    /* Distinct object aliasing A's storage: the sampled path must find A's RT. */
+    tex_t A2 = A;
+    nvn_tex_registry_add(&A2);
     GfxRenderTargetLayout layout;
     memset(&layout, 0, sizeof layout);
     layout.color_count = 1;
@@ -8896,9 +8981,11 @@ int runtime_nvn_segment_selftest(const char *screenshot, int frames) {
     const void *tA[1] = { &A };
     const void *tB[1] = { &B };
     const void *tC[1] = { &C };
+    const void *tD[1] = { &D };
     const float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
     const float green[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
     const float blue[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+    const float white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     nvnCommandBufferBeginRecording(&cb);
     nvnCommandBufferSetRenderTargets(&cb, 1, tA, NULL, NULL, NULL);
     nvnCommandBufferClearColor(&cb, 0, red, 0xf);
@@ -8910,9 +8997,12 @@ int runtime_nvn_segment_selftest(const char *screenshot, int frames) {
     nvnCommandBufferSetViewport(&cb, 0, 0, (int)W, (int)H);
     nvnCommandBufferSetScissor(&cb, 0, 0, (int)W, (int)H);
     nvnCommandBufferDrawArrays(&cb, NVN_DRAW_TRIANGLES, 0, 3);
-    /* Clear-only target: must be detected as empty, never submitted as a pass. */
+    /* Clear-only targets: execute the clears in order and associate the RTs so
+     * a later sample sees the cleared image. */
     nvnCommandBufferSetRenderTargets(&cb, 1, tC, NULL, NULL, NULL);
     nvnCommandBufferClearColor(&cb, 0, blue, 0xf);
+    nvnCommandBufferSetRenderTargets(&cb, 1, tD, NULL, NULL, NULL);
+    nvnCommandBufferClearColor(&cb, 0, white, 0xf);
     uint64_t handle = nvnCommandBufferEndRecording(&cb);
     nvnCommandBufferFinalize(&cb);
 
@@ -8925,50 +9015,70 @@ int runtime_nvn_segment_selftest(const char *screenshot, int frames) {
     if (!e) ok = 0;
     if (ok) {
         nseg = e->nseg;
-        if (nseg != 3) ok = 0;
-        if (nseg >= 3) {
+        if (nseg != 4) ok = 0;
+        if (nseg >= 4) {
             if (e->seg[0].color0_tex != &A || e->seg[0].draw_count != 3) ok = 0;
             if (e->seg[1].color0_tex != &B || e->seg[1].draw_count != 3) ok = 0;
-            if (e->seg[2].color0_tex != &C || e->seg[2].draw_count != 0) ok = 0;
+            if (e->seg[2].color0_tex != &C || e->seg[2].draw_count != 0 ||
+                e->seg[2].clear_count == 0) ok = 0;
+            if (e->seg[3].color0_tex != &D || e->seg[3].draw_count != 0 ||
+                e->seg[3].clear_count == 0) ok = 0;
         }
         for (uint32_t i = 0; i < nseg; i++)
-            if (e->seg[i].draw_count > 0 && e->seg[i].have_layout) queued++;
+            if ((e->seg[i].draw_count > 0 || e->seg[i].clear_count > 0) &&
+                e->seg[i].have_layout) queued++;
     }
     pthread_mutex_unlock(&g_retired_lock);
 
     unsigned rendered_before = nvn_scene_rendered;
+    unsigned submits_before = nvn_scene_submits;
     nvn_scene_submit_pending();
     unsigned rendered = nvn_scene_rendered - rendered_before;
+    unsigned submitted = nvn_scene_submits - submits_before;
 
     GfxOffscreenTarget *rtA = nvn_host_rt_get_owner(W, H, &layout, &A);
     GfxOffscreenTarget *rtB = nvn_host_rt_get_owner(W, H, &layout, &B);
-    if (!rtA || !rtB || rtA == rtB) {
-        fprintf(stderr, "[totk-nvn] segment probe: host targets A=%p B=%p\n",
-                (void *)rtA, (void *)rtB);
+    GfxOffscreenTarget *rtC = nvn_host_rt_get_owner(W, H, &layout, &C);
+    GfxOffscreenTarget *rtD = nvn_host_rt_get_owner(W, H, &layout, &D);
+    if (!rtA || !rtB || rtA == rtB || !rtC || !rtD) {
+        fprintf(stderr, "[totk-nvn] segment probe: host targets A=%p B=%p C=%p D=%p\n",
+                (void *)rtA, (void *)rtB, (void *)rtC, (void *)rtD);
         ok = 0;
     }
     uint8_t a_corner[4] = {0}, b_corner[4] = {0};
     uint8_t a_center[4] = {0}, b_center[4] = {0};
+    uint8_t c_corner[4] = {0}, d_corner[4] = {0};
     if (rtA && rtB) {
         ok &= gfx_backend_offscreen_read_pixel_index(rtA, 0, 4, 4, a_corner) != 0;
         ok &= gfx_backend_offscreen_read_pixel_index(rtB, 0, 4, 4, b_corner) != 0;
         ok &= gfx_backend_offscreen_read_pixel_index(rtA, 0, W / 2, H / 2, a_center) != 0;
         ok &= gfx_backend_offscreen_read_pixel_index(rtB, 0, W / 2, H / 2, b_center) != 0;
+        if (rtC) ok &= gfx_backend_offscreen_read_pixel_index(rtC, 0, 4, 4, c_corner) != 0;
+        if (rtD) ok &= gfx_backend_offscreen_read_pixel_index(rtD, 0, 4, 4, d_corner) != 0;
     }
     int a_red = a_corner[0] > 180 && a_corner[1] < 80 && a_corner[2] < 80;
     int b_green = b_corner[1] > 180 && b_corner[0] < 80 && b_corner[2] < 80;
     int centers_drawn = (a_center[0] || a_center[1] || a_center[2]) &&
                         (b_center[0] || b_center[1] || b_center[2]);
-    if (!a_red || !b_green || !centers_drawn) ok = 0;
+    int c_blue = c_corner[2] > 180 && c_corner[0] < 80 && c_corner[1] < 80;
+    int d_white = d_corner[0] > 180 && d_corner[1] > 180 && d_corner[2] > 180;
+    if (!a_red || !b_green || !centers_drawn || !c_blue || !d_white) ok = 0;
+    if (submitted != 4) ok = 0;
 
     /* Sample paths must use the segment that drew to each texture. */
     GfxTexture *ga = nvn_texture_gfx_ready(&A);
     GfxTexture *gb = nvn_texture_gfx_ready(&B);
+    GfxTexture *gd = nvn_texture_gfx_ready(&D);
+    GfxTexture *ga2 = nvn_texture_gfx_ready(&A2);
     const tex_bridge_t *ba = nvn_tex_bridge(&A, 0);
     const tex_bridge_t *bb = nvn_tex_bridge(&B, 0);
+    const tex_bridge_t *bd = nvn_tex_bridge(&D, 0);
+    const tex_bridge_t *ba2 = nvn_tex_bridge(&A2, 0);
     int a_gen = ba && ba->rt_valid && ba->rt_uploaded == ba->rt_frame;
     int b_gen = bb && bb->rt_valid && bb->rt_uploaded == bb->rt_frame;
-    if (!ga || !gb || !a_gen || !b_gen) ok = 0;
+    int d_gen = bd && bd->rt_valid && bd->rt_uploaded == bd->rt_frame;
+    int alias = ba2 && ba2 == ba && ba2->rt_valid;
+    if (!ga || !gb || !gd || !ga2 || !a_gen || !b_gen || !d_gen || !alias) ok = 0;
 
     if (screenshot && *screenshot && rtA && rtB) {
         char path[PATH_MAX];
@@ -8979,19 +9089,26 @@ int runtime_nvn_segment_selftest(const char *screenshot, int frames) {
     }
     fprintf(stderr, "[totk-nvn] segment probe segs=%u queued=%u rendered=%u"
                     " A=%02x%02x%02x B=%02x%02x%02x centerA=%02x%02x%02x"
-                    " centerB=%02x%02x%02x txtA=%p txtB=%p ok=%d\n",
+                    " centerB=%02x%02x%02x C=%02x%02x%02x D=%02x%02x%02x"
+                    " submitted=%u txtA=%p txtB=%p alias=%d ok=%d\n",
             nseg, queued, rendered, a_corner[0], a_corner[1], a_corner[2],
             b_corner[0], b_corner[1], b_corner[2],
             a_center[0], a_center[1], a_center[2], b_center[0], b_center[1],
-            b_center[2], (void *)ga, (void *)gb, ok);
+            b_center[2], c_corner[0], c_corner[1], c_corner[2],
+            d_corner[0], d_corner[1], d_corner[2], submitted,
+            (void *)ga, (void *)gb, alias, ok);
     if (ga) nvn_texture_bridge_drop(&A);
     if (gb) nvn_texture_bridge_drop(&B);
+    if (gd) nvn_texture_bridge_drop(&D);
     nvn_tex_registry_del(&A);
+    nvn_tex_registry_del(&A2);
     nvn_tex_registry_del(&B);
     nvn_tex_registry_del(&C);
+    nvn_tex_registry_del(&D);
     free(A.mem);
     free(B.mem);
     free(C.mem);
+    free(D.mem);
     nvnProgramFinalize(&prog);
     fprintf(stderr, "[totk-nvn] segment selftest %s\n", ok ? "PASS" : "FAIL");
     return ok;
