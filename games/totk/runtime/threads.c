@@ -659,6 +659,55 @@ static uint64_t yield_backoff_ns(uint64_t run_ns) {
     return s < (uint64_t)cap ? s : (uint64_t)cap;
 }
 
+static int arb_load_trace(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_ANDROID_TRACE_LOAD"); v = e && atoi(e) >= 2; }
+    return v;
+}
+typedef struct { uint64_t addr; int type; int32_t val; unsigned count; } arb_seen_t;
+static arb_seen_t g_arb_wait_seen[64], g_arb_sig_seen[64];
+static unsigned g_arb_wait_n, g_arb_sig_n, g_arb_wake_log;
+static uint64_t g_arb_watch[16];
+static int g_arb_nwatch = -1;
+static unsigned g_arb_watch_lines;
+static int arb_watch_match(uint64_t addr) {
+    if (g_arb_nwatch < 0) {
+        g_arb_nwatch = 0;
+        const char *e = getenv("TOTK_ANDROID_LOAD_WATCH");
+        while (e && *e && g_arb_nwatch < 16) {
+            char *end = NULL;
+            uint64_t v = strtoull(e, &end, 0);
+            if (end == e) break;
+            g_arb_watch[g_arb_nwatch++] = v;
+            e = *end == ',' ? end + 1 : end;
+            while (*e == ' ') e++;
+        }
+    }
+    for (int i = 0; i < g_arb_nwatch; i++) if (g_arb_watch[i] == addr) return 1;
+    return 0;
+}
+static void arb_note(arb_seen_t *tab, unsigned *n, uint64_t addr, int type, int32_t val,
+                     const char *what, uint32_t tid, const char *module, uint64_t off,
+                     int extra, int extra2, int nw) {
+    int watch = arb_watch_match(addr);
+    if (watch && g_arb_watch_lines++ < 600)
+        fprintf(stderr, "[totk-arb] WATCH %s tid=%#x addr=%#llx type=%d val=%d cnt=%d extra=%d/%d waiters=%d site=%s+%#llx\n",
+                what, tid, (unsigned long long)addr, type, val, tab ? 0 : 0, extra, extra2, nw,
+                module ? module : "?", (unsigned long long)off);
+    for (unsigned i = 0; i < *n; i++) if (tab[i].addr == addr && tab[i].type == type && tab[i].val == val) {
+        tab[i].count++;
+        if (tab[i].count == 2 || (tab[i].count % 10000) == 0)
+            fprintf(stderr, "[totk-arb] %s tid=%#x addr=%#llx type=%d val=%d n=%u extra=%d/%d waiters=%d\n",
+                    what, tid, (unsigned long long)addr, type, val, tab[i].count, extra, extra2, nw);
+        return;
+    }
+    if (*n >= 64) return;
+    tab[*n] = (arb_seen_t){ addr, type, val, 1 };
+    (*n)++;
+    fprintf(stderr, "[totk-arb] %s tid=%#x addr=%#llx type=%d val=%d n=1 extra=%d/%d waiters=%d site=%s+%#llx\n",
+            what, tid, (unsigned long long)addr, type, val, extra, extra2, nw,
+            module ? module : "?", (unsigned long long)off);
+}
 int svc_thread(int num, uint64_t *regs) {
     { thr_t *me = (g_keythr ? pthread_getspecific(g_keythr) : NULL); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->last_fp = regs[29]; me->nsvc++; } }
 
@@ -818,6 +867,9 @@ int svc_thread(int num, uint64_t *regs) {
         int64_t r; uint32_t v = ld32(addr);
         int ok = type == 2 ? (int32_t)v == val : (int32_t)v < val;
         if (ok && type == 1) { while (!cas32(addr, &v, v - 1)) if (!((int32_t)v < val)) { ok = 0; break; } }
+        if (arb_load_trace())
+            arb_note(g_arb_wait_seen, &g_arb_wait_n, addr, type, val, "wait",
+                     t ? t->handle : 0, "lr", (uint64_t)regs[30], (int)v, ok, 0);
         if (!ok) r = R_BAD_STATE;
         else { t->waddr = addr; r = block(t, 3, (int64_t)regs[3]); }
         pthread_mutex_unlock(&G);
@@ -827,6 +879,9 @@ int svc_thread(int num, uint64_t *regs) {
         uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2]; int cnt = (int)regs[3];
         pthread_mutex_lock(&G);
         int nw = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 3 && w->waddr == addr) nw++;
+        if (arb_load_trace())
+            arb_note(g_arb_sig_seen, &g_arb_sig_n, addr, type, val, "signal",
+                     cur() ? cur()->handle : 0, "lr", (uint64_t)regs[30], cnt, 0, nw);
         int64_t r = 0;
         if (type != 0) {
             int32_t nv = val + 1;
@@ -840,7 +895,14 @@ int svc_thread(int num, uint64_t *regs) {
             if (!cas32(addr, &e, (uint32_t)nv)) r = R_BAD_STATE;
         }
         if (!r) { int n = 0;
-            for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(3, addr)); n++) wake(w, 0); }
+            for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(3, addr)); n++) {
+                if (arb_load_trace() && nw > 0 && g_arb_wake_log < 200) {
+                    g_arb_wake_log++;
+                    fprintf(stderr, "[totk-arb] wake addr=%#llx target tid=%#x\n",
+                            (unsigned long long)addr, w->handle);
+                }
+                wake(w, 0);
+            } }
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }

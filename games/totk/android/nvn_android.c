@@ -7274,10 +7274,11 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             extern unsigned runtime_nvn_tex_pool_regs(void);
             extern unsigned runtime_oe_try_calls(void);
             extern unsigned runtime_oe_pop_calls(void);
+            extern unsigned runtime_fs_errors(void);
             fprintf(stderr, "[totk-load] draw=%u fs=%lu last=\"%s\" texpool=%u"
-                            " oe_try=%u oe_pop=%u hid=%lu buttons=%#x scene=%u/%u\n",
+                            " fs_err=%u oe_try=%u oe_pop=%u hid=%lu buttons=%#x scene=%u/%u\n",
                     total, runtime_fs_ops(), runtime_fs_last_op(),
-                    runtime_nvn_tex_pool_regs(), runtime_oe_try_calls(),
+                    runtime_nvn_tex_pool_regs(), runtime_fs_errors(), runtime_oe_try_calls(),
                     runtime_oe_pop_calls(), runtime_hid_polls(), runtime_hid_buttons(),
                     nvn_scene_rendered, nvn_scene_submits);
         }
