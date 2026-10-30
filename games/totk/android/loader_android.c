@@ -2289,6 +2289,17 @@ int main(int argc, char **argv) {
                iterations);
         return 0;
     }
+    if (!strcmp(argv[2], "probe-nvn-prog-abi")) {
+        int runtime_nvn_prog_abi_selftest(void);
+        if (!runtime_nvn_prog_abi_selftest()) {
+            fprintf(stderr, "[totk-nvn] NVNprogram ABI selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\","
+               "\"probe\":\"nvn-prog-abi\",\"size\":112,"
+               "\"sd2_data\":40,\"sd2_control\":48,\"serial\":104}\n");
+        return 0;
+    }
     if (!strcmp(argv[2], "probe-nvn-fence")) {
         int runtime_nvn_fence_selftest(void);
         if (!runtime_nvn_fence_selftest()) {

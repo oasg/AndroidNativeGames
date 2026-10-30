@@ -742,18 +742,19 @@ static uint32_t g_pool_clock = 1, g_pool_epoch = 1;
 static int g_pool_map_ready;
 static pthread_mutex_t g_pool_map_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Guest NVNprogram ABI (matches
+ * games/totk/third_party/d2r_gfx/gfx/nvn/nvn_obj.h): the shader data/control
+ * pairs are interleaved 16-byte entries.  Host-private pipeline/texture state
+ * lives in prog_shader_state_t, not in this guest-visible object. */
+typedef struct { uint64_t data; const void *control; } nvn_shader_data_t;
 typedef struct {
     uint32_t magic, nstage;
-    uint64_t data[6];
-    const void *control[6];
-    void *gfx_pipeline;       /* host Vulkan pipeline for the 2B.3 draw path */
-    void *gfx_textured_pipeline;
-    void *gfx_texture;
-    void *gfx_reflected_pipeline;  /* full .res.json descriptor layout */
-    void *shader_state;       /* obsolete: shader state lives in prog_state map */
-    uint32_t textured;
+    nvn_shader_data_t sd[6];
     uint64_t serial;
 } prog_t;
+_Static_assert(sizeof(prog_t) <= 0xC0, "NVNprogram guest ABI size");
+_Static_assert(offsetof(prog_t, sd) == 8, "NVNprogram sd offset");
+_Static_assert(offsetof(prog_t, serial) == 0x68, "NVNprogram serial offset");
 
 typedef struct {
     uint32_t magic, state;    /* 0 pending, 1 signaled (GPU completion seen) */
@@ -4902,6 +4903,12 @@ typedef struct {
     uint64_t pipe_variant_sig[NVN_PROG_PIPE_SLOTS];
     unsigned npipes, pipe_next;
     void *owner;                     /* guest program this state belongs to */
+    /* Host-private program resources (never stored in the guest NVNprogram). */
+    void *gfx_pipeline;              /* basic triangle pipeline */
+    void *gfx_textured_pipeline;     /* basic textured triangle pipeline */
+    void *gfx_texture;               /* texture used by the textured pipeline */
+    GfxReflectedPipeline *gfx_reflected_pipeline; /* full reflected pipeline */
+    uint32_t textured;
     /* Reflection used to build the current pipeline, for the per-submit
      * slot->binding bridge (especially NVN uniform-buffer index vs shader
      * constant-bank slot). */
@@ -5031,6 +5038,57 @@ static prog_shader_state_t *prog_state_remove(prog_t *p) {
     return NULL;
 }
 
+typedef struct {
+    void *gfx_pipeline;
+    void *gfx_textured_pipeline;
+    void *gfx_texture;
+    GfxReflectedPipeline *gfx_reflected_pipeline;
+    uint32_t textured;
+} prog_host_t;
+
+/* Host-only program resources.  The guest NVNprogram contains no host
+ * pointers; everything that used to live at +0x68.. is kept here. */
+static prog_shader_state_t *prog_state_ensure(prog_t *p) {
+    pthread_mutex_lock(&g_prog_lock);
+    prog_shader_state_t *s = prog_state_find(p);
+    if (!s) {
+        s = calloc(1, sizeof *s);
+        if (s) {
+            s->owner = p;
+            if (!prog_state_install(p, s)) { free(s); s = NULL; }
+        }
+    }
+    pthread_mutex_unlock(&g_prog_lock);
+    return s;
+}
+static prog_host_t prog_host_view(prog_t *p) {
+    prog_host_t h;
+    memset(&h, 0, sizeof h);
+    pthread_mutex_lock(&g_prog_lock);
+    prog_shader_state_t *s = prog_state_find(p);
+    if (s) {
+        h.gfx_pipeline = s->gfx_pipeline;
+        h.gfx_textured_pipeline = s->gfx_textured_pipeline;
+        h.gfx_texture = s->gfx_texture;
+        h.gfx_reflected_pipeline = s->gfx_reflected_pipeline;
+        h.textured = s->textured;
+    }
+    pthread_mutex_unlock(&g_prog_lock);
+    return h;
+}
+static void prog_host_set(prog_t *p, void *gfx_pipeline, void *gfx_textured_pipeline,
+                          void *gfx_texture, GfxReflectedPipeline *reflected,
+                          uint32_t textured) {
+    prog_shader_state_t *s = prog_state_ensure(p);
+    if (!s) return;
+    pthread_mutex_lock(&g_prog_lock);
+    if (gfx_pipeline) s->gfx_pipeline = gfx_pipeline;
+    if (gfx_textured_pipeline) s->gfx_textured_pipeline = gfx_textured_pipeline;
+    if (gfx_texture) s->gfx_texture = gfx_texture;
+    if (reflected) s->gfx_reflected_pipeline = reflected;
+    s->textured = textured;
+    pthread_mutex_unlock(&g_prog_lock);
+}
 static uint32_t nvnProgramInitialize(prog_t *p, const nvn_dev_t *d) { nvn_api("nvnProgramInitialize");
     if (!p || !nvn_obj(d, NVN_MAGIC('D', 'E', 'V', 0), "nvnProgramInitialize(device)")) return 0;
     memset(p, 0, sizeof *p);
@@ -5040,16 +5098,14 @@ static uint32_t nvnProgramInitialize(prog_t *p, const nvn_dev_t *d) { nvn_api("n
 }
 static void nvnProgramFinalize(prog_t *p) {
     if (!p) return;
-    if (p->gfx_reflected_pipeline) {
-        gfx_backend_reflected_pipeline_destroy((GfxReflectedPipeline *)p->gfx_reflected_pipeline);
-        p->gfx_reflected_pipeline = NULL;
-    }
-
     pthread_mutex_lock(&g_prog_lock);
     prog_shader_state_t *s = prog_state_remove(p);
     if (nvn_trace())
         fprintf(stderr, "[totk-nvn] ProgramFinalize %p state=%p\n", (void *)p, (void *)s);
     if (s) {
+        if (s->gfx_reflected_pipeline)
+            gfx_backend_reflected_pipeline_destroy(s->gfx_reflected_pipeline);
+        s->gfx_reflected_pipeline = NULL;
         prog_state_clear_locked(s);
         free(s);
     }
@@ -5134,8 +5190,8 @@ static uint32_t nvn_program_set_shaders(prog_t *p, int n, const void *shaders,
         const void *control = NULL;
         memcpy(&data, entry, 8);
         memcpy(&control, entry + 8, 8);
-        p->data[i] = data;
-        p->control[i] = control;
+        p->sd[i].data = data;
+        p->sd[i].control = control;
 
         RuntimeShaderIdentity id;
         const void *code = NULL;
@@ -5240,8 +5296,8 @@ static uint32_t nvn_program_set_shaders(prog_t *p, int n, const void *shaders,
         memcpy(&f30, (const uint8_t *)p + 0x30, 8);
         memcpy(&f38, (const uint8_t *)p + 0x38, 8);
         fprintf(stderr, "[totk-save-ui] prog-fields %p n=%d nstage=%u data0=%#llx ctl0=%p f28=%#llx f30=%#llx f38=%#llx\n",
-                (void *)p, n, p->nstage, (unsigned long long)p->data[0],
-                (void *)p->control[0], (unsigned long long)f28,
+                (void *)p, n, p->nstage, (unsigned long long)p->sd[0].data,
+                p->sd[0].control, (unsigned long long)f28,
                 (unsigned long long)f30, (unsigned long long)f38);
     }
     return 1;
@@ -5289,7 +5345,7 @@ int runtime_nvn_program_load_spirv(void *prog, const char *vs_path, const char *
         fprintf(stderr, "[totk-nvn] ERROR create pipeline from translated SPIR-V\n");
         return 0;
     }
-    p->gfx_pipeline = pipeline;
+    prog_host_set(p, pipeline, NULL, NULL, NULL, 0);
     fprintf(stderr, "[totk-nvn] loaded translated SPIR-V vs=%s ps=%s\n", vs_path, ps_path);
     return 1;
 }
@@ -5321,7 +5377,7 @@ int runtime_nvn_program_load_spirv_reflect(void *prog, const char *vs_path, cons
         fprintf(stderr, "[totk-nvn] ERROR create reflected pipeline vs=%s ps=%s\n", vs_path, ps_path);
         return 0;
     }
-    p->gfx_reflected_pipeline = pipeline;
+    prog_host_set(p, NULL, NULL, NULL, pipeline, 0);
     fprintf(stderr, "[totk-nvn] loaded reflected SPIR-V vs=%s(%u) ps=%s(%u)\n",
             vs_path, nvs, ps_path, nps);
     return 1;
@@ -5331,29 +5387,32 @@ int runtime_nvn_program_bind_texture(void *prog, uint32_t set, uint32_t binding,
                                      const void *texture) {
     prog_t *p = prog;
     const tex_t *t = texture;
-    if (!p || p->magic != NVN_MAGIC('P', 'R', 'O', 'G') || !p->gfx_reflected_pipeline ||
+    if (!p || p->magic != NVN_MAGIC('P', 'R', 'O', 'G') ||
         !t || t->magic != NVN_MAGIC('T', 'E', 'X', 0)) return 0;
+    prog_host_t h = prog_host_view(p);
+    if (!h.gfx_reflected_pipeline) return 0;
     GfxTexture *g = nvn_texture_gfx(t);
     if (!g) return 0;
-    return gfx_backend_reflected_bind_texture((GfxReflectedPipeline *)p->gfx_reflected_pipeline,
-                                              set, binding, g);
+    return gfx_backend_reflected_bind_texture(h.gfx_reflected_pipeline, set, binding, g);
 }
 
 int runtime_nvn_program_write_uniform(void *prog, uint32_t set, uint32_t binding,
                                       uint32_t offset, const void *data, size_t size) {
     prog_t *p = prog;
-    if (!p || p->magic != NVN_MAGIC('P', 'R', 'O', 'G') || !p->gfx_reflected_pipeline)
-        return 0;
-    return gfx_backend_reflected_write_uniform((GfxReflectedPipeline *)p->gfx_reflected_pipeline,
+    if (!p || p->magic != NVN_MAGIC('P', 'R', 'O', 'G')) return 0;
+    prog_host_t h = prog_host_view(p);
+    if (!h.gfx_reflected_pipeline) return 0;
+    return gfx_backend_reflected_write_uniform(h.gfx_reflected_pipeline,
                                                set, binding, offset, data, size);
 }
 
 int runtime_nvn_program_write_storage(void *prog, uint32_t set, uint32_t binding,
                                       uint32_t offset, const void *data, size_t size) {
     prog_t *p = prog;
-    if (!p || p->magic != NVN_MAGIC('P', 'R', 'O', 'G') || !p->gfx_reflected_pipeline)
-        return 0;
-    return gfx_backend_reflected_write_storage((GfxReflectedPipeline *)p->gfx_reflected_pipeline,
+    if (!p || p->magic != NVN_MAGIC('P', 'R', 'O', 'G')) return 0;
+    prog_host_t h = prog_host_view(p);
+    if (!h.gfx_reflected_pipeline) return 0;
+    return gfx_backend_reflected_write_storage(h.gfx_reflected_pipeline,
                                                set, binding, offset, data, size);
 }
 
@@ -6782,11 +6841,11 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
     }
     const tex_t *ctex = nvn_tex_registry_find(sg->color0_tex);
     int has_program = p && p->magic == NVN_MAGIC('P', 'R', 'O', 'G');
+    prog_host_t ph = has_program ? prog_host_view(p) : (prog_host_t){0};
     GfxVertexLayout input;
     uint64_t sig = 0;
     nvn_build_vertex_layout(bs, &input, &sig);
-    GfxReflectedPipeline *rp = has_program
-                              ? (GfxReflectedPipeline *)p->gfx_reflected_pipeline : NULL;
+    GfxReflectedPipeline *rp = has_program ? ph.gfx_reflected_pipeline : NULL;
     if (!rp && has_program) {
         char variant[192];
         nvn_variant_suffix(p, &view, variant, sizeof variant);
@@ -7250,8 +7309,8 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                         (void *)cb, input.bindings[bi].binding, input.bindings[bi].stride,
                         input.bindings[bi].input_rate);
         }
-        GfxReflectedPipeline *reflected = has_program
-            ? (GfxReflectedPipeline *)p->gfx_reflected_pipeline : NULL;
+        prog_host_t ph = has_program ? prog_host_view(p) : (prog_host_t){0};
+        GfxReflectedPipeline *reflected = has_program ? ph.gfx_reflected_pipeline : NULL;
         if (!reflected && has_program) {
             char variant[192];
             nvn_variant_suffix(p, cb, variant, sizeof variant);
@@ -7305,11 +7364,11 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             for (uint32_t oi = 0; oi < nowned; oi++) free(owned[oi]);
             free(translated);
             if (drew && !window_pass) nvn_window_mirror_target(w, rt);
-        } else if (has_program && p->textured && p->gfx_textured_pipeline && p->gfx_texture) {
-            drew = runtime_native_window_draw_textured_triangle(w->native, p->gfx_textured_pipeline,
-                                                                p->gfx_texture);
-        } else if (has_program && p->gfx_pipeline) {
-            drew = runtime_native_window_draw_triangle_pipeline(w->native, p->gfx_pipeline);
+        } else if (has_program && ph.textured && ph.gfx_textured_pipeline && ph.gfx_texture) {
+            drew = runtime_native_window_draw_textured_triangle(w->native, ph.gfx_textured_pipeline,
+                                                                ph.gfx_texture);
+        } else if (has_program && ph.gfx_pipeline) {
+            drew = runtime_native_window_draw_triangle_pipeline(w->native, ph.gfx_pipeline);
         } else {
             /* Clear-only command buffer, or a program whose shaders are not in
              * the cache: honour the recorded clear and present a real frame
@@ -7420,9 +7479,10 @@ int runtime_nvn_draw_selftest(const char *screenshot, int frames,
     if (vs_path && *vs_path && ps_path && *ps_path) {
         if (!runtime_nvn_program_load_spirv(&p, vs_path, ps_path)) return 0;
     } else {
-        p.gfx_pipeline = gfx_backend_builtin_triangle_pipeline();
+        GfxTrianglePipeline *bp = gfx_backend_builtin_triangle_pipeline();
+        prog_host_set(&p, bp, NULL, NULL, NULL, 0);
+        if (!bp) return 0;
     }
-    if (!p.gfx_pipeline) return 0;
     win_t w;
     win_builder_t wb;
     memset(&w, 0, sizeof w);
@@ -7481,7 +7541,7 @@ int runtime_nvn_cb_lifetime_selftest(void) {
     prog_t p;
     memset(&p, 0, sizeof p);
     if (!nvnProgramInitialize(&p, &d)) { runtime_native_window_destroy(nw); return 0; }
-    p.gfx_pipeline = gfx_backend_builtin_triangle_pipeline();
+    prog_host_set(&p, gfx_backend_builtin_triangle_pipeline(), NULL, NULL, NULL, 0);
     win_t w;
     win_builder_t wb;
     memset(&w, 0, sizeof w);
@@ -7557,8 +7617,9 @@ int runtime_nvn_cb_call_selftest(void) {
     prog_t p;
     memset(&p, 0, sizeof p);
     ok &= nvnProgramInitialize(&p, &d) != 0;
-    p.gfx_pipeline = gfx_backend_builtin_triangle_pipeline();
-    ok &= p.gfx_pipeline != NULL;
+    GfxTrianglePipeline *bp = gfx_backend_builtin_triangle_pipeline();
+    prog_host_set(&p, bp, NULL, NULL, NULL, 0);
+    ok &= bp != NULL;
     win_t w;
     win_builder_t wb;
     memset(&w, 0, sizeof w);
@@ -8603,9 +8664,7 @@ int runtime_nvn_textured_draw_selftest(const char *screenshot, int frames) {
     prog_t p;
     memset(&p, 0, sizeof p);
     if (!nvnProgramInitialize(&p, &d)) { free(pool_mem); return 0; }
-    p.gfx_textured_pipeline = tp;
-    p.gfx_texture = tex_gfx;
-    p.textured = 1;
+    prog_host_set(&p, NULL, tp, tex_gfx, NULL, 1);
     win_t w;
     win_builder_t wb;
     memset(&w, 0, sizeof w);
@@ -8684,8 +8743,9 @@ int runtime_nvn_texture_bind_selftest(const char *screenshot, int frames) {
     prog_t p;
     memset(&p, 0, sizeof p);
     if (!nvnProgramInitialize(&p, &d)) { free(pool_mem); return 0; }
-    p.gfx_reflected_pipeline = gfx_backend_reflected_builtin_texture_pipeline_create();
-    if (!p.gfx_reflected_pipeline) { free(pool_mem); return 0; }
+    GfxReflectedPipeline *rp = gfx_backend_reflected_builtin_texture_pipeline_create();
+    prog_host_set(&p, NULL, NULL, NULL, rp, 0);
+    if (!rp) { free(pool_mem); return 0; }
     if (!runtime_nvn_program_bind_texture(&p, 1, 0, &tex)) {
         fprintf(stderr, "[totk-nvn] ERROR bind real texture to reflected PS\n");
         nvnProgramFinalize(&p); free(pool_mem); return 0;
@@ -9632,7 +9692,7 @@ int runtime_nvn_retired_stress_selftest(int iterations) {
     prog_t prog;
     memset(&prog, 0, sizeof prog);
     if (!nvnProgramInitialize(&prog, &d)) return 0;
-    prog.gfx_reflected_pipeline = pipe;
+    prog_host_set(&prog, NULL, NULL, NULL, pipe, 0);
     const void *tA[1] = { &A };
     const void *tB[1] = { &B };
     const void *tC[1] = { &C };
@@ -9697,6 +9757,56 @@ int runtime_nvn_retired_stress_selftest(int iterations) {
     return ok;
 }
 
+/* probe-nvn-prog-abi: validate the guest-visible NVNprogram layout and that
+ * host pipeline/texture state stays in the side map, not in the guest object. */
+int runtime_nvn_prog_abi_selftest(void) {
+    if (sizeof(prog_t) > 0xC0) return 0;
+    if (offsetof(prog_t, sd[0]) != 0x08 ||
+        offsetof(prog_t, sd[2].data) != 0x28 ||
+        offsetof(prog_t, sd[2].control) != 0x30 ||
+        offsetof(prog_t, serial) != 0x68) return 0;
+    nvn_dev_t d;
+    dev_builder_t db;
+    memset(&d, 0, sizeof d);
+    memset(&db, 0, sizeof db);
+    if (!nvnDeviceInitialize(&d, &db)) return 0;
+    prog_t p;
+    memset(&p, 0, sizeof p);
+    if (!nvnProgramInitialize(&p, &d)) return 0;
+    static uint8_t ctl[0x880];
+    nvn_shader_data_t sd[2] = {
+        { 0x1111, ctl },
+        { 0x2222, ctl },
+    };
+    if (!nvnProgramSetShaders(&p, 2, sd)) return 0;
+    int ok = p.magic == NVN_MAGIC('P', 'R', 'O', 'G') && p.nstage == 2 &&
+             p.sd[0].data == 0x1111 && p.sd[0].control == ctl &&
+             p.sd[1].data == 0x2222 && p.sd[1].control == ctl;
+    for (int i = 2; i < 6; i++)
+        if (p.sd[i].data || p.sd[i].control) ok = 0;
+    prog_shader_state_t *s = NULL;
+    pthread_mutex_lock(&g_prog_lock);
+    s = prog_state_find(&p);
+    pthread_mutex_unlock(&g_prog_lock);
+    if (!s || s->owner != &p) ok = 0;
+    /* Host-only resources must survive independently of the guest bytes. */
+    prog_host_set(&p, (void *)0x1, (void *)0x2, (void *)0x3, NULL, 1);
+    prog_host_t h = prog_host_view(&p);
+    if (h.gfx_pipeline != (void *)0x1 || h.gfx_textured_pipeline != (void *)0x2 ||
+        h.gfx_texture != (void *)0x3 || h.textured != 1) ok = 0;
+    if (p.sd[2].data || p.sd[2].control) ok = 0;
+    nvnProgramFinalize(&p);
+    pthread_mutex_lock(&g_prog_lock);
+    s = prog_state_find(&p);
+    pthread_mutex_unlock(&g_prog_lock);
+    if (s) ok = 0;
+    fprintf(stderr, "[totk-nvn] prog ABI size=%zu sd2=(%#zx,%#zx) serial=%#zx ok=%d\n",
+            sizeof(prog_t), offsetof(prog_t, sd[2].data),
+            offsetof(prog_t, sd[2].control), offsetof(prog_t, serial), ok);
+    fprintf(stderr, "[totk-nvn] prog ABI selftest %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 /* probe-nvn-segment-targets: a synthetic retired recording clears and draws
  * target A, then switches to target B, clears and draws it.  The recording must
  * split into two draw-bearing segments, submit each into its own host target,
@@ -9755,7 +9865,7 @@ int runtime_nvn_segment_selftest(const char *screenshot, int frames) {
     prog_t prog;
     memset(&prog, 0, sizeof prog);
     if (!nvnProgramInitialize(&prog, &d)) return 0;
-    prog.gfx_reflected_pipeline = pipe;
+    prog_host_set(&prog, NULL, NULL, NULL, pipe, 0);
     cb_t cb;
     memset(&cb, 0, sizeof cb);
     if (!nvnCommandBufferInitialize(&cb, &d)) return 0;
