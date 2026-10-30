@@ -327,6 +327,7 @@ static unsigned delete_recursive(const char *path) { char p[1100]; unsigned r = 
 static unsigned open_directory(uint64_t *out, const char *path, int mode) {
     if (runtime_romfs_owns(path)) { fprintf(stderr, "[totk] OpenDirectory on RomFS %s\n", path); runtime_fail("RomFS directory listing not implemented"); }
     char p[1100]; unsigned r = host_path(path, p, sizeof p); if (r) return r; if (!out || mode < 1 || mode > 3) return R_INVALID_ARGUMENT;
+    runtime_fs_log("dir-open", path);
     DIR *d = opendir(p); if (!d) return errno_result();
     pthread_mutex_lock(&lock);
     for (int i = 0; i < NDIRS; i++) if (!dirs[i].dir) { dirs[i].dir = d; dirs[i].mode = mode; strcpy(dirs[i].path, p); *out = DIR_BASE + (uint64_t)i; pthread_mutex_unlock(&lock); return 0; }
@@ -342,6 +343,7 @@ static unsigned read_directory(int64_t *count, DirectoryEntry *out, uint64_t h, 
         int is_dir = S_ISDIR(st.st_mode); if (!(d->mode & (is_dir ? 1 : 2))) continue;
         memset(&out[n], 0, sizeof *out); strcpy(out[n].name, e->d_name); out[n].type = is_dir ? 0 : 1; out[n].size = is_dir ? 0 : st.st_size; n++;
     }
+    runtime_fs_log("dir-read", d->path);
     *count = n; return 0;
 }
 static void close_directory(uint64_t h) {
