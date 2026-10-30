@@ -32,7 +32,8 @@ static int is_spv(const uint8_t *p, size_t n) {
 #define SHADER_LOW_PTR 0x100000ull
 
 static int control_declared_length(const void *control_v, uintptr_t region_start,
-                                   size_t region_size, uint32_t *length_out) {
+                                   size_t region_size, uint32_t *length_out,
+                                   uint32_t *stage_out) {
     uintptr_t control = (uintptr_t)control_v;
     if (!control || control < region_start || control - region_start > region_size ||
         region_size - (control - region_start) < 0x718)
@@ -49,20 +50,24 @@ static int control_declared_length(const void *control_v, uintptr_t region_start
         return 0;
     if (region_size - (control - region_start) < key_len) return 0;
     *length_out = length;
+    if (stage_out) *stage_out = stage;
     return 1;
 }
 
 /* The code section starts with a 0x30-byte SPH header (magic + reserved
- * zeros).  The magic alone is not enough: require a non-empty instruction
- * after the header when the declared length has room for one. */
+ * zeros).  Graphics shaders use 0x12345678 and compute shaders 0x12345679
+ * (verified against the runtime's own .code dumps for vs/ps/cs).  The magic
+ * alone is not enough: require a non-empty instruction after the header when
+ * the declared length has room for one. */
 static int sph_ok(const uint8_t *region, size_t region_size, size_t off,
-                  uint32_t length) {
+                  uint32_t length, uint32_t stage) {
     if (off > region_size || length > region_size - off || length < 4 ||
         (off & 3))
         return 0;
     uint32_t magic;
     memcpy(&magic, region + off, sizeof magic);
-    if (magic != SHADER_SPH_MAGIC) return 0;
+    uint32_t expected = stage == 5 ? 0x12345679u : SHADER_SPH_MAGIC;
+    if (magic != expected) return 0;
     size_t body = off + (length < 0x30 ? length : 0x30);
     for (size_t i = off + 4; i < body; i++)
         if (region[i]) return 0;          /* reserved header bytes are zero */
@@ -144,8 +149,9 @@ static int resolve_in_region_impl(const void *region_v, size_t region_size,
         return 0;
     }
     size_t control_off = control_addr - (uintptr_t)region_v;
-    uint32_t length = 0;
-    if (!control_declared_length(control, (uintptr_t)region_v, region_size, &length)) {
+    uint32_t length = 0, stage = 0;
+    if (!control_declared_length(control, (uintptr_t)region_v, region_size, &length,
+                                 &stage)) {
         info->why = "bad-control";
         return 0;
     }
@@ -161,7 +167,7 @@ static int resolve_in_region_impl(const void *region_v, size_t region_size,
         if (low_addr < pool_size && low_addr + length <= pool_size) {
             size_t off = header + pool + (size_t)low_addr;
             info->candidate = (uintptr_t)region_v + off;
-            if (sph_ok(region, region_size, off, length)) {
+            if (sph_ok(region, region_size, off, length, stage)) {
                 info->why = "bahs-pool";
                 *code = region + off;
                 return 1;
@@ -178,7 +184,7 @@ static int resolve_in_region_impl(const void *region_v, size_t region_size,
      * only when the candidate passes the same SPH/length validation. */
     if (low_addr + length <= region_size) {
         info->candidate = (uintptr_t)region_v + (size_t)low_addr;
-        if (sph_ok(region, region_size, (size_t)low_addr, length)) {
+        if (sph_ok(region, region_size, (size_t)low_addr, length, stage)) {
             info->why = "mapping-absolute";
             *code = region + (size_t)low_addr;
             return 1;

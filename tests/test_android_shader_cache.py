@@ -370,6 +370,59 @@ int main(void) {
     }
     printf("ok miss\n");
 
+    /* Compute controls use SPH magic 0x12345679. */
+    put32(code, 0x12345679u);
+    put32(control + 0x714, 5);           /* stage = cs */
+    out = NULL;
+    if (!runtime_shader_resolve_in_region(region, sizeof region, control, 0x400,
+                                          &out, &info) ||
+        out != code || strcmp(info.why, "bahs-pool") != 0) {
+        printf("FAIL compute out=%p why=%s\n", out, info.why ? info.why : "?");
+        return 1;
+    }
+    printf("ok compute\n");
+
+    put32(code, 0x12345678u);            /* graphics magic on a compute control */
+    out = NULL;
+    if (runtime_shader_resolve_in_region(region, sizeof region, control, 0x400,
+                                         &out, &info) || out != NULL ||
+        strcmp(info.why, "bahs-pool-bad-code") != 0) {
+        printf("FAIL compute-miss out=%p why=%s\n", out, info.why ? info.why : "?");
+        return 1;
+    }
+    printf("ok compute-miss\n");
+
+    /* Two BAHS records: only the nearest one whose record area contains the
+     * control may supply the code pool.  The older package has a decoy pool
+     * at the same offset. */
+    memset(region, 0, sizeof region);
+    memcpy(region + 0x1000, "BAHS", 4);          /* older package A */
+    put32(region + 0x1000 + 20, 0x100);
+    put32(region + 0x1000 + 24, 0x1000);
+    put32(region + 0x1000 + 28, 0x2000);
+    put32(region + 0x1000 + 0x2000 + 0x400, 0xdeadbeefu);
+    memcpy(region + 0x4000, "BAHS", 4);          /* package B, contains control */
+    put32(region + 0x4000 + 20, 0x100);
+    put32(region + 0x4000 + 24, 0x1000);
+    put32(region + 0x4000 + 28, 0x2000);
+    control = region + 0x5000;
+    put32(control + 0x20, 0x880);
+    put32(control + 0x700, 0x100);
+    put32(control + 0x704, 0x100);
+    put32(control + 0x714, 0);
+    code = region + 0x4000 + 0x2000 + 0x400;
+    put32(code, 0x12345678u);
+    put32(code + 0x30, 0xfe0007e1u);
+    out = NULL;
+    if (!runtime_shader_resolve_in_region(region, sizeof region, control, 0x400,
+                                          &out, &info) ||
+        out != code || strcmp(info.why, "bahs-pool") != 0) {
+        printf("FAIL multi-bahs out=%p want=%p why=%s\n", out, (void *)code,
+               info.why ? info.why : "?");
+        return 1;
+    }
+    printf("ok multi-bahs\n");
+
     /* No BAHS: an absolute mapping-base offset still validates. */
     memset(region, 0, sizeof region);
     code = region + 0x400;
@@ -413,6 +466,9 @@ int main(void) {
             self.assertIn('ok bahs-pool', run.stdout)
             self.assertIn('ok pointer', run.stdout)
             self.assertIn('ok miss', run.stdout)
+            self.assertIn('ok compute', run.stdout)
+            self.assertIn('ok compute-miss', run.stdout)
+            self.assertIn('ok multi-bahs', run.stdout)
             self.assertIn('ok absolute', run.stdout)
 
 
