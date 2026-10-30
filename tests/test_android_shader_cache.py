@@ -370,6 +370,28 @@ int main(void) {
     }
     printf("ok miss\n");
 
+    /* Compute controls use SPH magic 0x12345679. */
+    put32(code, 0x12345679u);
+    put32(control + 0x714, 5);           /* stage = cs */
+    out = NULL;
+    if (!runtime_shader_resolve_in_region(region, sizeof region, control, 0x400,
+                                          &out, &info) ||
+        out != code || strcmp(info.why, "bahs-pool") != 0) {
+        printf("FAIL compute out=%p why=%s\n", out, info.why ? info.why : "?");
+        return 1;
+    }
+    printf("ok compute\n");
+
+    put32(code, 0x12345678u);            /* graphics magic on a compute control */
+    out = NULL;
+    if (runtime_shader_resolve_in_region(region, sizeof region, control, 0x400,
+                                         &out, &info) || out != NULL ||
+        strcmp(info.why, "bahs-pool-bad-code") != 0) {
+        printf("FAIL compute-miss out=%p why=%s\n", out, info.why ? info.why : "?");
+        return 1;
+    }
+    printf("ok compute-miss\n");
+
     /* No BAHS: an absolute mapping-base offset still validates. */
     memset(region, 0, sizeof region);
     code = region + 0x400;
@@ -413,6 +435,8 @@ int main(void) {
             self.assertIn('ok bahs-pool', run.stdout)
             self.assertIn('ok pointer', run.stdout)
             self.assertIn('ok miss', run.stdout)
+            self.assertIn('ok compute', run.stdout)
+            self.assertIn('ok compute-miss', run.stdout)
             self.assertIn('ok absolute', run.stdout)
 
 
