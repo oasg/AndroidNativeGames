@@ -85,6 +85,13 @@ static unsigned resolve_overlay(const char *path, char *out, size_t cap) {
     return r ? r : build(root, rest, out, cap);
 }
 
+static unsigned g_romfs_missing;
+static int romfs_load_trace(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_ANDROID_TRACE_LOAD"); on = e && atoi(e) >= 2; }
+    return on;
+}
+unsigned runtime_romfs_missing(void) { return g_romfs_missing; }
 unsigned runtime_romfs_open(uint64_t *out, const char *path, int mode) {
     if (!out || (mode & ~1)) return UNSUPPORTED;   /* the Android RomFS is read-only */
     char p[2048];
@@ -98,10 +105,12 @@ unsigned runtime_romfs_open(uint64_t *out, const char *path, int mode) {
             fprintf(stderr, "[totk-romfs] open %s: overlay %s\n", path, p);
     }
     if (fd < 0) {
-        if (getenv("TOTK_ANDROID_FS_TRACE"))
+        int missing = errno == ENOENT || errno == ENOTDIR;
+        if (missing) g_romfs_missing++;
+        if (getenv("TOTK_ANDROID_FS_TRACE") || romfs_load_trace())
             fprintf(stderr, "[totk-romfs] open %s: %s\n", path,
-                    errno == ENOENT || errno == ENOTDIR ? "not found" : "denied");
-        return errno == ENOENT || errno == ENOTDIR ? NOT_FOUND : INVALID;
+                    missing ? "not found" : "denied");
+        return missing ? NOT_FOUND : INVALID;
     }
     struct stat st;
     if (fstat(fd, &st) || !S_ISREG(st.st_mode)) { close(fd); return NOT_FOUND; }
@@ -109,7 +118,7 @@ unsigned runtime_romfs_open(uint64_t *out, const char *path, int mode) {
         entries[i].fd = fd;
         entries[i].size = (uint64_t)st.st_size;
         *out = HANDLE_BASE + i;
-        if (getenv("TOTK_ANDROID_FS_TRACE"))
+        if (getenv("TOTK_ANDROID_FS_TRACE") || romfs_load_trace())
             fprintf(stderr, "[totk-romfs] open %s handle=%#llx size=%llu\n",
                     path, (unsigned long long)*out, (unsigned long long)st.st_size);
         return 0;

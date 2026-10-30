@@ -23,6 +23,20 @@
 static void runtime_autoload_save_file_opened(const char *path) { (void)path; }
 void dm_guest_write_prepare(void *addr, size_t n) { (void)addr; (void)n; }
 static unsigned long g_fs_ops;
+static unsigned g_fs_errors;
+static int fs_load_trace(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_ANDROID_TRACE_LOAD"); on = e && atoi(e) >= 2; }
+    return on;
+}
+unsigned runtime_fs_errors(void) { return g_fs_errors; }
+static unsigned fs_error(const char *what, const char *path, unsigned r) {
+    g_fs_errors++;
+    if (fs_load_trace())
+        fprintf(stderr, "[totk-load] fs %s failed path=%s result=%#x\n", what,
+                path ? path : "?", r);
+    return r;
+}
 static char g_fs_last[192];
 unsigned long runtime_fs_ops(void) { return __atomic_load_n(&g_fs_ops, __ATOMIC_RELAXED); }
 const char *runtime_fs_last_op(void) { return g_fs_last; }
@@ -243,10 +257,11 @@ static unsigned open_file(uint64_t *out, const char *path, int mode) {
     if (runtime_romfs_owns(path)) return runtime_romfs_open(out, path, mode); BOTW_AOC_OPEN(out, path, mode)
     if (!out || !(mode & (OPEN_READ | OPEN_WRITE)) || (mode & ~7)) return R_INVALID_ARGUMENT;
     char p[1100]; int kind = M_FREE; unsigned r = host_path_kind(path, p, sizeof p, &kind); if (r) return r;
-    struct stat st; if (stat(p, &st)) return R_PATH_NOT_FOUND; if (!S_ISREG(st.st_mode)) return R_PATH_NOT_FOUND;
+    struct stat st; if (stat(p, &st)) return fs_error("open", path, R_PATH_NOT_FOUND);
+    if (!S_ISREG(st.st_mode)) return fs_error("open", path, R_PATH_NOT_FOUND);
     int save_writer = kind == M_SAVE && (mode & OPEN_WRITE);
     int fd = open(p, (mode & OPEN_WRITE ? (mode & OPEN_READ ? O_RDWR : O_WRONLY) : O_RDONLY) | O_NOFOLLOW);
-    if (fd < 0) return errno_result();
+    if (fd < 0) return fs_error("open", path, errno_result());
     runtime_autoload_save_file_opened(path);   /* no-op on Android */
     pthread_mutex_lock(&lock);
     for (int i = 0; i < NFILES; i++) if (files[i].fd <= 0) {
@@ -302,6 +317,7 @@ static void close_file(uint64_t h) {
     if (save) { save_touched(); atomic_fetch_sub(&save_writers, 1); }
 }
 static unsigned create_file(const char *path, int64_t size) {
+    if (fs_load_trace()) fprintf(stderr, "[totk-load] fs create path=%s size=%lld\n", path ? path : "?", (long long)size);
     char p[1100]; unsigned r = save_change_path(path, p, sizeof p); if (r) return r; if (size < 0) return R_INVALID_ARGUMENT;
     int fd = open(p, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600); if (fd < 0) return errno_result();
     int bad = ftruncate(fd, size); close(fd); return bad ? errno_result() : 0;
