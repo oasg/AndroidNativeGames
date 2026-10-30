@@ -6178,6 +6178,21 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
                     }
             }
         }
+        /* The sampling draw often inherits its texture slot from the queue
+         * table instead of carrying the bind in its own snapshot.  Check the
+         * queue-visible slots as well. */
+        if (cctex && !sampled) {
+            for (int st = 0; st < 2 && !sampled; st++)
+                for (int slot = 0; slot < 128; slot++) {
+                    uint64_t gh = 0;
+                    const tex_t *gt = NULL;
+                    if (!nvn_global_tex_get(st, slot, &gh, &gt) || !gt) continue;
+                    if (gt == cctex || nvn_tex_same_resource(gt, cctex)) {
+                        sampled = 1;
+                        break;
+                    }
+                }
+        }
         e->age = ++g_retired_age;
         nvn_scene_submits++;
         uint32_t ncmds = sg->ncmds, ccount = sg->clear_count;
