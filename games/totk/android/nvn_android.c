@@ -2338,6 +2338,7 @@ static int nvn_orphan_seen(uint64_t handle) {
     return 0;
 }
 static unsigned nvn_nvn_draws;
+static int g_nvn_probe;   /* synthetic selftest shaders are not module-backed */
 static unsigned nvn_record_count;   /* BeginRecording calls, for the first-frame trace */
 static unsigned nvn_vtx_trace, nvn_rt_trace, nvn_tex_trace, nvn_draw_trace, nvn_ubo_trace;
 static unsigned nvn_draw_rec_trace, nvn_vaset_trace, nvn_ubo_apply_trace, nvn_tex_apply_trace;
@@ -4561,6 +4562,15 @@ static uint32_t nvn_program_set_shaders(prog_t *p, int n, const void *shaders,
                     (unsigned long)resolved.candidate,
                     resolved.why ? resolved.why : "?");
         }
+        if (!have_code && g_nvn_probe && control && data >= 0x100000 &&
+            runtime_shader_identity(control, (const void *)(uintptr_t)data, &id)) {
+            /* Selftest control blocks are heap allocations, not mapped NVN
+             * modules, so the low-address resolver rejects them.  The probe
+             * stored its cache entry with the same direct identity. */
+            code = (const void *)(uintptr_t)data;
+            have_code = 1;
+            resolved.why = "probe-synthetic";
+        }
         if (!have_code || !runtime_shader_identity(control, code, &id)) {
             fprintf(stderr, "[totk-nvn] %s program=%p slot=%d: no NVN shader identity"
                             " (control=%p data=%#llx code=%p why=%s)\n",
@@ -6654,6 +6664,7 @@ static int nvn_probe_check(const char *what, const uint8_t px[4],
 }
 
 int runtime_nvn_state_selftest(const char *screenshot, int frames) {
+    g_nvn_probe = 1;
     if (frames < 1) frames = 1;
     if (frames > 60) frames = 60;
     void *nw = runtime_native_window_create(1280, 720, 0x25, 0xB1);
@@ -7228,6 +7239,7 @@ int runtime_nvn_state_selftest(const char *screenshot, int frames) {
 }
 
 int runtime_nvn_frame_selftest(const char *screenshot, int frames) {
+    g_nvn_probe = 1;
     if (frames < 1) frames = 1;
     if (frames > 60) frames = 60;
     void *nw = runtime_native_window_create(1280, 720, 0x25, 0xF1);
@@ -7542,6 +7554,7 @@ static int nvn_probe_px_near(const uint8_t a[4], const float c[4], int tol) {
  * that the same program produces distinct pipelines for a 1-target and a
  * 2-target layout (the MRT layout is part of the pipeline key). */
 int runtime_nvn_mrt_selftest(const char *screenshot, int frames) {
+    g_nvn_probe = 1;
     if (frames < 1) frames = 1;
     if (frames > 16) frames = 16;
     int color_fmt = gfx_backend_vk_format_for_nvn(0x25);   /* RGBA8 */
