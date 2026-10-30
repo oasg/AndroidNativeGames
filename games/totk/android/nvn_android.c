@@ -2436,6 +2436,7 @@ static int nvn_orphan_seen(uint64_t handle) {
     return 0;
 }
 static unsigned nvn_nvn_draws;
+static int g_nvn_probe;   /* synthetic selftest shaders are not module-backed */
 static unsigned nvn_record_count;   /* BeginRecording calls, for the first-frame trace */
 static unsigned nvn_vtx_trace, nvn_rt_trace, nvn_tex_trace, nvn_draw_trace, nvn_ubo_trace;
 static unsigned nvn_draw_rec_trace, nvn_vaset_trace, nvn_ubo_apply_trace, nvn_tex_apply_trace;
@@ -4710,6 +4711,15 @@ static uint32_t nvn_program_set_shaders(prog_t *p, int n, const void *shaders,
                     (unsigned long)resolved.candidate,
                     resolved.why ? resolved.why : "?");
         }
+        if (!have_code && g_nvn_probe && control && data >= 0x100000 &&
+            runtime_shader_identity(control, (const void *)(uintptr_t)data, &id)) {
+            /* Selftest control blocks are heap allocations, not mapped NVN
+             * modules, so the low-address resolver rejects them.  The probe
+             * stored its cache entry with the same direct identity. */
+            code = (const void *)(uintptr_t)data;
+            have_code = 1;
+            resolved.why = "probe-synthetic";
+        }
         if (!have_code || !runtime_shader_identity(control, code, &id)) {
             fprintf(stderr, "[totk-nvn] %s program=%p slot=%d: no NVN shader identity"
                             " (control=%p data=%#llx code=%p why=%s)\n",
@@ -6246,13 +6256,44 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
         }
     }
     if (rp) {
-        uint32_t cap = sg->ncmds ? sg->ncmds : 1;
+        /* UI recordings usually set their 360x69 viewport/scissor once, before
+         * the first SetRenderTargets.  The per-target split starts each later
+         * segment at its SetRenderTargets, so without this replay those
+         * segments rasterize with the 0x0 default viewport. */
+        nvn_cmd_t prefix[2];
+        uint32_t npre = 0;
+        if (lw <= 512) {
+            const nvn_cmd_t *vp = NULL, *sc = NULL;
+            int seg_vp = 0, seg_sc = 0;
+            for (uint32_t ci = 0; ci < sg->first_cmd; ci++) {
+                if (e->cmds[ci].kind == NVN_CMD_SET_VIEWPORT) vp = &e->cmds[ci];
+                else if (e->cmds[ci].kind == NVN_CMD_SET_SCISSOR) sc = &e->cmds[ci];
+            }
+            for (uint32_t ci = sg->first_cmd; ci < sg->first_cmd + sg->ncmds; ci++) {
+                if (e->cmds[ci].kind == NVN_CMD_SET_VIEWPORT) seg_vp = 1;
+                else if (e->cmds[ci].kind == NVN_CMD_SET_SCISSOR) seg_sc = 1;
+            }
+            if (vp && !seg_vp) prefix[npre++] = *vp;
+            if (sc && !seg_sc) prefix[npre++] = *sc;
+        }
+        uint32_t cap = (sg->ncmds ? sg->ncmds : 1) + npre;
         GfxCmd *translated = calloc(cap, sizeof *translated);
         if (translated) {
             float clear[4] = { 0.05f, 0.08f, 0.12f, 1.0f };
             int has_clear = 0;
-            uint32_t count = nvn_translate_commands(&view, translated, cap, rt,
-                                                    clear, &has_clear);
+            uint32_t base = 0;
+            if (npre) {
+                cb_t pv = view;
+                nvn_cmd_t pre[2];
+                memcpy(pre, prefix, npre * sizeof *pre);
+                pv.cmds = pre;
+                pv.ncmds = npre;
+                float pclear[4] = { 0, 0, 0, 0 };
+                int phas_clear = 0;
+                base = nvn_translate_commands(&pv, translated, npre, rt, pclear, &phas_clear);
+            }
+            uint32_t count = nvn_translate_commands(&view, translated + base,
+                                                    cap - base, rt, clear, &has_clear) + base;
             nvn_remap_texture_bind_cmds(translated, count, rp);
             nvn_apply_bind_state(p, rp, bs, &view);
             GfxVertexStream streams[24];
@@ -6644,6 +6685,17 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                         l2_frame, shot ? "ok" : "failed");
         }
         unsigned total = __atomic_add_fetch(&nvn_nvn_draws, 1, __ATOMIC_RELAXED);
+        if (getenv("TOTK_ANDROID_TRACE_TITLE") && (total % 300) == 0) {
+            extern unsigned long runtime_fs_ops(void);
+            extern const char *runtime_fs_last_op(void);
+            extern unsigned long runtime_hid_polls(void);
+            extern uint32_t runtime_hid_buttons(void);
+            fprintf(stderr, "[totk-title] draw=%u record=%u scene=%u/%u queued=%u empty=%u"
+                            " fs=%lu last=\"%s\" hid=%lu buttons=%#x\n",
+                    total, nvn_record_count, nvn_scene_rendered, nvn_scene_submits,
+                    nvn_scene_queued, nvn_empty_sampled, runtime_fs_ops(),
+                    runtime_fs_last_op(), runtime_hid_polls(), runtime_hid_buttons());
+        }
         if (total <= 32 || (total % 300) == 0 || nvn_trace())
             fprintf(stderr, "[totk-nvn] NVN draw #%u program=%p window=%p vertices=%d%s%s\n",
                     total, (void *)p, (void *)w, cb->draw_count,
@@ -7076,6 +7128,7 @@ static int nvn_probe_check(const char *what, const uint8_t px[4],
 }
 
 int runtime_nvn_state_selftest(const char *screenshot, int frames) {
+    g_nvn_probe = 1;
     if (frames < 1) frames = 1;
     if (frames > 60) frames = 60;
     void *nw = runtime_native_window_create(1280, 720, 0x25, 0xB1);
@@ -7650,6 +7703,7 @@ int runtime_nvn_state_selftest(const char *screenshot, int frames) {
 }
 
 int runtime_nvn_frame_selftest(const char *screenshot, int frames) {
+    g_nvn_probe = 1;
     if (frames < 1) frames = 1;
     if (frames > 60) frames = 60;
     void *nw = runtime_native_window_create(1280, 720, 0x25, 0xF1);
@@ -7964,6 +8018,7 @@ static int nvn_probe_px_near(const uint8_t a[4], const float c[4], int tol) {
  * that the same program produces distinct pipelines for a 1-target and a
  * 2-target layout (the MRT layout is part of the pipeline key). */
 int runtime_nvn_mrt_selftest(const char *screenshot, int frames) {
+    g_nvn_probe = 1;
     if (frames < 1) frames = 1;
     if (frames > 16) frames = 16;
     int color_fmt = gfx_backend_vk_format_for_nvn(0x25);   /* RGBA8 */

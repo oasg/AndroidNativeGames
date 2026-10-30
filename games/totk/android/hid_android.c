@@ -126,7 +126,12 @@ static void hid_input_parse(void) {
         fprintf(stderr, "[totk-hid] input script: %u press(es) %s\n", g_npresses,
                 script ? "(TOTK_ANDROID_INPUT_SCRIPT)" : "(autostart)");
 }
+static unsigned long g_poll_count;
+static uint32_t g_poll_buttons;
+unsigned long runtime_hid_polls(void) { return __atomic_load_n(&g_poll_count, __ATOMIC_RELAXED); }
+uint32_t runtime_hid_buttons(void) { return __atomic_load_n(&g_poll_buttons, __ATOMIC_RELAXED); }
 static int hid_states_core(void *states, int count, const void *id, uint32_t want_style) {
+    __atomic_add_fetch(&g_poll_count, 1, __ATOMIC_RELAXED);
     if (!states || count <= 0 || count > 16) return 0;
     hid_input_parse();
     if (!g_npresses) {
@@ -177,6 +182,7 @@ static int hid_states_core(void *states, int count, const void *id, uint32_t wan
     const uint32_t *pid = id;
     int connected = g_enabled && g_allowed && pid && *pid == hid_pad_id() &&
                     want_style == hid_pad_style() && (g_styles & want_style);
+    if (connected) __atomic_store_n(&g_poll_buttons, (uint32_t)bits, __ATOMIC_RELAXED);
     /* Only the first state is valid when the return value is 1.  Leave the
      * caller's older samples alone: nn::hid's history is what the game compares
      * against to see a button edge. */
