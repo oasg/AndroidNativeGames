@@ -4394,6 +4394,21 @@ static void nvnCommandBufferBindTexture(cb_t *c, int stage, int i, uint64_t hand
         nvn_cb_desc_event(c, (uint32_t)stage, 2, (uint32_t)i, 0, 0, handle);
     }
     nvn_global_tex_set(stage, i, handle, bind_tex);
+    {
+        static int on = -1;
+        if (on < 0) on = getenv("TOTK_ANDROID_TRACE_UI_FLOW") != NULL;
+        if (on && bind_tex && bind_tex->d.width <= 512 && bind_tex->d.height <= 512 &&
+            bind_tex->d.width >= 64) {
+            static unsigned logged;
+            if (logged++ < 240)
+                fprintf(stderr, "[totk-ui] bind cb=%p thread=%#x cmd=%u rec=%d stage=%d"
+                                " slot=%d tex=%p fmt=%#x %ux%u target=%d\n",
+                        (void *)c, runtime_thread_current_handle(), c->ncmds,
+                        c->recording, stage, i, (const void *)bind_tex,
+                        bind_tex->d.format, bind_tex->d.width, bind_tex->d.height,
+                        bind_tex->d.target);
+        }
+    }
     if (nvn_trace() || (nvn_trace_first() && nvn_tex_trace++ < 64)) {
         int tid = (int)(handle & 0xfffff), sid = (int)((handle >> 20) & 0xfff);
         const tex_pool_t *tpool = nvn_tex_pool_for(c);
@@ -4446,6 +4461,18 @@ static void nvnCommandBufferBindTextures(cb_t *c, int stage, int first, int n, c
             const tex_t *bt = (handles[i] && bp)
                             ? nvn_tex_pool_lookup(bp, (int)(handles[i] & 0xfffff)) : NULL;
             nvn_global_tex_set(stage, index, handles[i], bt);
+            static int on = -1;
+            if (on < 0) on = getenv("TOTK_ANDROID_TRACE_UI_FLOW") != NULL;
+            if (on && bt && bt->d.width <= 512 && bt->d.height <= 512 &&
+                bt->d.width >= 64) {
+                static unsigned logged;
+                if (logged++ < 240)
+                    fprintf(stderr, "[totk-ui] bind cb=%p thread=%#x cmd=%u rec=%d stage=%d"
+                                    " slot=%d tex=%p fmt=%#x %ux%u target=%d\n",
+                            (void *)c, runtime_thread_current_handle(), c->ncmds,
+                            c->recording, stage, index, (const void *)bt,
+                            bt->d.format, bt->d.width, bt->d.height, bt->d.target);
+            }
         }
     }
     if (nvn_trace()) {
@@ -6672,6 +6699,24 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
         int window_pass = !have_layout ||
                           (window_target && nvn_layout_matches_window(w, &layout, rw, rh));
         const nvn_bind_state_t *bs = nvn_cb_draw_state(cb);
+        {
+            static int uiflow = -1;
+            if (uiflow < 0) uiflow = getenv("TOTK_ANDROID_TRACE_UI_FLOW") != NULL;
+            if (uiflow && nvn_nvn_draws < 24) {
+                fprintf(stderr, "[totk-ui] window cb=%p thread=%#x cmds=%u draws=%d pass=%d"
+                                " target=%dx%d prog=%p samples:",
+                        (void *)cb, runtime_thread_current_handle(), cb->ncmds,
+                        cb->draw_count, window_pass, rw, rh, (void *)p);
+                if (bs) for (int st = 0; st < 2; st++) for (int slot = 0; slot < 128; slot++) {
+                    if (!(bs->tex_mask[st][slot / 32] & (1u << (slot % 32)))) continue;
+                    const tex_pool_t *tp = nvn_tex_pool_for(cb);
+                    const tex_t *tt = tp ? nvn_tex_pool_lookup(tp, (int)(bs->tex[st][slot] & 0xfffff)) : NULL;
+                    fprintf(stderr, " %d:%d=%p", st, slot, (const void *)tt);
+                    if (tt) fprintf(stderr, "(%#x %ux%u)", tt->d.format, tt->d.width, tt->d.height);
+                }
+                fputc('\n', stderr);
+            }
+        }
         if (nvn_trace_first() && nvn_nvn_draws < 4) {
             fprintf(stderr, "[totk-nvn] Submit cb=%p bs=%p va0=%#x vs0=%#llx legacy=%p window=%p win_target=%d"
                             " layout=%dx%d colors=%u depth=%#x have_layout=%d window_pass=%d"
