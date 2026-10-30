@@ -2276,6 +2276,19 @@ int main(int argc, char **argv) {
                frames, shot, shot);
         return 0;
     }
+    if (!strcmp(argv[2], "probe-nvn-retired-stress")) {
+        int runtime_nvn_retired_stress_selftest(int iterations);
+        const char *it = getenv("TOTK_ANDROID_STRESS_ITERS");
+        int iterations = it && *it ? atoi(it) : 500;
+        if (!runtime_nvn_retired_stress_selftest(iterations)) {
+            fprintf(stderr, "[totk-nvn] retired stress selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\","
+               "\"probe\":\"nvn-retired-stress\",\"iterations\":%d}\n",
+               iterations);
+        return 0;
+    }
     if (!strcmp(argv[2], "probe-nvn-fence")) {
         int runtime_nvn_fence_selftest(void);
         if (!runtime_nvn_fence_selftest()) {

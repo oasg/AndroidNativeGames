@@ -23,6 +23,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
+#include <signal.h>
+#include <dlfcn.h>
+#include <ucontext.h>
+#include <fcntl.h>
 #include "gfx_backend_android.h"
 #include "shader_cache_android.h"
 
@@ -55,6 +59,7 @@ static void nvn_warm_recording(void *cb);
 static int nvn_gpu_drain(const char *what);
 static void nvn_host_rt_clear(void);
 static void nvn_scene_submit_pending(void);
+static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index);
 static int nvn_is_empty_target(const void *tex);
 static int nvn_trace_inputs(void);
 static int nvn_trace_composite(void);
@@ -266,6 +271,70 @@ static int nvn_global_ubo_get(int stage, int index, uint64_t *address, size_t *s
 }
 
 
+/* Diagnostic crash context for the retired-pass investigation.  Enabled only
+ * by TOTK_ANDROID_HOST_CRASH=1; the loader owns the production observer. */
+void runtime_guest_frame_report(uint64_t fp, uint64_t lr);
+static void nvn_host_crash_raw(int sig, siginfo_t *si, void *ctx) {
+    ucontext_t *u = ctx;
+    uintptr_t pc = 0, lr = 0, sp = 0;
+    uint64_t gfp = 0, glr = 0;
+#if defined(__aarch64__)
+    pc = (uintptr_t)u->uc_mcontext.pc;
+    lr = (uintptr_t)u->uc_mcontext.regs[30];
+    sp = (uintptr_t)u->uc_mcontext.sp;
+    gfp = u->uc_mcontext.regs[29];
+    glr = u->uc_mcontext.regs[30];
+#endif
+    dprintf(2, "[host-crash] raw sig=%d pc=%p lr=%p sp=%p fault=%p\n",
+            sig, (void *)pc, (void *)lr, (void *)sp,
+            si ? si->si_addr : NULL);
+    Dl_info di;
+    uintptr_t base = 0;
+    const char *name = "?";
+    if (dladdr((void *)pc, &di) && di.dli_fbase) {
+        base = (uintptr_t)di.dli_fbase;
+        name = di.dli_fname ? di.dli_fname : "?";
+    }
+    dprintf(2, "[host-crash] sig=%d pc=%p lr=%p sp=%p fault=%p base=%p off=%#lx name=%s\n",
+            sig, (void *)pc, (void *)lr, (void *)sp,
+            si ? si->si_addr : NULL, (void *)base,
+            (unsigned long)(pc - base), name);
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        static char maps[16384];
+        ssize_t n = read(fd, maps, sizeof maps - 1);
+        close(fd);
+        if (n > 0) {
+            maps[n] = 0;
+            char *line = maps;
+            while (line && *line) {
+                char *nl = strchr(line, '\n');
+                if (nl) *nl = 0;
+                unsigned long long a = 0, b = 0, off = 0;
+                char perms[8] = {0}, path[256] = {0};
+                if (sscanf(line, "%llx-%llx %7s %llx %*s %*s %255s",
+                           &a, &b, perms, &off, path) >= 4 &&
+                    pc >= a && pc < b)
+                    dprintf(2, "[host-crash] map=%s pc_off=%#llx\n", line,
+                            (unsigned long long)(pc - a));
+                line = nl ? nl + 1 : NULL;
+            }
+        }
+    }
+    runtime_guest_frame_report(gfp, glr);
+    _exit(139);
+}
+static void nvn_install_host_crash_late(void) {
+    const char *e = getenv("TOTK_ANDROID_HOST_CRASH");
+    if (!e || !*e) return;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = nvn_host_crash_raw;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+}
 static const char *g_last_api = "none";
 static char g_last_proc[80] = "none";
 static int nvn_trace(void);
@@ -514,6 +583,7 @@ typedef struct {
 } tex_bridge_t;
 static tex_bridge_t *g_tex_bridges;
 static unsigned g_tex_bridge_count, g_tex_bridge_cap;
+static pthread_mutex_t g_tex_bridge_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 static unsigned nvn_upload_traces;
 /* Set when the compositor samples a target that no segment drew to.  The L2
  * frame dump uses it to capture the title/clear state instead of waiting for a
@@ -539,29 +609,41 @@ static int nvn_tex_same_resource(const tex_t *a, const tex_t *b) {
 }
 static tex_bridge_t *nvn_tex_bridge(const tex_t *t, int create) {
     if (!t) return NULL;
+    pthread_mutex_lock(&g_tex_bridge_lock);
     for (unsigned i = 0; i < g_tex_bridge_count; i++)
-        if (g_tex_bridges[i].tex == t) return &g_tex_bridges[i];
+        if (g_tex_bridges[i].tex == t) {
+            tex_bridge_t *b = &g_tex_bridges[i];
+            pthread_mutex_unlock(&g_tex_bridge_lock);
+            return b;
+        }
     for (unsigned i = 0; i < g_tex_bridge_count; i++)
-        if (nvn_tex_same_resource(g_tex_bridges[i].tex, t)) return &g_tex_bridges[i];
-    if (!create) return NULL;
+        if (nvn_tex_same_resource(g_tex_bridges[i].tex, t)) {
+            tex_bridge_t *b = &g_tex_bridges[i];
+            pthread_mutex_unlock(&g_tex_bridge_lock);
+            return b;
+        }
+    if (!create) { pthread_mutex_unlock(&g_tex_bridge_lock); return NULL; }
     if (g_tex_bridge_count == g_tex_bridge_cap) {
         unsigned cap = g_tex_bridge_cap ? g_tex_bridge_cap * 2 : 64;
         tex_bridge_t *n = realloc(g_tex_bridges, (size_t)cap * sizeof *n);
-        if (!n) return NULL;
+        if (!n) { pthread_mutex_unlock(&g_tex_bridge_lock); return NULL; }
         g_tex_bridges = n;
         g_tex_bridge_cap = cap;
     }
     memset(&g_tex_bridges[g_tex_bridge_count], 0, sizeof g_tex_bridges[0]);
     g_tex_bridges[g_tex_bridge_count].tex = t;
-    return &g_tex_bridges[g_tex_bridge_count++];
+    tex_bridge_t *b = &g_tex_bridges[g_tex_bridge_count++];
+    pthread_mutex_unlock(&g_tex_bridge_lock);
+    return b;
 }
 /* Associate a guest colour texture with the host image the scene pass renders
  * into.  The sampled copy is dropped so the next bind rebuilds it from the
  * rendered image instead of the stale guest bytes. */
 static void nvn_tex_set_rt(const tex_t *t, GfxOffscreenTarget *rt,
                            const GfxRenderTargetLayout *layout, uint32_t w, uint32_t h) {
+    pthread_mutex_lock(&g_tex_bridge_lock);
     tex_bridge_t *b = nvn_tex_bridge(t, 1);
-    if (!b || !rt) return;
+    if (!b || !rt) { pthread_mutex_unlock(&g_tex_bridge_lock); return; }
     int layout_changed = !b->rt_valid || b->rt != rt;
     b->rt = rt;
     b->rt_layout = *layout;
@@ -578,6 +660,7 @@ static void nvn_tex_set_rt(const tex_t *t, GfxOffscreenTarget *rt,
         fprintf(stderr, "[totk-frame] tex-rt tex=%p rt=%p %ux%u fmt=%#x gen=%llu\n",
                 (const void *)t, (void *)rt, w, h, layout->color_formats[0],
                 (unsigned long long)b->rt_frame);
+    pthread_mutex_unlock(&g_tex_bridge_lock);
 }
 typedef struct {
     uint8_t minf, magf, ws, wt, wr, cmp_mode, cmp_func, reduction;
@@ -854,6 +937,7 @@ static uint32_t nvnDeviceBuilderGetFlags(const dev_builder_t *b) {
 }
 
 static uint32_t nvnDeviceInitialize(nvn_dev_t *d, const dev_builder_t *b) { nvn_api("nvnDeviceInitialize");
+    nvn_install_host_crash_late();
     if (!d) return 0;
     memset(d, 0, sizeof *d);
     d->magic = NVN_MAGIC('D', 'E', 'V', 0);
@@ -1606,20 +1690,24 @@ static uint32_t nvnTextureInitialize(tex_t *t, const tex_builder_t *b) { nvn_api
     return 1;
 }
 static int nvn_texture_store_bridge(tex_t *t, GfxTexture *g) {
+    pthread_mutex_lock(&g_tex_bridge_lock);
     tex_bridge_t *b = nvn_tex_bridge(t, 1);
-    if (!b) { gfx_backend_texture_destroy(g); return 0; }
+    if (!b) { pthread_mutex_unlock(&g_tex_bridge_lock); gfx_backend_texture_destroy(g); return 0; }
     if (b->gfx) gfx_backend_texture_destroy((GfxTexture *)b->gfx);
     b->gfx = g;
+    pthread_mutex_unlock(&g_tex_bridge_lock);
     return 1;
 }
 /* The guest is the source of truth: a CPU write/flush invalidates the host
  * copy so the next bind re-uploads the updated storage. */
 static void nvn_texture_bridge_drop(const tex_t *t) {
+    pthread_mutex_lock(&g_tex_bridge_lock);
     tex_bridge_t *b = nvn_tex_bridge(t, 0);
-    if (!b) return;
+    if (!b) { pthread_mutex_unlock(&g_tex_bridge_lock); return; }
     if (b->gfx) gfx_backend_texture_destroy((GfxTexture *)b->gfx);
     b->gfx = NULL;
     b->rt_uploaded = 0;   /* force a rebuild on the next bind */
+    pthread_mutex_unlock(&g_tex_bridge_lock);
 }
 
 
@@ -1826,8 +1914,11 @@ int runtime_nvn_texture_upload_guest(void *texture) {
 }
 
 static void *nvn_texture_gfx(const tex_t *t) {
+    pthread_mutex_lock(&g_tex_bridge_lock);
     tex_bridge_t *b = nvn_tex_bridge(t, 0);
-    return b ? b->gfx : NULL;
+    void *g = b ? b->gfx : NULL;
+    pthread_mutex_unlock(&g_tex_bridge_lock);
+    return g;
 }
 
 static void nvn_upload_trace_result(int on, const tex_t *t, const char *what,
@@ -1842,7 +1933,7 @@ static void nvn_upload_trace_result(int on, const tex_t *t, const char *what,
  * as the source of truth and uploads lazily.  A texture that is also a scene
  * render target is different: the freshly rendered target image wins over the
  * stale guest bytes, so rebuild the sampled texture from the RT readback. */
-static GfxTexture *nvn_texture_gfx_ready(const tex_t *t) {
+static GfxTexture *nvn_texture_gfx_ready_locked(const tex_t *t) {
     if (!t || t->magic != NVN_MAGIC('T', 'E', 'X', 0)) return NULL;
     tex_bridge_t *b = nvn_tex_bridge(t, 0);
     int utr = nvn_trace_inputs() && nvn_upload_traces < 512 &&
@@ -1936,6 +2027,12 @@ static GfxTexture *nvn_texture_gfx_ready(const tex_t *t) {
     nvn_upload_trace_result(utr, t, up ? "guest" : "fail", g);
     return up ? g : NULL;
 }
+static GfxTexture *nvn_texture_gfx_ready(const tex_t *t) {
+    pthread_mutex_lock(&g_tex_bridge_lock);
+    GfxTexture *g = nvn_texture_gfx_ready_locked(t);
+    pthread_mutex_unlock(&g_tex_bridge_lock);
+    return g;
+}
 
 static GfxSampler *nvn_sampler_gfx(const samp_t *s) {
     if (!s || s->magic != NVN_MAGIC('S', 'A', 'M', 'P')) return NULL;
@@ -1962,6 +2059,7 @@ static GfxSampler *nvn_sampler_gfx(const samp_t *s) {
 static void nvnTextureFinalize(tex_t *t) {
     if (!t) return;
     nvn_tex_registry_del(t);
+    pthread_mutex_lock(&g_tex_bridge_lock);
     for (unsigned i = 0; i < g_tex_bridge_count; i++) {
         if (g_tex_bridges[i].tex == t) {
             if (g_tex_bridges[i].gfx) gfx_backend_texture_destroy(g_tex_bridges[i].gfx);
@@ -1969,6 +2067,7 @@ static void nvnTextureFinalize(tex_t *t) {
             break;
         }
     }
+    pthread_mutex_unlock(&g_tex_bridge_lock);
     t->magic = 0;
 }
 static void nvnTextureSetDebugLabel(tex_t *t, const char *l) { (void)t; (void)l; }
@@ -6819,7 +6918,30 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
  * passes before the window compositor that samples them. */
 static void nvn_scene_submit_pending(void) {
     nvn_scene_item_t items[NVN_SCENE_QUEUE_MAX];
-    unsigned n = nvn_scene_take(items, NVN_SCENE_QUEUE_MAX);
+    /* Serialize retired segment execution: running a whole multi-target
+     * recording's segments in one submit deterministically crashes the
+     * Adreno submit path around the first 0x3f pass.  One segment per submit
+     * drains the FIFO across frames and keeps the recording thread live. */
+    unsigned max = 1;
+    const char *ns = getenv("TOTK_ANDROID_SCENE_N_PER_SUBMIT");
+    if (ns && *ns) {
+        long v = strtol(ns, NULL, 0);
+        if (v > 0 && v <= (long)NVN_SCENE_QUEUE_MAX) max = (unsigned)v;
+    }
+    unsigned n;
+    if (max < NVN_SCENE_QUEUE_MAX) {
+        pthread_mutex_lock(&g_scene_lock);
+        n = g_scene_pending_count < max ? g_scene_pending_count : max;
+        for (unsigned i = 0; i < n; i++) items[i] = g_scene_pending[i];
+        if (n) {
+            memmove(&g_scene_pending[0], &g_scene_pending[n],
+                    (g_scene_pending_count - n) * sizeof g_scene_pending[0]);
+            g_scene_pending_count -= n;
+        }
+        pthread_mutex_unlock(&g_scene_lock);
+    } else {
+        n = nvn_scene_take(items, max);
+    }
     for (unsigned i = 0; i < n; i++)
         nvn_submit_scene_snapshot(items[i].handle, items[i].seg);
 }
@@ -9383,6 +9505,105 @@ static void *nvnDeviceGetProcAddress(const nvn_dev_t *d, const char *name) {
     return fn;
 }
 
+/* probe-nvn-retired-stress: repeatedly retire and submit multi-target CBs
+ * with target/alias churn.  Exercises the retired snapshot, host-RT cache,
+ * texture bridge, queue drain and pipeline reuse without the game. */
+static int nvn_seg_probe_tex(tex_t *t, uint32_t w, uint32_t h);
+int runtime_nvn_retired_stress_selftest(int iterations) {
+    if (iterations < 1) iterations = 1;
+    if (iterations > 2000) iterations = 2000;
+    nvn_dev_t d;
+    dev_builder_t db;
+    memset(&d, 0, sizeof d);
+    memset(&db, 0, sizeof db);
+    if (!nvnDeviceInitialize(&d, &db)) return 0;
+    if (!gfx_backend_vulkan_available()) return 0;
+    const uint32_t W = 64, H = 64;
+    tex_t A, B, C, A2;
+    if (!nvn_seg_probe_tex(&A, W, H) || !nvn_seg_probe_tex(&B, W, H) ||
+        !nvn_seg_probe_tex(&C, W, H)) return 0;
+    A2 = A;
+    nvn_tex_registry_add(&A2);
+    GfxRenderTargetLayout layout;
+    memset(&layout, 0, sizeof layout);
+    layout.color_count = 1;
+    layout.color_formats[0] = (uint32_t)gfx_backend_vk_format_for_nvn(0x25);
+    const uint8_t *vs = NULL, *ps = NULL;
+    size_t vs_size = 0, ps_size = 0;
+    gfx_backend_builtin_triangle_modules(&vs, &vs_size, &ps, &ps_size);
+    GfxReflectedPipeline *pipe = (vs && ps)
+        ? gfx_backend_reflected_pipeline_create_layout(vs, vs_size, ps, ps_size,
+                                                       &layout, NULL, 0, NULL, 0, NULL)
+        : NULL;
+    if (!pipe) return 0;
+    prog_t prog;
+    memset(&prog, 0, sizeof prog);
+    if (!nvnProgramInitialize(&prog, &d)) return 0;
+    prog.gfx_reflected_pipeline = pipe;
+    const void *tA[1] = { &A };
+    const void *tB[1] = { &B };
+    const void *tC[1] = { &C };
+    const float red[4] = { 1, 0, 0, 1 }, green[4] = { 0, 1, 0, 1 };
+    const float blue[4] = { 0, 0, 1, 1 };
+    unsigned rendered = 0, submitted = 0, segs = 0;
+    int ok = 1;
+    for (int it = 0; it < iterations && ok; it++) {
+        cb_t cb;
+        memset(&cb, 0, sizeof cb);
+        if (!nvnCommandBufferInitialize(&cb, &d)) { ok = 0; break; }
+        cb.prog = &prog;
+        nvnCommandBufferBeginRecording(&cb);
+        nvnCommandBufferSetRenderTargets(&cb, 1, tA, NULL, NULL, NULL);
+        nvnCommandBufferClearColor(&cb, 0, red, 0xf);
+        nvnCommandBufferSetViewport(&cb, 0, 0, (int)W, (int)H);
+        nvnCommandBufferSetScissor(&cb, 0, 0, (int)W, (int)H);
+        nvnCommandBufferDrawArrays(&cb, NVN_DRAW_TRIANGLES, 0, 3);
+        nvnCommandBufferSetRenderTargets(&cb, 1, tB, NULL, NULL, NULL);
+        nvnCommandBufferClearColor(&cb, 0, green, 0xf);
+        nvnCommandBufferSetViewport(&cb, 0, 0, (int)W, (int)H);
+        nvnCommandBufferSetScissor(&cb, 0, 0, (int)W, (int)H);
+        nvnCommandBufferDrawArrays(&cb, NVN_DRAW_TRIANGLES, 0, 3);
+        nvnCommandBufferSetRenderTargets(&cb, 1, tC, NULL, NULL, NULL);
+        nvnCommandBufferClearColor(&cb, 0, blue, 0xf);
+        uint64_t handle = nvnCommandBufferEndRecording(&cb);
+        nvnCommandBufferFinalize(&cb);
+        unsigned r0 = nvn_scene_rendered, s0 = nvn_scene_submits;
+        for (int k = 0; k < 4; k++) nvn_scene_submit_pending();
+        rendered += nvn_scene_rendered - r0;
+        submitted += nvn_scene_submits - s0;
+        segs += 3;
+        if (nvn_scene_rendered - r0 != 2 || nvn_scene_submits - s0 != 3) ok = 0;
+        (void)handle;
+    }
+    GfxOffscreenTarget *rtA = nvn_host_rt_get_owner(W, H, &layout, &A);
+    GfxOffscreenTarget *rtB = nvn_host_rt_get_owner(W, H, &layout, &B);
+    GfxTexture *ga = nvn_texture_gfx_ready(&A2);
+    const tex_bridge_t *ba = nvn_tex_bridge(&A, 0);
+    const tex_bridge_t *ba2 = nvn_tex_bridge(&A2, 0);
+    uint8_t ac[4] = {0}, bc[4] = {0};
+    if (rtA) gfx_backend_offscreen_read_pixel_index(rtA, 0, 4, 4, ac);
+    if (rtB) gfx_backend_offscreen_read_pixel_index(rtB, 0, 4, 4, bc);
+    int alias = ba && ba2 && ba == ba2 && ba2->rt_valid;
+    if (!rtA || !rtB || !ga || !alias ||
+        ac[0] < 180 || ac[1] > 80 || ac[2] > 80 ||
+        bc[1] < 180 || bc[0] > 80 || bc[2] > 80) ok = 0;
+    fprintf(stderr, "[totk-nvn] retired stress iters=%d segs=%u rendered=%u"
+                    " submitted=%u alias=%d A=%02x%02x%02x B=%02x%02x%02x ok=%d\n",
+            iterations, segs, rendered, submitted, alias, ac[0], ac[1], ac[2],
+            bc[0], bc[1], bc[2], ok);
+    if (ga) nvn_texture_bridge_drop(&A2);
+    nvnTextureFinalize(&A);
+    nvnTextureFinalize(&A2);
+    nvnTextureFinalize(&B);
+    nvnTextureFinalize(&C);
+    free(A.mem);
+    free(B.mem);
+    free(C.mem);
+    nvnProgramFinalize(&prog);
+    fprintf(stderr, "[totk-nvn] retired stress selftest %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 /* probe-nvn-segment-targets: a synthetic retired recording clears and draws
  * target A, then switches to target B, clears and draws it.  The recording must
  * split into two draw-bearing segments, submit each into its own host target,
@@ -9501,7 +9722,9 @@ int runtime_nvn_segment_selftest(const char *screenshot, int frames) {
 
     unsigned rendered_before = nvn_scene_rendered;
     unsigned submits_before = nvn_scene_submits;
-    nvn_scene_submit_pending();
+    /* The production drain is serialized (one segment per submit); the probe
+     * must submit repeatedly to drain all four segments. */
+    for (int k = 0; k < 4; k++) nvn_scene_submit_pending();
     unsigned rendered = nvn_scene_rendered - rendered_before;
     unsigned submitted = nvn_scene_submits - submits_before;
 
