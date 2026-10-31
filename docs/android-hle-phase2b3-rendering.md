@@ -928,36 +928,65 @@ was removed; `fs` now uses `account_android.c`'s UID and logs:
 [totk-android] fs read save:/slot_01/caption.sav
 ```
 
-This is required for any title/save-slot test.  The UI still stalls later at a
-graphics pipeline/UI step and the `0x3f` compute target remains unwritten.
+This is required for any title/save-slot test.
+
+### 9.4 UI shader cache and the remaining Adreno stall
+
+With the real save mounted, the UI path now records and executes small
+targets.  `TOTK_ANDROID_TRACE_SCENE_STEPS=1` shows:
+
+```text
+[totk-scene-step] rt 360x69 fmt=0x25 owner=... draws=6
+[totk-scene-step] execute end drew=1
+[totk-scene-step] rt 1920x1080 fmt=0x7a owner=0x336d9ad68 ... draws=6
+```
+
+The missing UI compute module was dumped with
+`TOTK_ANDROID_SHADER_DUMP` and translated offline with
+`games/totk/android/tools/translate_dump.py`.  The d946... compute module has
+2 UBOs, 8 SSBOs and one sampled texture, and **no storage images**; it builds
+UI data, it does not write pixels directly.  The full translated UI cache
+(vs 1056 / ps 1366 / cs 158 files in the test profile) was pushed to the
+device; the following run then reached the 1920x1080 UI target instead of
+falling back on every shader miss.
+
+The run still stalls around present #58–#76, before the `0x3f` composite.
+`TOTK_DUMP_AFTER=45` shows one guest thread (0x103a) owning core 2 for 39 s
+with only 9 SVCs, while the main thread waits on `WaitForAddress`
+`0x3332303dc`.  That is a host Adreno pipeline/submit stall, not the old guest
+list race.  `present` remains `colors=1` because the `0x3f` source is still
+never written.
 
 ## 10. Next
 
-1. Implement Vulkan compute dispatch for the UI compositor
-   (`nvnCommandBufferDispatchCompute`): compute pipeline creation from the
-   cached SPIR-V, storage-image/SSBO descriptors, and dispatch.  Until this
-   runs, the `0x3f` target is always zero and the window composite is black.
-2. Re-run with virtual cores, capture the title/save-slot frame and verify
-   A/Continue → 3D.
-3. Only the first 360x69 target has a 66x5 loading strip; later UI layers and
+1. Get past the Adreno stall at present #58–#76: identify the host call that
+   keeps thread 0x103a on core 2 for 39 s (pipeline create vs submit/fence).
+   The UI scene steps already execute for 360x69 and 1920x1080 targets.
+2. Implement `nvnCommandBufferDispatchCompute` for the UI compute modules.
+   The d946... module needs UBOs/SSBOs/sampled texture, not storage images, so
+   this is a buffer-dispatch path first; then re-check how the `0x3f` target
+   is produced by the following graphics pass.
+3. Re-run with virtual cores and the f9cd... save, capture the title/save-slot
+   frame and verify A/Continue → 3D.
+4. Only the first 360x69 target has a 66x5 loading strip; later UI layers and
    the 180x34 mask stay black.  If the loading barrier completes, re-check the
    UI vertex/UI2F and glyph/style inputs before expecting title text.
-3. A real 3D draw list to `0x3f` is still not recorded in this state; it should
+5. A real 3D draw list to `0x3f` is still not recorded in this state; it should
    appear after the pre-title load completes and a new game/save is selected.
-3. Reach gameplay: the HID ABI is fixed and scripted A/Plus reaches the guest,
+6. Reach gameplay: the HID ABI is fixed and scripted A/Plus reaches the guest,
    but the title does not transition.  A 1.4.3 macOS save is incompatible with
    the 1.0.0 Android image (worker SIGSEGV); use a 1.0.0 save or a host
    new-game flow instead of importing that save.
-4. Grow/stream the per-binding UBO/SSBO arena for very large or heavily
+7. Grow/stream the per-binding UBO/SSBO arena for very large or heavily
    re-bound storage buffers, and add the remaining fixed state (stencil
    compare/write masks, alpha-to-coverage, logic op, MSAA).
-5. Keep the startup/title shader cache current for the new draws; the
+8. Keep the startup/title shader cache current for the new draws; the
    BAHS-offset resolver and `<key>-<suffix>` variants are in place
    (`probe-nvn-frame`, `probe-nvn-state`, `probe-shader-cache`).
-6. Add array/3D/cube/mip texture upload and generate the offline `attr`/`tex`
+9. Add array/3D/cube/mip texture upload and generate the offline `attr`/`tex`
    answer rows from the game's bound state so the variant files exist for the
    scene shaders.
-7. Verify swapchain `preTransform` on the physical panel, then run the Surface
+10. Verify swapchain `preTransform` on the physical panel, then run the Surface
    shell against the first non-black game frame; `adb install` works on the
    Xiaomi device, and `probe-vulkan-surface-target` covers the target-present
    path.
