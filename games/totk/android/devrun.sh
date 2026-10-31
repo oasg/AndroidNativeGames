@@ -45,9 +45,14 @@ lockdir=${TOTK_DEVICE_LOCK:-/tmp/totk-device.lock.d}
     exit 1
 }
 mkdir -p "$work"
-for d in rewritten analysis extracted; do
+for d in rewritten extracted; do
     [ -e "$work/$d" ] || ln -s "$src/$d" "$work/$d"
 done
+# prepare_android_runtime.py writes runtime-layout.json under analysis/, so
+# each lane gets its own copy instead of racing on the shared one.
+if [ ! -e "$work/analysis" ]; then
+    cp -R "$src/analysis" "$work/analysis"
+fi
 
 if [ "$build" = 1 ]; then
     ( cd "$root" && WORK="$work" games/totk/android/build.sh )
