@@ -112,16 +112,14 @@ void runtime_thread_init(void) {
     const uint64_t area = 1u << 20;
     need(stack_size >= (idx + 1) * area, "guest stack area");
     uintptr_t area_base = (uintptr_t)(stack_base + stack_size - (idx + 1) * area);
-    need(mprotect((void *)area_base, area, PROT_READ | PROT_WRITE) == 0, "guest stack mapping");
+    need(mprotect((void *)area_base, area, PROT_READ | PROT_WRITE) == 0,
+         "guest stack mapping");
     runtime_guest_commit(area_base, area);
-
-    /* Put the TLS/TLR/ThreadType at the bottom of this thread's stack area.
-     * nn::os discovers the committed area as the thread stack, so the TLR is
-     * inside the range GetCurrentStackInfo later returns. */
-    hc->guest_tls = (uint8_t *)area_base;       /* 8 KiB TLS, TPIDR_EL0 guest value */
-    hc->guest_tlr = hc->guest_tls + 0x2000;     /* 0x200 ThreadLocalRegion */
-    hc->dummy = hc->guest_tls + 0x3000;         /* ThreadType read from TLR+0x1f8 */
+    hc->guest_tls = (uint8_t *)area_base;
+    hc->guest_tlr = hc->guest_tls + 0x2000;
+    hc->dummy = hc->guest_tls + 0x3000;
     uint64_t tb = area_base, ts = area;
+    hc->guest_stack_top = area_base + area - 16;
     memcpy(hc->dummy + 0x50, &tb, 8);           /* ThreadType::stack_base */
     memcpy(hc->dummy + 0x58, &ts, 8);           /* ThreadType::stack_size */
     /* Horizon's ThreadLocalRegion keeps the guest TPIDR_EL0 value at +0x1f0
@@ -135,7 +133,6 @@ void runtime_thread_init(void) {
     if (guest_handle) memcpy(hc->dummy + 0x1b0, &guest_handle, 4);   /* ThreadType::thread_id */
     if (getenv("TOTK_ANDROID_TLS_TRACE"))
         fprintf(stderr, "[totk-android] thread init handle=%#x dummy=%p\n", guest_handle, hc->dummy);
-    hc->guest_stack_top = area_base + area - 16;
     if (getenv("TOTK_ANDROID_TLS_TRACE") || getenv("TOTK_ANDROID_CTOR_PROBE") || tls_probe_mode)
         fprintf(stderr, "[totk-android] thread tls tlr=%p dummy=%p stack=%#llx+%#llx sp=%#llx\n",
                 hc->guest_tlr, hc->dummy, (unsigned long long)area_base,
