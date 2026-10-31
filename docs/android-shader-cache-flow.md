@@ -347,8 +347,10 @@ Lane 5 measured:
 | validation mirror (all `.spv`) | 5,819 | 5,810 | 0 |
 
 All 5,819 SPIR-V files created a `VkShaderModule` on the Adreno 830.  The 9
-modules without `.res.json` are still usable as SPIR-V but cannot supply
-descriptor reflection; they are listed in the audit output.
+modules without `.res.json` are synthetic `probe-nvn-state` entries, not game
+modules; they are still usable as SPIR-V but cannot supply descriptor
+reflection.  `docs/android-shader-cache-audit.md` section 1.1 lists them and
+explains why no dump can regenerate the missing reflection.
 
 ### 7.3 Key/file consistency
 
