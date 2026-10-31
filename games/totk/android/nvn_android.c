@@ -3637,18 +3637,22 @@ typedef struct {
     uint64_t seq;
     uint32_t prio;
     const void *target;   /* guest colour-0 texture, for the window's 0x3f lookup */
+    uint32_t width, height, draws;   /* segment target shape / draw count */
 } nvn_scene_item_t;
 static nvn_scene_item_t g_scene_pending[NVN_SCENE_QUEUE_MAX];
 static unsigned g_scene_pending_count;
 static unsigned nvn_scene_queued;
+static unsigned nvn_scene_dropped;
 static unsigned nvn_scene_submits, nvn_scene_rendered;
+static int nvn_ui_seg_want(void);
 static pthread_mutex_t g_scene_lock = PTHREAD_MUTEX_INITIALIZER;
 /* The title UI records ~100 targets per frame but only one segment per submit
  * used to drain.  A plain FIFO overflows and drops the 0x3f composite that the
  * window samples.  Segments with draws and sampled textures go to the front;
  * empty clear/state segments stay behind. */
 static void nvn_scene_queue(uint64_t handle, uint32_t seg, uint64_t seq, uint32_t prio,
-                            const void *target) {
+                            const void *target, uint32_t width, uint32_t height,
+                            uint32_t draws) {
     if (getenv("TOTK_ANDROID_NO_SCENE_QUEUE")) return;
     pthread_mutex_lock(&g_scene_lock);
     for (unsigned i = 0; i < g_scene_pending_count; i++)
@@ -3657,26 +3661,44 @@ static void nvn_scene_queue(uint64_t handle, uint32_t seg, uint64_t seq, uint32_
             pthread_mutex_unlock(&g_scene_lock);
             return;
         }
-    if (g_scene_pending_count == NVN_SCENE_QUEUE_MAX) {
-        /* Drop the oldest lowest-priority entry, never a textured 0x3f pass. */
-        unsigned drop = 0;
-        for (unsigned i = NVN_SCENE_QUEUE_MAX; i-- > 0; ) {
-            if (g_scene_pending[i].prio == 0) { drop = i; break; }
+    /* A newer recording re-renders the same guest target, so an older
+     * recording's entry for that target can never be sampled again.  Keeping
+     * it only crowds out the producer/consumer chain that is due now. */
+    for (unsigned i = 0; i < g_scene_pending_count; ) {
+        if (g_scene_pending[i].target == target && g_scene_pending[i].handle != handle) {
+            memmove(&g_scene_pending[i], &g_scene_pending[i + 1],
+                    (g_scene_pending_count - i - 1) * sizeof g_scene_pending[0]);
+            g_scene_pending_count--;
+            continue;
         }
-        memmove(&g_scene_pending[drop], &g_scene_pending[drop + 1],
-                (NVN_SCENE_QUEUE_MAX - drop - 1) * sizeof g_scene_pending[0]);
+        i++;
+    }
+    if (g_scene_pending_count == NVN_SCENE_QUEUE_MAX) {
+        /* FIFO: the head is the oldest and therefore the most stale entry. */
+        if (nvn_ui_seg_want())
+            fprintf(stderr, "[totk-ui-seg] queue full: drop handle=%#llx seg=%u prio=%u"
+                            " depth=%u\n", (unsigned long long)g_scene_pending[0].handle,
+                    g_scene_pending[0].seg, g_scene_pending[0].prio,
+                    g_scene_pending_count);
+        nvn_scene_dropped++;
+        memmove(&g_scene_pending[0], &g_scene_pending[1],
+                (NVN_SCENE_QUEUE_MAX - 1) * sizeof g_scene_pending[0]);
         g_scene_pending_count--;
     }
-    unsigned at = g_scene_pending_count;
-    while (at > 0 && g_scene_pending[at - 1].prio < prio) at--;
-    memmove(&g_scene_pending[at + 1], &g_scene_pending[at],
-            (g_scene_pending_count - at) * sizeof g_scene_pending[0]);
+    /* Append: a recording's segments are queued in ascending segment order and
+     * the drain consumes them from the head, so a producer always runs before
+     * the consumers that sample its target.  Priority used to reorder the
+     * queue; that starved the 60-draw prio-1 producer behind every prio-2
+     * consumer, leaving the whole 360x69 chain on an untouched target. */
+    unsigned at = g_scene_pending_count++;
     g_scene_pending[at].handle = handle;
     g_scene_pending[at].seg = seg;
     g_scene_pending[at].seq = seq;
     g_scene_pending[at].prio = prio;
     g_scene_pending[at].target = target;
-    g_scene_pending_count++;
+    g_scene_pending[at].width = width;
+    g_scene_pending[at].height = height;
+    g_scene_pending[at].draws = draws;
     nvn_scene_queued++;
     pthread_mutex_unlock(&g_scene_lock);
     if (nvn_trace_frame())
@@ -3814,6 +3836,38 @@ static void nvn_retired_clear_locked(nvn_retired_t *e) {
     free(e->seg);
     memset(e, 0, sizeof *e);
 }
+/* --- Lane 2 scene-segment diagnostics ---------------------------------
+ * A UI recording is split into segments; every segment that draws has to run,
+ * in recording order, or the later segments sample a target nothing wrote.
+ * Report, per segment, exactly why it is or is not executed. */
+static int nvn_trace_ui_segs(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("TOTK_ANDROID_TRACE_UI_SEGS") != NULL;
+    return on;
+}
+static unsigned nvn_ui_seg_logs;
+static int nvn_ui_seg_want(void) {
+    return nvn_trace_ui_segs() && nvn_ui_seg_logs < 512;
+}
+static const char *nvn_seg_reason(const nvn_seg_t *sg, const nvn_retired_t *e) {
+    if (!sg->ncmds) return "no-commands";
+    if (!sg->have_layout) return "no-layout";
+    if (sg->window_texture) return "window-texture";
+    if (!sg->color0_tex) return "no-color0";
+    if (!sg->draw_count && !sg->clear_count) return "state-only";
+    if (sg->draw_count == 0) return "clear-only";
+    if (!(sg->have_last && sg->last.have_state) && !(e && e->bind))
+        return "no-bind-state";
+    if (!sg->warm) return "not-warmed";
+    if (!sg->pstate) return "no-pstate";
+    if (!sg->pipeline) return "no-pipeline";
+    return "ok";
+}
+static int nvn_seg_is_ui(const nvn_seg_t *sg) {
+    return sg && ((sg->width == 360 && sg->height == 69) ||
+                  (sg->width == 180 && sg->height == 34));
+}
+
 /* Per-target draw histogram for a retired recording.  TOTK's large UI/atlas
  * command buffers set a 1920x1080 0x3f colour target but draw only to small
  * atlas textures; knowing which target actually received the draws avoids
@@ -3951,6 +4005,36 @@ static void nvn_cb_retire(cb_t *c) {
             if (empty_segs && nempty < e->nseg) empty_segs[nempty++] = i;
         }
     }
+    /* One dump per UI recording: every segment, its key state and the exact
+     * reason it will or will not be replayed. */
+    if (nvn_ui_seg_want()) {
+        int has_ui = 0;
+        for (uint32_t i = 0; e->seg && i < e->nseg; i++)
+            if (nvn_seg_is_ui(&e->seg[i])) has_ui = 1;
+        if (has_ui) {
+            nvn_ui_seg_logs++;
+            fprintf(stderr, "[totk-ui-seg] retire handle=%#llx nseg=%u nqueue=%u nempty=%u"
+                            " draws=%u prog=%p bind=%d\n",
+                    (unsigned long long)e->handle, e->nseg, nqueue, nempty,
+                    e->draw_count, e->prog, e->bind != NULL);
+            for (uint32_t si = 0; si < e->nseg; si++) {
+                nvn_seg_t *sg = &e->seg[si];
+                int queued = 0;
+                uint32_t prio = 0;
+                for (unsigned qi = 0; qi < nqueue; qi++)
+                    if (queue_segs[qi] == si) { queued = 1; prio = queue_prio[qi]; break; }
+                const tex_t *st = nvn_tex_registry_find(sg->color0_tex);
+                fprintf(stderr, "[totk-ui-seg]  seg=%u cmd=[%u,%u) draws=%u clears=%u"
+                                " layout=%d %ux%u fmt=%#x tex=%p prog=%p pstate=%p rp=%p"
+                                " warm=%d last=%d queued=%d prio=%u reason=%s\n",
+                        si, sg->first_cmd, sg->first_cmd + sg->ncmds, sg->draw_count,
+                        sg->clear_count, sg->have_layout, sg->width, sg->height,
+                        st ? (uint32_t)st->d.format : 0, sg->color0_tex, e->prog,
+                        (void *)sg->pstate, (void *)sg->pipeline, sg->warm,
+                        sg->have_last, queued, prio, nvn_seg_reason(sg, e));
+            }
+        }
+    }
     {
         static int on = -1;
         if (on < 0) on = getenv("TOTK_ANDROID_TRACE_SEGS") != NULL;
@@ -4040,7 +4124,13 @@ static void nvn_cb_retire(cb_t *c) {
         nvn_scene_queue(scene_handle, queue_segs[i], rm ? rm->record_seq : 0,
                         queue_prio ? queue_prio[i] : 0,
                         e->seg && queue_segs[i] < e->nseg
-                            ? e->seg[queue_segs[i]].color0_tex : NULL);
+                            ? e->seg[queue_segs[i]].color0_tex : NULL,
+                        e->seg && queue_segs[i] < e->nseg
+                            ? e->seg[queue_segs[i]].width : 0,
+                        e->seg && queue_segs[i] < e->nseg
+                            ? e->seg[queue_segs[i]].height : 0,
+                        e->seg && queue_segs[i] < e->nseg
+                            ? e->seg[queue_segs[i]].draw_count : 0);
     for (unsigned i = 0; i < nempty; i++) {
         nvn_retired_t *re = NULL;
         pthread_mutex_lock(&g_retired_lock);
@@ -7952,6 +8042,12 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
     nvn_seg_t *sg = &e->seg[seg_index];
     if ((!sg->draw_count && !sg->clear_count) || !sg->have_layout ||
         sg->window_texture || !sg->color0_tex || !sg->ncmds) {
+        if (nvn_ui_seg_want())
+            fprintf(stderr, "[totk-ui-seg] skip handle=%#llx seg=%u reason=%s"
+                            " draws=%u clears=%u layout=%d win=%d color0=%p ncmds=%u\n",
+                    (unsigned long long)handle, seg_index, nvn_seg_reason(sg, e),
+                    sg->draw_count, sg->clear_count, sg->have_layout,
+                    sg->window_texture, sg->color0_tex, sg->ncmds);
         pthread_mutex_unlock(&g_retired_lock);
         return 0;
     }
@@ -8049,6 +8145,10 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
     const nvn_bind_state_t *seed = (sg->have_last && sg->last.have_state)
                                  ? &sg->last.state : e->bind;
     if (!seed) {
+        if (nvn_ui_seg_want())
+            fprintf(stderr, "[totk-ui-seg] skip handle=%#llx seg=%u reason=no-bind-state"
+                            " last=%d\n", (unsigned long long)handle, seg_index,
+                    sg->have_last);
         pthread_mutex_unlock(&g_retired_lock);
         return 0;
     }
@@ -8350,12 +8450,37 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
                     ok ? "ok" : "failed");
         }
     }
+    /* Lane 2: the exact 360x69 output of each of the first UI segments, so the
+     * first writer in the chain can be identified (not just the 50th). */
+    if (nvn_ui_seg_want() && lw <= 512) {
+        static unsigned ui_seg_dumps;
+        if (ui_seg_dumps < 12) {
+            size_t rn = 0;
+            const uint8_t *rpix = gfx_backend_offscreen_pixels(rt, &rn);
+            uint32_t rnz = nvn_first_nonzero(rpix, rn, 1u << 20);
+            fprintf(stderr, "[totk-ui-seg] result seg=%u %ux%u drew=%d bytes=%zu"
+                            " first_nz=%s%u\n", seg_index, lw, lh, drew, rn,
+                    rnz == UINT32_MAX ? "none " : "", rnz == UINT32_MAX ? 0 : rnz);
+            const char *ui_seg_ppm = getenv("TOTK_ANDROID_UI_SEG_PPM");
+            if (ui_seg_ppm && *ui_seg_ppm) {
+                char path[PATH_MAX];
+                snprintf(path, sizeof path, "%s-s%u-%ux%u.ppm", ui_seg_ppm,
+                         seg_index, lw, lh);
+                int ok = gfx_backend_offscreen_write_ppm_index(rt, 0, path);
+                fprintf(stderr, "[totk-ui-seg] ppm seg=%u -> %s (%s)\n", seg_index,
+                        path, ok ? "ok" : "failed");
+            }
+            ui_seg_dumps++;
+        }
+    }
     e->age = ++g_retired_age;
     nvn_scene_submits++;
     if (drew) nvn_scene_rendered++;
     uint32_t ncmds = sg->ncmds, ndraws = sg->draw_count;
     uint32_t first = sg->first_cmd;
     const void *ctex_dbg = sg->color0_tex;
+    prog_shader_state_t *sg_pstate = sg->pstate;
+    int sg_warm = sg->warm;
     const char *scene_ppm = getenv("TOTK_ANDROID_SCENE_PPM");
     if (drew && scene_ppm && *scene_ppm) {
         static int dumped;
@@ -8367,6 +8492,11 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
         }
     }
     pthread_mutex_unlock(&g_retired_lock);
+    if (nvn_ui_seg_want())
+        fprintf(stderr, "[totk-ui-seg] run handle=%#llx seg=%u %ux%u draws=%u rp=%p"
+                        " pstate=%p warm=%d drew=%d\n",
+                (unsigned long long)handle, seg_index, lw, lh, ndraws, (void *)rp,
+                (void *)sg_pstate, sg_warm, drew);
     if (nvn_trace_frame())
         fprintf(stderr, "[totk-frame] scene submit handle=%#llx seg=%u rt=%p %ux%u"
                         " color0=%p cmd=[%u,%u) draws=%u program=%p pipeline=%p"
@@ -8380,9 +8510,19 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
 /* Before the window composite draws, make its sampled 0x3f source fresh even
  * when the FIFO is deep.  TOTK records ~100 UI targets per frame but the
  * Adreno submit path cannot replay all of them in one call, so the plain FIFO
- * would still be empty at the 0x3f segment when the window samples it. */
+ * would still be empty at the 0x3f segment when the window samples it.
+ *
+ * The UI recording is a chain: seg 2 paints the base 360x69 image with 60
+ * vertices, segs 3..19 each draw 6 vertices on top of the previous target, and
+ * the last segment draws the result into the 1920x1080 0x3f texture.  Ordered
+ * by "samples a texture" the base pass and the 0x3f pass sort last, so a
+ * one-segment-per-submit FIFO starves exactly the two segments that matter and
+ * the compositor samples an untouched target.  Render that recording's small
+ * UI segments in recording order here, then the segment that writes the
+ * sampled target. */
 static void nvn_scene_submit_sampled_target(const nvn_bind_state_t *bs, cb_t *view) {
     if (!bs) return;
+    if (getenv("TOTK_ANDROID_NO_SAMPLED_DRAIN")) return;
     const void *target = NULL;
     const tex_pool_t *tp = nvn_tex_pool_for(view);
     for (int st = 0; st < 2 && !target; st++)
@@ -8405,7 +8545,9 @@ static void nvn_scene_submit_sampled_target(const nvn_bind_state_t *bs, cb_t *vi
     uint32_t seg = 0;
     int found = 0;
     pthread_mutex_lock(&g_scene_lock);
-    for (unsigned i = 0; i < g_scene_pending_count; i++) {
+    /* Newest first: an older recording's segments are stale, because the
+     * guest re-records the same guest textures every frame. */
+    for (unsigned i = g_scene_pending_count; i-- > 0; ) {
         if (g_scene_pending[i].target != target) continue;
         handle = g_scene_pending[i].handle;
         seg = g_scene_pending[i].seg;
@@ -8415,19 +8557,61 @@ static void nvn_scene_submit_sampled_target(const nvn_bind_state_t *bs, cb_t *vi
         found = 1;
         break;
     }
+    if (found) {
+        /* The whole recording is about to run in order below; keep its other
+         * entries out of the FIFO so stale copies cannot crowd it. */
+        unsigned w = 0;
+        for (unsigned i = 0; i < g_scene_pending_count; i++) {
+            if (g_scene_pending[i].handle == handle) continue;
+            g_scene_pending[w++] = g_scene_pending[i];
+        }
+        g_scene_pending_count = w;
+    }
     pthread_mutex_unlock(&g_scene_lock);
-    if (found) nvn_submit_scene_snapshot(handle, seg);
+    if (!found) return;
+    /* Collect the recording's earlier drawable small-target segments. */
+    uint32_t chain[64];
+    unsigned nchain = 0;
+    unsigned max_chain = 32;
+    const char *mc = getenv("TOTK_ANDROID_UI_CHAIN_MAX");
+    if (mc && *mc) {
+        long v = strtol(mc, NULL, 0);
+        if (v >= 0 && v <= 64) max_chain = (unsigned)v;
+    }
+    pthread_mutex_lock(&g_retired_lock);
+    nvn_retired_t *e = NULL;
+    for (unsigned i = 0; i < NVN_RETIRED_MAX; i++)
+        if (g_retired[i].used && g_retired[i].handle == handle) { e = &g_retired[i]; break; }
+    if (e) {
+        for (uint32_t i = 0; i < e->nseg && i < seg && nchain < max_chain; i++) {
+            const nvn_seg_t *sg = &e->seg[i];
+            if (!sg->draw_count || !sg->have_layout || sg->window_texture ||
+                !sg->color0_tex) continue;
+            if (sg->width > 512 || sg->height > 512) continue;
+            chain[nchain++] = i;
+        }
+    }
+    pthread_mutex_unlock(&g_retired_lock);
+    if (nvn_ui_seg_want())
+        fprintf(stderr, "[totk-ui-seg] chain handle=%#llx seg=%u nchain=%u\n",
+                (unsigned long long)handle, seg, nchain);
+    for (unsigned i = 0; i < nchain; i++)
+        nvn_submit_scene_snapshot(handle, chain[i]);
+    nvn_submit_scene_snapshot(handle, seg);
 }
 
 /* Called at the start of every queue submit: render the retired offscreen
  * passes before the window compositor that samples them. */
 static void nvn_scene_submit_pending(void) {
     nvn_scene_item_t items[NVN_SCENE_QUEUE_MAX];
-    /* Serialize retired segment execution: running a whole multi-target
-     * recording's segments in one submit deterministically crashes the
-     * Adreno submit path around the first 0x3f pass.  One segment per submit
-     * drains the FIFO across frames and keeps the recording thread live. */
-    unsigned max = 1;
+    /* Drain a bounded batch per submit instead of one segment.  A UI recording
+     * is a chain of ~20 segments (a 60-draw producer, then 6-draw consumers,
+     * then the 1920x1080 composite); draining one per submit means the
+     * consumers always outrun the producer and the chain never completes.
+     * At most one large (>=1024 px) target is replayed per submit: running
+     * several full-screen passes in one submit is what the Adreno submit path
+     * could not take. */
+    unsigned max = 8;
     const char *ns = getenv("TOTK_ANDROID_SCENE_N_PER_SUBMIT");
     if (ns && *ns) {
         long v = strtol(ns, NULL, 0);
@@ -8436,19 +8620,39 @@ static void nvn_scene_submit_pending(void) {
     unsigned n;
     if (max < NVN_SCENE_QUEUE_MAX) {
         pthread_mutex_lock(&g_scene_lock);
-        n = g_scene_pending_count < max ? g_scene_pending_count : max;
+        n = 0;
+        unsigned nlarge = 0;
+        while (n < g_scene_pending_count && n < max) {
+            if (g_scene_pending[n].width >= 1024 || g_scene_pending[n].height >= 1024) {
+                if (nlarge) break;
+                nlarge = 1;
+            }
+            n++;
+        }
         for (unsigned i = 0; i < n; i++) items[i] = g_scene_pending[i];
         if (n) {
             memmove(&g_scene_pending[0], &g_scene_pending[n],
                     (g_scene_pending_count - n) * sizeof g_scene_pending[0]);
             g_scene_pending_count -= n;
         }
+        unsigned depth = g_scene_pending_count;
         pthread_mutex_unlock(&g_scene_lock);
+        if (nvn_ui_seg_want() && (n || depth))
+            fprintf(stderr, "[totk-ui-seg] drain max=%u n=%u depth_after=%u"
+                            " queued_total=%u rendered=%u dropped=%u\n",
+                    max, n, depth, nvn_scene_queued, nvn_scene_rendered,
+                    nvn_scene_dropped);
     } else {
         n = nvn_scene_take(items, max);
     }
-    for (unsigned i = 0; i < n; i++)
+    for (unsigned i = 0; i < n; i++) {
+        if (nvn_ui_seg_want())
+            fprintf(stderr, "[totk-ui-seg] drain[%u] handle=%#llx seg=%u prio=%u"
+                            " target=%p %ux%u draws=%u\n", i,
+                    (unsigned long long)items[i].handle, items[i].seg, items[i].prio,
+                    items[i].target, items[i].width, items[i].height, items[i].draws);
         nvn_submit_scene_snapshot(items[i].handle, items[i].seg);
+    }
 }
 
 static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
@@ -8560,8 +8764,10 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
         int window_pass = has_window && (!have_layout ||
                           (window_target && nvn_layout_matches_window(w, &layout, rw, rh)));
         const nvn_bind_state_t *bs = nvn_cb_draw_state(cb);
-        if (window_pass && getenv("TOTK_ANDROID_SAMPLED_DRAIN"))
-            nvn_scene_submit_sampled_target(bs, cb);
+        /* Refresh the 0x3f source this window pass samples.  Cheap (small UI
+         * targets only) and required for a correct composite; disable with
+         * TOTK_ANDROID_NO_SAMPLED_DRAIN for A/B evidence. */
+        if (window_pass) nvn_scene_submit_sampled_target(bs, cb);
         {
             static int uiflow = -1;
             if (uiflow < 0) uiflow = getenv("TOTK_ANDROID_TRACE_UI_FLOW") != NULL;
