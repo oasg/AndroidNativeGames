@@ -29,6 +29,7 @@
 #include <sys/mman.h>
 #include <time.h>
 #ifdef __ANDROID__
+#include <ucontext.h>
 #include "../android/thread_compat_android.h"
 #else
 #include <mach/mach.h>
@@ -336,6 +337,9 @@ static void core_wait_report(const thr_t *w) {
     fprintf(stderr, "\n");
 }
 #endif
+#ifdef __ANDROID__
+static void android_preempt_kick(thr_t *o);
+#endif
 static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask is handed over
     if (!cores_enabled() || t->cur_core >= 0) return;
     if (!(t->mask & ((1u << NCORE) - 1))) die("thread %#x core mask %#llx has no application core", t->handle, (unsigned long long)t->mask);
@@ -354,8 +358,24 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
 #else
     if (c >= 0) { t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
-    for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) g_core_owner[i]->preempt = 1;
-    while (t->cur_core < 0) pthread_cond_wait(&t->cv, &G);
+    while (t->cur_core < 0) {
+        /* Re-check periodically, not only when this waiter first queues: the
+         * owner may have acquired the core after the queue entry, and a guest
+         * spinlock needs an asynchronous kick to give it up. */
+        for (int i = 0; i < NCORE; i++)
+            if (core_allowed(t, i) && g_core_owner[i] &&
+                g_core_owner[i]->prio > t->prio) {
+                g_core_owner[i]->preempt = 1;
+#ifdef __ANDROID__
+                android_preempt_kick(g_core_owner[i]);
+#endif
+            }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 5000000;
+        if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+        pthread_cond_timedwait(&t->cv, &G, &ts);
+    }
 #endif
 }
 static thr_t *me_or_null(void) { return g_keythr ? pthread_getspecific(g_keythr) : NULL; }
@@ -405,6 +425,56 @@ void runtime_core_checkpoint(void) {
     if (!t || !t->preempt) return;
     pthread_mutex_lock(&G); t->preempt = 0; core_put(t); core_take(t); pthread_mutex_unlock(&G);
 }
+
+#ifdef __ANDROID__
+/* Android runs the guest threads as host pthreads and cannot use the Darwin
+ * thread_suspend path.  A guest spinlock owner that never enters an SVC can
+ * keep a core forever while a better thread waits for it (TOTK's UI loader
+ * does exactly this).  A waiter signals the owner with SIGUSR2; the handler
+ * only switches cores when the interrupted PC is original guest code at the
+ * top level, so it never runs concurrently with a host HLE call. */
+extern int runtime_guest_top_level(uint64_t pc);
+static int g_android_async_preempt = -1;
+static uint64_t g_android_preempt_kicks, g_android_preempt_async;
+static void android_preempt_signal(int sig, siginfo_t *si, void *ctx) {
+    (void)sig; (void)si;
+    thr_t *t = me_or_null();
+    if (!t || !__atomic_load_n(&t->preempt, __ATOMIC_ACQUIRE) || t->cur_core < 0) return;
+    uint64_t pc = (uint64_t)((ucontext_t *)ctx)->uc_mcontext.pc;
+    int top = runtime_guest_top_level(pc);
+    if (top && g_android_preempt_async < 8 && getenv("TOTK_ANDROID_TRACE_PREEMPT"))
+        fprintf(stderr, "[threads] preempt h=%#x pc=%#llx core=%d\n",
+                t->handle, (unsigned long long)pc, t->cur_core);
+    if (!top) return;
+    int saved = errno;
+    pthread_mutex_lock(&G);
+    if (t->cur_core >= 0 && t->preempt) {
+        core_put(t); core_take(t);
+        g_android_preempt_async++;
+    } else {
+        t->preempt = 0;
+    }
+    pthread_mutex_unlock(&G);
+    errno = saved;
+}
+static void android_preempt_kick(thr_t *o) {   // holding G
+    if (g_android_async_preempt < 0) {
+        const char *e = getenv("TOTK_ANDROID_ASYNC_PREEMPT");
+        g_android_async_preempt = !(e && !strcmp(e, "0"));
+        if (g_android_async_preempt) {
+            struct sigaction a = {0};
+            a.sa_sigaction = android_preempt_signal;
+            a.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
+            sigemptyset(&a.sa_mask);
+            if (sigaction(SIGUSR2, &a, NULL)) g_android_async_preempt = 0;
+            fprintf(stderr, "[threads] Android async core preemption: %s\n",
+                    g_android_async_preempt ? "on" : "off");
+        }
+    }
+    if (!g_android_async_preempt || !o || !o->pt) return;
+    if (!pthread_kill(o->pt, SIGUSR2)) g_android_preempt_kicks++;
+}
+#endif
 int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_core >= 0 ? t->cur_core : t->core) : -1; }
 
 static int64_t block(thr_t *t,int kind,int64_t ns) {

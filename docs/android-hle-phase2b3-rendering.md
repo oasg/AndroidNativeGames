@@ -950,22 +950,42 @@ UI data, it does not write pixels directly.  The full translated UI cache
 device; the following run then reached the 1920x1080 UI target instead of
 falling back on every shader miss.
 
-The run still stalls around present #58–#76, before the `0x3f` composite.
-`TOTK_DUMP_AFTER=45` shows one guest thread (0x103a) owning core 2 for 39 s
-with only 9 SVCs, while the main thread waits on `WaitForAddress`
-`0x3332303dc`.  That is a host Adreno pipeline/submit stall, not the old guest
-list race.  `present` remains `colors=1` because the `0x3f` source is still
-never written.
+A dump taken while that run was stalled (`TOTK_DUMP_AFTER=45`) showed one
+guest thread (0x103a) owning core 2 for 39 s with only 9 SVCs, while the main
+thread waited on `WaitForAddress` `0x3332303dc`.  Its guest chain was:
+
+```text
+main+0x22c56cc (spin loop on [x19+0xa0], calls vtable+0x88)
+  <- main+0x29bb788 <- sdk+0x12a518 ...
+```
+
+This is a guest spinlock, not an Adreno hang.  Horizon preempts a same-core
+spinner on its timer slice; the host only checked `preempt` at SVC entry, and
+TOTK's UI loader spin loop can avoid SVCs long enough to keep core 2 forever.
+
+The Android scheduler now supports **asynchronous core preemption**: a waiter
+that beats a core owner sends `SIGUSR2`; the handler switches cores only when
+the interrupted PC is original guest code at the top level (never inside an
+HLE host call).  It is enabled by default for TOTK; `TOTK_ANDROID_ASYNC_PREEMPT=0`
+restores the old SVC-only behavior.  Waiting for a core is now a 5 ms timed
+wait that re-checks the owner, so a waiter that queued before the owner got
+the core still kicks it.
+
+With this, the same save/cache run reached **4045 presents** without the list
+crash or the 39 s core stall.  The UI scene steps now execute 180x34 and
+360x69 composites, but their sampled 360x69 source is still empty
+(`first_nz=none gfx=0x0`), so the final picture remains black.
 
 ## 10. Next
 
-1. Get past the Adreno stall at present #58–#76: identify the host call that
-   keeps thread 0x103a on core 2 for 39 s (pipeline create vs submit/fence).
-   The UI scene steps already execute for 360x69 and 1920x1080 targets.
-2. Implement `nvnCommandBufferDispatchCompute` for the UI compute modules.
+1. Implement `nvnCommandBufferDispatchCompute` for the UI compute modules.
    The d946... module needs UBOs/SSBOs/sampled texture, not storage images, so
-   this is a buffer-dispatch path first; then re-check how the `0x3f` target
-   is produced by the following graphics pass.
+   this is a buffer-dispatch path first.  The 180x34 UI draw already samples a
+   360x69 source, but that source is zero (`first_nz=none`); filling it is the
+   next visible change.
+2. Implement the texture copy/clear shims the UI uses
+   (`CopyTextureToTexture`, `CopyBufferToTexture`, `ClearTexture`) instead of
+   `nvn_zero_call`; the window pass samples an empty `0x3f` target.
 3. Re-run with virtual cores and the f9cd... save, capture the title/save-slot
    frame and verify A/Continue → 3D.
 4. Only the first 360x69 target has a 66x5 loading strip; later UI layers and

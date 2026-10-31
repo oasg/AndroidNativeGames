@@ -396,6 +396,28 @@ static void *probe_thread(void *unused) {
 /* Guest frame names for the thread dump (threads.c calls this weak hook).
  * Prefer the nearest defined symbol in the mapped module, so a dump names
  * the load/job function instead of only main+0x.... */
+/* Used by the Android virtual-core async-preemption handler: only preempt a
+ * thread interrupted in original guest code at the top level, never inside a
+ * host HLE call or a rewritten gate. */
+int runtime_guest_code_pc(uint64_t pc) {
+    for (unsigned i = 0; i < NMODULES; i++) {
+        uintptr_t b = (uintptr_t)modules[i].base;
+        if (!b) continue;
+        if (pc >= b && pc < b + modules[i].text_end) return 1;
+    }
+    return 0;
+}
+
+int runtime_guest_top_level(uint64_t pc) {
+    if (!runtime_guest_code_pc(pc)) return 0;
+    uintptr_t tp;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    uint64_t off = __atomic_load_n(&runtime_host_ctx_off, __ATOMIC_RELAXED);
+    if (!off) return 1;
+    HostContext *hc = *(HostContext **)(tp + off);
+    return hc && hc->host_stack_top != 0;
+}
+
 void runtime_describe_address(uint64_t addr, char *out, size_t cap) {
     for (unsigned i = 0; i < NMODULES; i++) {
         uintptr_t b = (uintptr_t)modules[i].base;

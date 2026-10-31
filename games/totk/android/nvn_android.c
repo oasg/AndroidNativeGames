@@ -9933,11 +9933,21 @@ static void nvn_trace_copy_b2t(void *c, void *buf, void *t, void *v, void *r, in
         fprintf(stderr, "[totk-frame] composite copy buffer->texture buf=%p t=%p\n", buf, t);
     nvn_zero_call("nvnCommandBufferCopyBufferToTexture");
 }
-static void nvn_trace_copy_t2t(void *c, ...) {
-    (void)c;
+static void nvn_trace_copy_t2t(void *c, const void *src, const void *sv, const void *sr,
+                               const void *dst, const void *dv, const void *dr, int flags) {
+    (void)c; (void)sv; (void)dv; (void)flags;
     nvn_cb_copy_t2t_calls++;
-    if (nvn_trace_composite())
-        fprintf(stderr, "[totk-frame] composite copy texture->texture called\n");
+    if (nvn_trace_composite()) {
+        const tex_t *s = nvn_tex_registry_find(src);
+        const tex_t *d = nvn_tex_registry_find(dst);
+        const int32_t *r = sr;
+        fprintf(stderr, "[totk-frame] composite copy texture->texture src=%p(%s fmt=%#x %ux%u)"
+                        " dst=%p(%s fmt=%#x %ux%u) region=%d,%d,%d %dx%dx%d\n",
+                src, s ? "tex" : "?", s ? s->d.format : 0, s ? s->d.width : 0, s ? s->d.height : 0,
+                dst, d ? "tex" : "?", d ? d->d.format : 0, d ? d->d.width : 0, d ? d->d.height : 0,
+                r ? r[0] : 0, r ? r[1] : 0, r ? r[2] : 0,
+                r ? r[3] : 0, r ? r[4] : 0, r ? r[5] : 0);
+    }
     nvn_zero_call("nvnCommandBufferCopyTextureToTexture");
 }
 static void nvn_trace_blit(void *c, ...) {
