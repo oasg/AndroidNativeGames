@@ -776,12 +776,50 @@ Expected:
 - `probe-spirv`: all cached SPIR-V modules accepted by the driver.
 - `probe-nvn-submit`: the older submit/present self-test still passes.
 
-## 8. Next
+## 8. Save/UI composite path
 
-1. Fix the stuck pre-title load/job barrier: the UI composite into `0x3f`
-   works (`center=a68a565f`), but the later black fade overwrites it and the
-   loading strip never advances.  Trace the guest load job/thread and the
-   `save:/option.sav` path; the renderer/composite is not the missing edge.
+The save/title UI composite now reaches the window.  The missing pieces were
+all host-side:
+
+- **Windowless UI command buffers**: TOTK submits UI recordings that never
+  call `nvnCommandBufferSetWindow`; they render to the guest `0x3f` target.
+  `nvnQueueSubmitCommands` used to reject them with "command buffer has no
+  drawable window".  Offscreen target resolution now works without a window,
+  and a successful offscreen draw calls `nvn_tex_set_rt()` so the later window
+  composite samples the rendered image.
+- **Prefix target state**: NVN keeps render targets across
+  `BeginRecording`.  A UI recording often draws to the live target before its
+  first `SetRenderTargets`; the segment splitter seeded the prefix with
+  `ctex=NULL` and dropped those draws.  It now seeds from the command buffer's
+  live target snapshot.
+- **Segment queue depth/priority**: the UI records ~100 targets per frame but
+  the Adreno-safe drain is one segment per submit.  The queue was 64 entries
+  and truncated `queue_segs[64]`, so the `0x3f` composite was dropped.  It is
+  now a 1024-entry priority queue (textured draw segments first, clear-only
+  segments are not queued), and the window pass synchronously drains a pending
+  segment whose target is the sampled `0x3f` texture before compositing.
+- **Host render-target cache**: increased from 16 to 128 (size + layout +
+  guest owner), because the UI creates one host image per plane/atlas.
+- **Pipeline compile stack**: raised to 128 MiB for the large UI variants.
+
+Evidence: `TOTK_ANDROID_L2_FRAME_AT=600` now produces a non-black 1920x1080
+window frame with **762 unique colours** (dark blue `0d141e` background and an
+orange/red loading strip), instead of an all-zero PPM.  A later run reached
+draw #2100 and the same composite path.
+
+The remaining blocker is a guest crash at `main+0x79a9a4` (a list walk with a
+null link) after `nvnTexturePoolRegisterTexture`; it occurs at varying draws
+(32–300) and prevents a reliable capture of the actual title/save-slot screen.
+The x600 frame is still an early loading screen, not the save-slot UI, and
+A/Continue has therefore not been verified from a visible title screen.
+
+## 9. Next
+
+1. Fix the `nvnTexturePoolRegisterTexture` / `main+0x79a9a4` guest list crash
+   (texture-pool registration lifetime or a guest-visible pool field being
+   overwritten), so title/save-slot UI can be captured after the loading strip.
+2. Once the save-slot screen is visible, send A/Continue and verify the
+   transition into gameplay and the first 3D draw list to `0x3f`.
 2. Only the first 360x69 target has a 66x5 loading strip; later UI layers and
    the 180x34 mask stay black.  If the loading barrier completes, re-check the
    UI vertex/UI2F and glyph/style inputs before expecting title text.
