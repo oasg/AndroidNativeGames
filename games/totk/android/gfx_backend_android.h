@@ -372,6 +372,68 @@ GfxReflectedPipeline *gfx_backend_reflected_builtin_texture_pipeline_create(void
  * pipeline creation, then draws it.  No game data. */
 int gfx_backend_reflected_ubo_selftest(void);
 
+/* ------------------------------------------------------------------ */
+/* Compute and texture transfer (Wave 0 contract; additive).
+ *
+ * These are the primitives the NVN command-buffer lane records into and the
+ * Vulkan backend implements.  They do not change any existing entry point.
+ * Every call is synchronous: it submits and waits before returning, so a
+ * readback issued after a dispatch observes the dispatch's result.  A failure
+ * is reported with 0/NULL; the backend never fakes a successful dispatch or
+ * copy. */
+
+typedef struct GfxComputePipeline GfxComputePipeline;
+
+/* Create a compute pipeline from one translated SPIR-V module.  `specs` is the
+ * same reflection output used by the graphics path and all bindings live in
+ * descriptor set 0.  Returns NULL for an unsupported descriptor kind or a
+ * driver failure. */
+GfxComputePipeline *gfx_backend_compute_pipeline_create(const uint8_t *cs, size_t cs_size,
+                                                        const GfxBindingSpec *specs,
+                                                        uint32_t nspecs);
+void gfx_backend_compute_pipeline_destroy(GfxComputePipeline *pipeline);
+
+/* Bind a UBO/SSBO (GFX_BIND_UBO/GFX_BIND_SSBO) or a sampled/storage image
+ * (GFX_BIND_SAMPLED_IMAGE/GFX_BIND_COMBINED_IMAGE_SAMPLER/GFX_BIND_STORAGE_IMAGE)
+ * by SPIR-V set/binding.  `data` is copied into the backend's buffer.  A
+ * storage image must be a texture the backend created with storage usage;
+ * one that is not is rejected rather than silently treated as sampled. */
+int gfx_backend_compute_bind_buffer(GfxComputePipeline *pipeline, uint32_t set,
+                                    uint32_t binding, const void *data, size_t size);
+int gfx_backend_compute_bind_texture(GfxComputePipeline *pipeline, uint32_t set,
+                                     uint32_t binding, const GfxTexture *texture);
+/* Update an already-bound buffer without rebinding (dynamic-offset epoch). */
+int gfx_backend_compute_write_buffer(GfxComputePipeline *pipeline, uint32_t set,
+                                     uint32_t binding, uint32_t offset,
+                                     const void *data, size_t size);
+/* Copy a bound buffer back to host memory (valid after dispatch). */
+int gfx_backend_compute_read_buffer(GfxComputePipeline *pipeline, uint32_t set,
+                                    uint32_t binding, void *dst, size_t size);
+/* Record, submit and wait.  Returns 1 only when the dispatch completed. */
+int gfx_backend_compute_dispatch(GfxComputePipeline *pipeline,
+                                 uint32_t group_x, uint32_t group_y, uint32_t group_z);
+
+/* Texture transfer.  Coordinates are in texels; width/height/depth of 0 mean
+ * "to the edge of the level".  Copy requires matching formats; the backend
+ * uses vkCmdCopyImage and only falls back to a nearest-filter blit when the
+ * formats differ.  `dst` and `src` may alias only for non-overlapping regions.
+ * Clear/upload/download apply to one mip level and one array layer (3D uses
+ * layer 0). */
+int gfx_backend_texture_copy(GfxTexture *dst, uint32_t dst_level, uint32_t dst_layer,
+                             int32_t dst_x, int32_t dst_y, int32_t dst_z,
+                             const GfxTexture *src, uint32_t src_level, uint32_t src_layer,
+                             int32_t src_x, int32_t src_y, int32_t src_z,
+                             uint32_t width, uint32_t height, uint32_t depth);
+int gfx_backend_texture_clear(GfxTexture *dst, uint32_t level, uint32_t layer,
+                              const float rgba[4],
+                              int32_t x, int32_t y, uint32_t width, uint32_t height);
+int gfx_backend_texture_upload(GfxTexture *dst, uint32_t level, uint32_t layer,
+                               int32_t x, int32_t y, uint32_t width, uint32_t height,
+                               const void *data, size_t size);
+int gfx_backend_texture_download(const GfxTexture *src, uint32_t level, uint32_t layer,
+                                 int32_t x, int32_t y, uint32_t width, uint32_t height,
+                                 void *dst, size_t size);
+
 /* Minimal sampled-texture path: RGBA8 texture -> VkImage/VkSampler and a
  * textured triangle pipeline.  This is the 2B.3 NVN texture bridge's Vulkan
  * half; the NVN object wraps it. */

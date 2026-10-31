@@ -24,7 +24,8 @@ out="$work/build/android-v0"
   -fno-stack-protector -ffixed-x18 -fno-sanitize=shadow-call-stack -fno-emulated-tls \
   -I"$here/../runtime" -I"$out" \
   -I"$here/../third_party/d2r_gfx/gfx/nvn" -I"$here/../third_party/d2r_gfx/gfx/tex" \
-  "$here/loader_android.c" "$here/hle_android.c" "$here/hle_stack_android.c" \
+  "$here/loader_android.c" "$here/probe_hooks_android.c" \
+  "$here/hle_android.c" "$here/hle_stack_android.c" \
   "$here/services_android.c" "$here/fs_service_android.c" "$here/vi_android.c" \
   "$here/account_android.c" "$here/nvn_android.c" "$here/nvdrv_android.c" \
   "$here/native_window_android.c" "$here/gfx_vulkan_android.c" "$here/hid_android.c" \

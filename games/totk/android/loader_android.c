@@ -9,6 +9,7 @@
 #include "ipc.h"
 #include "sha256.h"
 #include "gfx_backend_android.h"
+#include "probe_hooks_android.h"
 #include "shader_cache_android.h"
 #include <dlfcn.h>
 #include <errno.h>
@@ -2189,6 +2190,10 @@ int main(int argc, char **argv) {
         printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"vulkan-mrt\"}\n");
         return 0;
     }
+    if (!strcmp(argv[2], "probe-vulkan-compute"))
+        return gfx_backend_compute_probe(argv[1]);
+    if (!strcmp(argv[2], "probe-vulkan-copy"))
+        return gfx_backend_copy_probe(argv[1]);
     if (!strcmp(argv[2], "probe-vulkan-surface-target")) {
         if (!gfx_backend_surface_target_selftest()) {
             fprintf(stderr, "[totk-vk] surface target selftest FAIL\n");
@@ -2424,6 +2429,10 @@ int main(int argc, char **argv) {
         printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"nvn-fence\"}\n");
         return 0;
     }
+    if (!strcmp(argv[2], "probe-nvn-compute"))
+        return nvn_compute_probe(argv[1]);
+    if (!strcmp(argv[2], "probe-nvn-copy"))
+        return nvn_copy_probe(argv[1]);
     if (!strcmp(argv[2], "probe-nvn-vertex-state")) {
         int runtime_nvn_vertex_state_selftest(void);
         if (!runtime_nvn_vertex_state_selftest()) {
