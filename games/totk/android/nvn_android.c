@@ -741,6 +741,38 @@ static unsigned g_tex_pool_full, g_samp_pool_full, g_tex_pool_max;
 static uint32_t g_pool_clock = 1, g_pool_epoch = 1;
 static int g_pool_map_ready;
 static pthread_mutex_t g_pool_map_lock = PTHREAD_MUTEX_INITIALIZER;
+/* NVN pool objects are guest memory and must stay untouched after init: the
+ * engine keeps its own links next to the header.  Keep the host last-use epoch
+ * in a side table keyed by the pool pointer. */
+#define NVN_POOL_EPOCH_MAX 1024
+typedef struct { const void *p; uint32_t epoch; } pool_epoch_t;
+static pool_epoch_t g_pool_epochs[NVN_POOL_EPOCH_MAX];
+static unsigned g_pool_epoch_count, g_pool_epoch_next;
+static pthread_mutex_t g_pool_epoch_lock = PTHREAD_MUTEX_INITIALIZER;
+static void pool_epoch_set(const void *p) {
+    if (!p) return;
+    pthread_mutex_lock(&g_pool_epoch_lock);
+    for (unsigned i = 0; i < g_pool_epoch_count; i++)
+        if (g_pool_epochs[i].p == p) {
+            g_pool_epochs[i].epoch = g_pool_epoch;
+            pthread_mutex_unlock(&g_pool_epoch_lock);
+            return;
+        }
+    unsigned i = g_pool_epoch_count < NVN_POOL_EPOCH_MAX
+               ? g_pool_epoch_count++ : g_pool_epoch_next++ % NVN_POOL_EPOCH_MAX;
+    g_pool_epochs[i].p = p;
+    g_pool_epochs[i].epoch = g_pool_epoch;
+    pthread_mutex_unlock(&g_pool_epoch_lock);
+}
+static uint32_t pool_epoch_get(const void *p) {
+    uint32_t e = 0;
+    if (!p) return 0;
+    pthread_mutex_lock(&g_pool_epoch_lock);
+    for (unsigned i = 0; i < g_pool_epoch_count; i++)
+        if (g_pool_epochs[i].p == p) { e = g_pool_epochs[i].epoch; break; }
+    pthread_mutex_unlock(&g_pool_epoch_lock);
+    return e;
+}
 
 /* Guest NVNprogram ABI (matches
  * games/totk/third_party/d2r_gfx/gfx/nvn/nvn_obj.h): the shader data/control
@@ -2408,7 +2440,7 @@ static unsigned pool_home(const void *p, int id) {
     return (unsigned)h & (NVN_POOL_BUCKETS - 1);
 }
 static int pool_old(const tex_pool_t *p) {
-    return (int32_t)(g_pool_epoch - p->epoch) > 2;
+    return (int32_t)(g_pool_epoch - pool_epoch_get(p)) > 2;
 }
 static void pool_map_init_locked(void) {
     if (g_pool_map_ready) return;
@@ -2489,7 +2521,7 @@ static void nvn_tex_pool_add(const tex_pool_t *p, int id, const tex_t *t) {
         tex_pool_map_t *e = &g_tex_pool_map[cur];
         if (e->pool == p && e->id == (uint32_t)id) {
             e->tex = t; e->gen = p->gen; e->sig = sig;
-            e->age = ++g_pool_clock; ((tex_pool_t *)p)->epoch = g_pool_epoch;
+            e->age = ++g_pool_clock; pool_epoch_set(p);
             pthread_mutex_unlock(&g_pool_map_lock);
             return;
         }
@@ -2514,7 +2546,9 @@ static void nvn_tex_pool_add(const tex_pool_t *p, int id, const tex_t *t) {
     g_tex_buckets[b] = idx;
     g_tex_pool_map_count++;
     if (g_tex_pool_map_count > g_tex_pool_max) g_tex_pool_max = g_tex_pool_map_count;
-    ((tex_pool_t *)p)->epoch = g_pool_epoch;
+    /* Do not write host bookkeeping into the guest NVNtexturePool object:
+     * the engine keeps its own links next to the NVN header, and an epoch
+     * store here corrupted the texture list (main+0x79a9a4). */
     pthread_mutex_unlock(&g_pool_map_lock);
 }
 static const tex_t *nvn_tex_pool_lookup(const tex_pool_t *p, int id) {
@@ -2536,7 +2570,7 @@ static const tex_t *nvn_tex_pool_lookup(const tex_pool_t *p, int id) {
                 pthread_mutex_unlock(&g_pool_map_lock);
                 return NULL;
             }
-            e->age = ++g_pool_clock; ((tex_pool_t *)p)->epoch = g_pool_epoch;
+            e->age = ++g_pool_clock;
             const tex_t *t = e->tex;
             pthread_mutex_unlock(&g_pool_map_lock);
             return t;
@@ -2572,7 +2606,7 @@ static void nvn_samp_pool_add(const samp_pool_t *p, int id, const samp_t *s) {
     for (unsigned i = 0; i < g_samp_pool_map_count; i++)
         if (g_samp_pool_map[i].pool == p && g_samp_pool_map[i].id == (uint32_t)id) {
             g_samp_pool_map[i].samp = s; g_samp_pool_map[i].gen = p->gen;
-            g_samp_pool_map[i].age = ++g_pool_clock; ((samp_pool_t *)p)->epoch = g_pool_epoch;
+            g_samp_pool_map[i].age = ++g_pool_clock; pool_epoch_set(p);
             pthread_mutex_unlock(&g_pool_map_lock);
             return;
         }
@@ -2580,7 +2614,7 @@ static void nvn_samp_pool_add(const samp_pool_t *p, int id, const samp_t *s) {
     for (unsigned i = 0; i < g_samp_pool_map_count; i++) {
         samp_pool_map_t *e = &g_samp_pool_map[i];
         if (!samp_pool_valid(e->pool) || e->gen != e->pool->gen ||
-            (int32_t)(g_pool_epoch - e->pool->epoch) > 2) continue;
+            (int32_t)(g_pool_epoch - pool_epoch_get(e->pool)) > 2) continue;
         if (n != i) g_samp_pool_map[n] = *e;
         n++;
     }
@@ -2593,7 +2627,7 @@ static void nvn_samp_pool_add(const samp_pool_t *p, int id, const samp_t *s) {
     samp_pool_map_t *e = &g_samp_pool_map[g_samp_pool_map_count++];
     e->pool = p; e->samp = s; e->id = (uint32_t)id; e->gen = p->gen;
     e->age = ++g_pool_clock;
-    ((samp_pool_t *)p)->epoch = g_pool_epoch;
+    pool_epoch_set(p);
     pthread_mutex_unlock(&g_pool_map_lock);
 }
 static const samp_t *nvn_samp_pool_lookup(const samp_pool_t *p, int id) {
@@ -2604,7 +2638,7 @@ static const samp_t *nvn_samp_pool_lookup(const samp_pool_t *p, int id) {
         samp_pool_map_t *e = &g_samp_pool_map[i];
         if (e->pool == p && e->id == (uint32_t)id) {
             if (e->gen != p->gen) { pthread_mutex_unlock(&g_pool_map_lock); return NULL; }
-            e->age = ++g_pool_clock; ((tex_pool_t *)p)->epoch = g_pool_epoch;
+            e->age = ++g_pool_clock; pool_epoch_set(p);
             const samp_t *s = e->samp;
             pthread_mutex_unlock(&g_pool_map_lock);
             return s;
@@ -2625,7 +2659,7 @@ static uint32_t nvnTexturePoolInitialize(tex_pool_t *p, const pool_t *pool, ptrd
     if (!gen) gen = 1;
     memset(p, 0, sizeof *p);
     p->magic = NVN_MAGIC('T', 'P', 'O', 'L'); p->pool = (pool_t *)pool; p->off = off; p->n = (uint32_t)n;
-    p->gen = gen; p->epoch = g_pool_epoch;
+    p->gen = gen; pool_epoch_set(p);
     return 1;
 }
 static void nvnTexturePoolFinalize(tex_pool_t *p) {
@@ -2656,7 +2690,7 @@ static uint32_t nvnSamplerPoolInitialize(samp_pool_t *p, const pool_t *pool, ptr
     nvn_samp_pool_forget(p);
     memset(p, 0, sizeof *p);
     p->magic = NVN_MAGIC('S', 'P', 'O', 'L'); p->pool = (pool_t *)pool; p->off = off; p->n = (uint32_t)n;
-    p->gen = gen; p->epoch = g_pool_epoch;
+    p->gen = gen; pool_epoch_set(p);
     return 1;
 }
 static void nvnSamplerPoolFinalize(samp_pool_t *p) {
@@ -3380,7 +3414,13 @@ static nvn_retired_t g_retired[NVN_RETIRED_MAX];
  * thread's submit drains this FIFO first so the compositor samples a scene
  * that was rendered in this frame. */
 #define NVN_SCENE_QUEUE_MAX 1024
-typedef struct { uint64_t handle; uint32_t seg; uint64_t seq; uint32_t prio; } nvn_scene_item_t;
+typedef struct {
+    uint64_t handle;
+    uint32_t seg;
+    uint64_t seq;
+    uint32_t prio;
+    const void *target;   /* guest colour-0 texture, for the window's 0x3f lookup */
+} nvn_scene_item_t;
 static nvn_scene_item_t g_scene_pending[NVN_SCENE_QUEUE_MAX];
 static unsigned g_scene_pending_count;
 static unsigned nvn_scene_queued;
@@ -3390,7 +3430,8 @@ static pthread_mutex_t g_scene_lock = PTHREAD_MUTEX_INITIALIZER;
  * used to drain.  A plain FIFO overflows and drops the 0x3f composite that the
  * window samples.  Segments with draws and sampled textures go to the front;
  * empty clear/state segments stay behind. */
-static void nvn_scene_queue(uint64_t handle, uint32_t seg, uint64_t seq, uint32_t prio) {
+static void nvn_scene_queue(uint64_t handle, uint32_t seg, uint64_t seq, uint32_t prio,
+                            const void *target) {
     pthread_mutex_lock(&g_scene_lock);
     for (unsigned i = 0; i < g_scene_pending_count; i++)
         if (g_scene_pending[i].handle == handle && g_scene_pending[i].seg == seg) {
@@ -3416,6 +3457,7 @@ static void nvn_scene_queue(uint64_t handle, uint32_t seg, uint64_t seq, uint32_
     g_scene_pending[at].seg = seg;
     g_scene_pending[at].seq = seq;
     g_scene_pending[at].prio = prio;
+    g_scene_pending[at].target = target;
     g_scene_pending_count++;
     nvn_scene_queued++;
     pthread_mutex_unlock(&g_scene_lock);
@@ -3699,7 +3741,9 @@ static void nvn_cb_retire(cb_t *c) {
                 e->color0_tex, e->nseg, nqueue, nempty);
     for (unsigned i = 0; i < nqueue; i++)
         nvn_scene_queue(scene_handle, queue_segs[i], rm ? rm->record_seq : 0,
-                        queue_prio ? queue_prio[i] : 0);
+                        queue_prio ? queue_prio[i] : 0,
+                        e->seg && queue_segs[i] < e->nseg
+                            ? e->seg[queue_segs[i]].color0_tex : NULL);
     for (unsigned i = 0; i < nempty; i++) {
         nvn_retired_t *re = NULL;
         pthread_mutex_lock(&g_retired_lock);
@@ -7294,23 +7338,14 @@ static void nvn_scene_submit_sampled_target(const nvn_bind_state_t *bs, cb_t *vi
     int found = 0;
     pthread_mutex_lock(&g_scene_lock);
     for (unsigned i = 0; i < g_scene_pending_count; i++) {
+        if (g_scene_pending[i].target != target) continue;
         handle = g_scene_pending[i].handle;
         seg = g_scene_pending[i].seg;
-        pthread_mutex_lock(&g_retired_lock);
-        const nvn_retired_t *e = NULL;
-        for (unsigned k = 0; k < NVN_RETIRED_MAX; k++)
-            if (g_retired[k].used && g_retired[k].handle == handle) { e = &g_retired[k]; break; }
-        if (e && seg < e->nseg && e->seg[seg].draw_count > 0 &&
-            e->seg[seg].color0_tex == target) {
-            found = 1;
-        }
-        pthread_mutex_unlock(&g_retired_lock);
-        if (found) {
-            memmove(&g_scene_pending[i], &g_scene_pending[i + 1],
-                    (g_scene_pending_count - i - 1) * sizeof g_scene_pending[0]);
-            g_scene_pending_count--;
-            break;
-        }
+        memmove(&g_scene_pending[i], &g_scene_pending[i + 1],
+                (g_scene_pending_count - i - 1) * sizeof g_scene_pending[0]);
+        g_scene_pending_count--;
+        found = 1;
+        break;
     }
     pthread_mutex_unlock(&g_scene_lock);
     if (found) nvn_submit_scene_snapshot(handle, seg);
@@ -7687,6 +7722,17 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
         int dump_now = l2_at
             ? (nvn_nvn_draws == l2_at)
             : (scene_ready && nvn_nvn_draws >= 1);
+        const char *l2_every_s = getenv("TOTK_ANDROID_L2_FRAME_EVERY");
+        unsigned l2_every = l2_every_s && *l2_every_s
+                          ? (unsigned)strtoul(l2_every_s, NULL, 0) : 0;
+        if (has_window && l2_frame && *l2_frame && l2_every &&
+            nvn_nvn_draws && (nvn_nvn_draws % l2_every) == 0) {
+            char path[PATH_MAX];
+            snprintf(path, sizeof path, "%s-%u.ppm", l2_frame, nvn_nvn_draws);
+            int shot = runtime_native_window_screenshot(w->native, path);
+            fprintf(stderr, "[totk-nvn] periodic frame #%u -> %s (%s)\n",
+                    nvn_nvn_draws, path, shot ? "ok" : "failed");
+        }
         if (has_window && l2_frame && *l2_frame && !l2_frame_dumped && dump_now) {
             l2_frame_dumped = 1;
             int shot = runtime_native_window_screenshot(w->native, l2_frame);
