@@ -574,11 +574,15 @@ static const tex_t *nvn_tex_registry_find(const void *p) {
     return found;
 }
 
+/* Must match the guest/macOS dpool layout for the first 0x18 bytes:
+ * {NVNmemoryPool *pool; int64_t off; int32_t n}.  Host bookkeeping lives in
+ * the 8-byte tail so we never move the guest's pool/off/n fields. */
 typedef struct {
-    uint32_t magic, n;
-    uint32_t gen, epoch;      /* host-side generation and last-use frame */
     pool_t *pool;
     int64_t off;
+    int32_t n;
+    uint32_t magic;
+    uint32_t gen, epoch;
 } tex_pool_t;
 
 /* Queue-scoped texture binds.  TOTK binds resources on a state-only command
@@ -713,7 +717,13 @@ typedef struct { uint32_t magic; samp_par p; } samp_t;
 typedef struct { const samp_t *samp; GfxSampler *gfx; } samp_bridge_t;
 static samp_bridge_t g_samp_bridges[64];
 static unsigned g_samp_bridge_count;
-typedef struct { uint32_t magic, n; uint32_t gen, epoch; pool_t *pool; int64_t off; } samp_pool_t;
+typedef struct {
+    pool_t *pool;
+    int64_t off;
+    int32_t n;
+    uint32_t magic;
+    uint32_t gen, epoch;
+} samp_pool_t;
 
 /* NVN texture/sampler pool registrations.  The pool object itself is
  * guest-sized (0x20 bytes); the host map is generation-aware and bounded. */
@@ -1168,7 +1178,7 @@ static int nvn_gpu_pending_work;
 static int nvn_gpu_drain(const char *what) {
     if (!nvn_gpu_pending_work) return 1;
     if (!gfx_backend_vulkan_available()) { nvn_gpu_pending_work = 0; return 1; }
-    if (!gfx_backend_queue_idle()) {
+    if (!getenv("TOTK_ANDROID_NO_QUEUE_IDLE") && !gfx_backend_queue_idle()) {
         char d[96];
         snprintf(d, sizeof d, "%s: GPU work did not reach idle", what);
         nvn_fail(what, d);
@@ -2681,16 +2691,18 @@ static uint32_t nvnTexturePoolInitialize(tex_pool_t *p, const pool_t *pool, ptrd
     if (n < 0) { nvn_fail("nvnTexturePoolInitialize", "negative count"); return 0; }
     uint32_t gen = p->magic == NVN_MAGIC('T', 'P', 'O', 'L') ? p->gen + 1 : 1;
     if (!gen) gen = 1;
-    memset(p, 0, sizeof *p);
-    p->magic = NVN_MAGIC('T', 'P', 'O', 'L'); p->pool = (pool_t *)pool; p->off = off; p->n = (uint32_t)n;
+    p->pool = (pool_t *)pool; p->off = off; p->n = n;
+    p->magic = NVN_MAGIC('T', 'P', 'O', 'L');
     p->gen = gen; pool_epoch_set(p);
     return 1;
 }
 static void nvnTexturePoolFinalize(tex_pool_t *p) {
+    /* The NVNtexturePool object is guest-owned and may be embedded in an
+     * engine object that is still being torn down.  macOS leaves it untouched;
+     * writing gen/magic here corrupted the engine's texture-pool list. */
     if (!p) return;
     nvn_tex_pool_forget(p);
-    if (p->magic == NVN_MAGIC('T', 'P', 'O', 'L')) p->gen++;
-    nvn_pool_forget(p); p->magic = 0;
+    nvn_pool_forget(p);
 }
 static void nvnTexturePoolSetDebugLabel(tex_pool_t *p, const char *l) { (void)p; (void)l; }
 static void nvnTexturePoolRegisterTexture(const tex_pool_t *p, int id, const tex_t *t, const void *v) { nvn_api("nvnTexturePoolRegisterTexture");
@@ -2732,16 +2744,15 @@ static uint32_t nvnSamplerPoolInitialize(samp_pool_t *p, const pool_t *pool, ptr
     uint32_t gen = p->magic == NVN_MAGIC('S', 'P', 'O', 'L') ? p->gen + 1 : 1;
     if (!gen) gen = 1;
     nvn_samp_pool_forget(p);
-    memset(p, 0, sizeof *p);
-    p->magic = NVN_MAGIC('S', 'P', 'O', 'L'); p->pool = (pool_t *)pool; p->off = off; p->n = (uint32_t)n;
+    p->pool = (pool_t *)pool; p->off = off; p->n = n;
+    p->magic = NVN_MAGIC('S', 'P', 'O', 'L');
     p->gen = gen; pool_epoch_set(p);
     return 1;
 }
 static void nvnSamplerPoolFinalize(samp_pool_t *p) {
     if (!p) return;
     nvn_samp_pool_forget(p);
-    if (p->magic == NVN_MAGIC('S', 'P', 'O', 'L')) p->gen++;
-    nvn_pool_forget(p); p->magic = 0;
+    nvn_pool_forget(p);
 }
 static void nvnSamplerPoolSetDebugLabel(samp_pool_t *p, const char *l) { (void)p; (void)l; }
 static void nvnSamplerPoolRegisterSampler(const samp_pool_t *p, int id, const samp_t *s) { nvn_api("nvnSamplerPoolRegisterSampler");

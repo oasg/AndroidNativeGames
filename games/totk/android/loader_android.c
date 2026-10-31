@@ -32,6 +32,30 @@
 
 pthread_key_t runtime_keys[8];
 static uint64_t timer_calls, svc_calls;
+void runtime_guest_commit(uintptr_t base, uintptr_t size);
+/* Adreno's submit path runs on the guest stack (NVN procs are called directly,
+ * not through the HLE gate).  Its frame can cross the top/bottom page of a
+ * 1 MiB guest stack, so commit a generous read/write window around the real
+ * SVC stack top. */
+void runtime_thread_prepare_stack(uintptr_t top) {
+    if (!top || top < (2u << 20)) return;
+    uintptr_t lo = (top - (2u << 20)) & ~(uintptr_t)0xfff;
+    size_t len = (2u << 20) + (64u << 10);
+    if (mprotect((void *)lo, len, PROT_READ | PROT_WRITE) == 0)
+        runtime_guest_commit(lo, len);
+}
+/* Per-thread alternate signal stack so a stack-overflow SIGSEGV in the
+ * Adreno/LLVM submit path still reaches crash_handler instead of dying with a
+ * bare "Segmentation fault". */
+static __thread uint8_t g_altstack[64 * 1024] __attribute__((aligned(16)));
+static void crash_altstack_install(void) {
+    stack_t ss;
+    memset(&ss, 0, sizeof ss);
+    ss.ss_sp = g_altstack;
+    ss.ss_size = sizeof g_altstack;
+    ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
+}
 
 typedef struct {
     uintptr_t host_stack_top;   /* offset 0: gate_android.S reads this */
@@ -95,6 +119,7 @@ void runtime_thread_set_guest_handle(uint32_t handle) {
 }
 
 void runtime_thread_init(void) {
+    crash_altstack_install();
     if (g_host) return;
     HostContext *hc = calloc(1, sizeof *hc);
     GuestSlots *gs = calloc(1, sizeof *gs);
@@ -1760,9 +1785,10 @@ static int probe(void) {
 int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
+    crash_altstack_install();
     struct sigaction sa = {0};
     sa.sa_sigaction = crash_handler;
-    sa.sa_flags = SA_SIGINFO;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);

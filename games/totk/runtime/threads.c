@@ -475,6 +475,7 @@ extern _Noreturn void runtime_thread_leave(const uint64_t *host_context,void *ar
 uint32_t (*dm_thread_tick_fn)(void);   // 取当前游戏拍；diag.c 初始化时登记（单测不登记，拍号记 0） | Gets the current game tick; registered when diag.c initializes (unit tests do not register it, the tick number is recorded as 0)
 void crash_thread_init(void);
 void guest_thread_init(void);   // thread.c：每线程 TSD 槽（门、x18、TLS、TLR）唯一设置点 | thread.c: the single place that sets the per-thread TSD slots (gate, x18, TLS, TLR)
+extern void runtime_thread_prepare_stack(uintptr_t top);
 __attribute__((weak)) void runtime_hle_stack_set(uintptr_t top) { (void)top; }   // standalone thread probe: no host-stack switch
 static void *thread_main(void *p) {
     thr_t *t = p;
@@ -484,6 +485,7 @@ static void *thread_main(void *p) {
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
     t->mport = pthread_mach_thread_np(pthread_self());
 
+    runtime_thread_prepare_stack(t->stack_top);
     guest_thread_init();
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); core_take(t); pthread_mutex_unlock(&G);
     { volatile char marker = 0; runtime_hle_stack_set((uintptr_t)&marker - 1024); }   // host services of this thread run below this frame
