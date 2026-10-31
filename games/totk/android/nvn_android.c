@@ -2994,6 +2994,41 @@ static const nvn_bind_state_t *nvn_cb_draw_state(const cb_t *cb) {
     return cb ? (const nvn_bind_state_t *)cb->bind_state : NULL;
 }
 
+static void nvn_trace_bad_target(const char *what, uint32_t index, const void *p) {
+    if (!getenv("TOTK_ANDROID_TRACE_TARGET")) return;
+    static unsigned logged;
+    if (logged++ >= 64) return;
+    tex_t raw;
+    memset(&raw, 0, sizeof raw);
+    int read = p && nvn_crash_read_mem((uintptr_t)p, &raw, sizeof raw);
+    fprintf(stderr, "[totk-target] bad %s[%u] p=%p read=%d magic=%#x serial=%#llx"
+                    " fmt=%#x %ux%u tgt=%d levels=%u mem=%p pool=%p off=%#llx\n",
+            what, index, p, read, read ? raw.magic : 0,
+            read ? (unsigned long long)raw.serial : 0ull,
+            read ? (unsigned)raw.d.format : 0, read ? raw.d.width : 0,
+            read ? raw.d.height : 0, read ? raw.d.target : 0,
+            read ? raw.d.levels : 0, read ? (void *)raw.mem : NULL,
+            read ? (void *)raw.pool : NULL, read ? (long long)raw.off : 0ll);
+    if (!read) return;
+    pthread_mutex_lock(&g_tex_obj_lock);
+    unsigned shown = 0;
+    for (unsigned i = 0; i < g_tex_obj_count && shown < 8; i++) {
+        const tex_t *t = g_tex_objs[i];
+        int serial_match = raw.serial && t->serial == raw.serial;
+        int field_match = t->d.width == raw.d.width && t->d.height == raw.d.height &&
+                          t->d.format == raw.d.format && t->mem == raw.mem;
+        if (!serial_match && !field_match) continue;
+        fprintf(stderr, "[totk-target] candidate reg=%p serial=%#llx match=%s%s"
+                        " fmt=%#x %ux%u mem=%p\n", (void *)t,
+                (unsigned long long)t->serial, serial_match ? "serial" : "",
+                field_match ? (serial_match ? "+fields" : "fields") : "",
+                (unsigned)t->d.format, t->d.width, t->d.height, (void *)t->mem);
+        shown++;
+    }
+    fprintf(stderr, "[totk-target] registry=%u\n", g_tex_obj_count);
+    pthread_mutex_unlock(&g_tex_obj_lock);
+}
+
 /* Resolve the NVN texture set to a host layout.  Every color target and the
  * depth target contribute their guest dimensions/format; unsupported formats
  * are explicit failures (the backend returns VK_FORMAT_UNDEFINED = 0). */
@@ -3008,16 +3043,48 @@ static int nvn_rt_layout_from_targets(uint32_t n, void *const *tex, const void *
         if (why) *why = "color target count";
         return 0;
     }
-    for (uint32_t i = 0; i < n; i++) {
+    /* NVN MRT arrays are sparse: a null slot is inactive, but the active
+     * slots after it keep their NVN colour index.  The backend layout cannot
+     * express VK_ATTACHMENT_UNUSED, so fill inactive slots with a dummy
+     * attachment using the first active format; shader SV_Target indices stay
+     * intact and unused slots are never sampled. */
+    uint32_t active_n = n;
+    while (active_n > 1 && tex && !tex[active_n - 1]) active_n--;
+    int base_fmt = 0;
+    for (uint32_t i = 0; i < active_n; i++) {
         const tex_t *t = nvn_tex_registry_find(tex ? tex[i] : NULL);
-        if (!t) { if (why) *why = "color target is not an NVN texture"; return 0; }
+        if (!t) {
+            if (!tex || !tex[i]) {
+                if (!base_fmt) {
+                    /* Find the first active slot before accepting a gap. */
+                    for (uint32_t j = i + 1; j < active_n; j++) {
+                        const tex_t *tj = nvn_tex_registry_find(tex[j]);
+                        if (tj) {
+                            int f = gfx_backend_vk_format_for_nvn((uint32_t)tj->d.format);
+                            if (f) { base_fmt = f; *width = tj->d.width; *height = tj->d.height; break; }
+                        }
+                    }
+                }
+                if (!base_fmt) {
+                    nvn_trace_bad_target("color", i, NULL);
+                    if (why) *why = "inactive color target has no active format";
+                    return 0;
+                }
+                layout->color_formats[i] = (uint32_t)base_fmt;
+                continue;
+            }
+            nvn_trace_bad_target("color", i, tex[i]);
+            if (why) *why = "color target is not an NVN texture";
+            return 0;
+        }
         int fmt = gfx_backend_vk_format_for_nvn((uint32_t)t->d.format);
         if (!fmt) {
             if (why) *why = "unsupported color target format";
             return 0;
         }
+        if (!base_fmt) base_fmt = fmt;
         layout->color_formats[i] = fmt;
-        if (i == 0) { *width = t->d.width; *height = t->d.height; }
+        if (!*width || !*height) { *width = t->d.width; *height = t->d.height; }
         else if (t->d.width != *width || t->d.height != *height) {
             static unsigned logged;
             if (logged++ < 8)
@@ -3025,10 +3092,14 @@ static int nvn_rt_layout_from_targets(uint32_t n, void *const *tex, const void *
                         i, t->d.width, t->d.height, *width, *height);
         }
     }
-    layout->color_count = n;
+    layout->color_count = active_n;
     if (depth) {
         const tex_t *dt = nvn_tex_registry_find(depth);
-        if (!dt) { if (why) *why = "depth target is not an NVN texture"; return 0; }
+        if (!dt) {
+            nvn_trace_bad_target("depth", 0, depth);
+            if (why) *why = "depth target is not an NVN texture";
+            return 0;
+        }
         int fmt = gfx_backend_vk_format_for_nvn((uint32_t)dt->d.format);
         if (!fmt) { if (why) *why = "unsupported depth target format"; return 0; }
         layout->depth_format = fmt;
@@ -4128,6 +4199,18 @@ static void nvnCommandBufferSetRenderTargets(cb_t *c, int n, const void *const *
     nvn_bind_state_t *bs = nvn_cb_bind_state(c);
     if (bs) bs->depth_tex = depth;
     if (n < 0 || n > GFX_MAX_COLOR_TARGETS || (!t && n)) { nvn_fail("nvnCommandBufferSetRenderTargets", "invalid target count"); return; }
+    int requested_n = n;
+    while (n > 1 && t && !t[n - 1]) n--;
+    if (getenv("TOTK_ANDROID_TRACE_TARGET")) {
+        fprintf(stderr, "[totk-target] SetRenderTargets cb=%p requested=%d active=%d depth=%p colors=",
+                (void *)c, requested_n, n, depth);
+        for (int i = 0; i < requested_n && i < GFX_MAX_COLOR_TARGETS; i++) {
+            uintptr_t v = 0;
+            if (!t || !nvn_crash_read_mem((uintptr_t)(t + i), &v, sizeof v)) v = 0;
+            fprintf(stderr, " %p", (void *)v);
+        }
+        fprintf(stderr, "\n");
+    }
     nvn_cmd_t *cmd = nvn_cb_cmd(c, NVN_CMD_SET_RENDER_TARGETS);
     if (cmd) {
         cmd->u.targets.count = (uint32_t)n;
@@ -9830,6 +9913,47 @@ static int nvn_seg_probe_tex(tex_t *t, uint32_t w, uint32_t h) {
     if (!t->mem) return 0;
     nvn_tex_registry_add(t);
     return 1;
+}
+
+/* probe-nvn-sparse-targets: an NVN MRT array may leave inactive slots null
+ * while later slots stay active.  The resolver must preserve the active slot
+ * indices and substitute dummy attachments for the gaps. */
+static int nvn_seg_probe_tex(tex_t *t, uint32_t w, uint32_t h);
+int runtime_nvn_sparse_target_selftest(void) {
+    nvn_dev_t d;
+    dev_builder_t db;
+    memset(&d, 0, sizeof d);
+    memset(&db, 0, sizeof db);
+    if (!nvnDeviceInitialize(&d, &db)) return 0;
+    tex_t A, B, D;
+    if (!nvn_seg_probe_tex(&A, 64, 64) || !nvn_seg_probe_tex(&B, 64, 64) ||
+        !nvn_seg_probe_tex(&D, 64, 64)) return 0;
+    void *tg[4] = { &A, &B, NULL, &D };
+    GfxRenderTargetLayout layout;
+    uint32_t w = 0, h = 0;
+    const char *why = NULL;
+    int ok = nvn_rt_layout_from_targets(4, tg, NULL, &layout, &w, &h, &why);
+    ok = ok && layout.color_count == 4 && w == 64 && h == 64 &&
+         layout.color_formats[0] && layout.color_formats[1] &&
+         layout.color_formats[2] == layout.color_formats[0] &&
+         layout.color_formats[3];
+    void *tail[4] = { &A, &B, NULL, NULL };
+    GfxRenderTargetLayout tl;
+    uint32_t tw = 0, th = 0;
+    const char *twhy = NULL;
+    ok = ok && nvn_rt_layout_from_targets(4, tail, NULL, &tl, &tw, &th, &twhy) &&
+         tl.color_count == 2;
+    GfxOffscreenTarget *rt = ok ? nvn_host_rt_get_owner(64, 64, &layout, &A) : NULL;
+    if (!rt) ok = 0;
+    fprintf(stderr, "[totk-nvn] sparse MRT colors=%u dummy=%#x/%#x tail=%u rt=%p ok=%d%s%s\n",
+            layout.color_count, layout.color_formats[0], layout.color_formats[2],
+            tl.color_count, (void *)rt, ok, why ? " why=" : "", why ? why : "");
+    nvnTextureFinalize(&A);
+    nvnTextureFinalize(&B);
+    nvnTextureFinalize(&D);
+    free(A.mem); free(B.mem); free(D.mem);
+    fprintf(stderr, "[totk-nvn] sparse target selftest %s\n", ok ? "PASS" : "FAIL");
+    return ok;
 }
 
 int runtime_nvn_segment_selftest(const char *screenshot, int frames) {
