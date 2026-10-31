@@ -1542,11 +1542,15 @@ static int reflect_spirv_file(const char *path, uint32_t target_set,
             }
             break;
         case 71: /* OpDecorate */
-            if (wc >= 4 && o[0] < bound) {
-                if (o[1] == 33) dbind[o[0]] = o[2];       /* Binding */
-                else if (o[1] == 34) dset[o[0]] = o[2];   /* DescriptorSet */
-                else if (o[1] == 2) dblock[o[0]] = 2;     /* Block */
-                else if (o[1] == 3) dblock[o[0]] = 3;     /* BufferBlock */
+            /* Block (2) and BufferBlock (3) carry no value word, so their
+             * instruction is only 3 words wide.  Requiring wc >= 4 for every
+             * decoration left dblock[] clear and classified every legacy
+             * BufferBlock SSBO as a UBO. */
+            if (wc >= 3 && o[0] < bound) {
+                if (wc >= 4 && o[1] == 33) dbind[o[0]] = o[2];       /* Binding */
+                else if (wc >= 4 && o[1] == 34) dset[o[0]] = o[2];   /* DescriptorSet */
+                else if (o[1] == 2) dblock[o[0]] = 2;                /* Block */
+                else if (o[1] == 3) dblock[o[0]] = 3;                /* BufferBlock */
             }
             break;
         default:
