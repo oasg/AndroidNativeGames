@@ -76,16 +76,26 @@ TOTK_LANE=lane1 games/totk/android/devrun.sh --no-build probe-vulkan-copy
 - serializes every adb call through `/tmp/totk-device.lock.d`
   (`TOTK_DEVICE_LOCK`, `TOTK_LOCK_TIMEOUT`).
 
-Shared device assets (`romfs-min`, `shader-cache`, saves) stay under
-`/data/local/tmp/totk-android` and are referenced with environment variables.
+Shared device assets stay under `/data/local/tmp/totk-android` and are
+referenced with environment variables:
+
+- RomFS: `TOTK_ANDROID_ROMFS=/data/local/tmp/totk-android/romfs-min/totk-romfs-min`
+- full shader cache:
+  `TOTK_ANDROID_SHADER_CACHE=/data/local/tmp/totk-android/lanes/shader/shader-cache`
+- save/profile: default `/data/local/tmp/totk-android/user-data` (the
+  `f9cd...` account save is already there)
+
 Wave 1 device tests are parallel only in code; adb runs queue on the lock.
+Because there is one device, the 30-minute soak belongs to Wave 4: Lane 3 runs
+only short smoke tests (a few minutes / a few thousand presents) during
+Wave 1 and records the exact command for the final soak.
 
 ## 5. File ownership
 
 | lane | may edit |
 | --- | --- |
 | 0 | `.gitignore`, `build.sh`, `devrun.sh`, `probe_hooks_android.[ch]`, `gfx_backend_android.h` (contract only), `docs/` |
-| 1 | `gfx_vulkan_android.c` (implements the frozen header) |
+| 1 | `gfx_vulkan_android.c`, new `gfx_compute_spv.h`, new `shaders/*` repo-owned test shaders |
 | 2 | `nvn_android.c` |
 | 3 | `runtime/threads.c`, `loader_android.c` |
 | 4 | no production code; outputs only under `/tmp` and `/data/local/tmp` |
