@@ -827,6 +827,64 @@ static int vk_format_block(VkFormat f, uint32_t *bw, uint32_t *bh, uint32_t *byt
     return 1;
 }
 
+/* Recent render-target dimensions, recorded when an offscreen layout is
+ * requested.  The frozen reflected-pipeline API carries only the format, so
+ * this lets a rejected attachment report the size the caller asked for. */
+typedef struct {
+    int format;
+    uint32_t width, height;
+} VkRtDimHint;
+static VkRtDimHint g_rt_dim_hints[8];
+static unsigned g_rt_dim_hint_next;
+
+static void vk_rt_dim_hint_record(int format, uint32_t width, uint32_t height) {
+    VkRtDimHint *h = &g_rt_dim_hints[g_rt_dim_hint_next++ % 8];
+    h->format = format;
+    h->width = width;
+    h->height = height;
+}
+
+static int vk_rt_dim_hint_lookup(int format, uint32_t *width, uint32_t *height) {
+    for (unsigned i = 0; i < 8; i++) {
+        const VkRtDimHint *h = &g_rt_dim_hints[i];
+        if (h->format != format || !h->width || !h->height) continue;
+        if (width) *width = h->width;
+        if (height) *height = h->height;
+        return 1;
+    }
+    return 0;
+}
+
+/* Rate-limit non-color attachment diagnostics: a single bad layout used to
+ * print thousands of lines and make adb stderr back-pressure stall the guest
+ * core.  At most eight lines are emitted for the pipeline check and eight for
+ * the offscreen-create check. */
+static unsigned g_bad_color_pipeline_logs;
+static unsigned g_bad_color_offscreen_logs;
+
+static void vk_log_bad_color_attachment(const char *what, uint32_t attachment,
+                                        VkFormat fmt, const GfxRenderTargetLayout *layout,
+                                        uint32_t width, uint32_t height,
+                                        unsigned *counter) {
+    unsigned n = (*counter)++;
+    if (n >= 8) return;
+    uint32_t bw = 0, bh = 0, bytes = 0;
+    vk_format_block(fmt, &bw, &bh, &bytes);
+    const char *tail = n == 7 ? " (8/8, further errors suppressed)" : "";
+    if (width && height)
+        vk_log("ERROR %s: attachment %u format %s(%d) block=%ux%u bpp=%u "
+               "texture=%ux%u colors=%u depth=%d is not color%s",
+               what, attachment, vk_format_name(fmt), (int)fmt, bw, bh, bytes,
+               width, height, layout ? layout->color_count : 0,
+               layout ? layout->depth_format : 0, tail);
+    else
+        vk_log("ERROR %s: attachment %u format %s(%d) block=%ux%u bpp=%u "
+               "texture=?x? colors=%u depth=%d is not color%s",
+               what, attachment, vk_format_name(fmt), (int)fmt, bw, bh, bytes,
+               layout ? layout->color_count : 0,
+               layout ? layout->depth_format : 0, tail);
+}
+
 static VkImageAspectFlags vk_format_copy_aspect(VkFormat f) {
     switch (f) {
     case VK_FORMAT_D24_UNORM_S8_UINT:
@@ -1119,6 +1177,9 @@ static GfxOffscreenTarget *vk_offscreen_create_layout_locked(uint32_t width, uin
         vk_log("ERROR offscreen size %ux%u", width, height);
         return NULL;
     }
+    if (layout->color_count)
+        for (uint32_t i = 0; i < layout->color_count; i++)
+            vk_rt_dim_hint_record(layout->color_formats[i], width, height);
     for (uint32_t i = 0; i < layout->color_count; i++) {
         VkFormat fmt = (VkFormat)layout->color_formats[i];
         VkFormatInfo info = vk_format_info(fmt);
@@ -1127,7 +1188,8 @@ static GfxOffscreenTarget *vk_offscreen_create_layout_locked(uint32_t width, uin
             return NULL;
         }
         if (!vk_format_is_color_target(fmt) || info.bpp < 1 || info.bpp > 16) {
-            vk_log("ERROR offscreen attachment %u: %s is not a color format", i, info.name);
+            vk_log_bad_color_attachment("offscreen", i, fmt, layout, width, height,
+                                        &g_bad_color_offscreen_logs);
             return NULL;
         }
         VkFormatProperties fp;
@@ -3844,8 +3906,10 @@ static GfxReflectedPipeline *reflect_pipeline_create_impl(
         VkFormat cf = (VkFormat)layout->color_formats[i];
         if (cf == VK_FORMAT_UNDEFINED || !vk_format_is_color_target(cf) ||
             !vk_format_info(cf).bpp) {
-            vk_log("ERROR reflected pipeline: attachment %u format %d is not color",
-                   i, (int)cf);
+            uint32_t hint_w = 0, hint_h = 0;
+            vk_rt_dim_hint_lookup(layout->color_formats[i], &hint_w, &hint_h);
+            vk_log_bad_color_attachment("reflected pipeline", i, cf, layout,
+                                        hint_w, hint_h, &g_bad_color_pipeline_logs);
             pthread_mutex_unlock(&g_lock);
             return NULL;
         }
@@ -5806,6 +5870,28 @@ static int vk_texture_region_check_blocks(const GfxTexture *t, int32_t x, int32_
     return 1;
 }
 
+/* Packed row geometry for a region.  Compressed formats use one row per block
+ * row and `bpp` is bytes per block, so a BC4 block view (one block per texel)
+ * can be uploaded/downloaded through the same code as an uncompressed image. */
+static int vk_texture_packed_geometry(VkFormat fmt, uint32_t w, uint32_t h,
+                                      size_t *row_bytes, uint32_t *rows,
+                                      uint32_t *bpp, uint32_t *bw, uint32_t *bh) {
+    uint32_t block_w = 0, block_h = 0, bytes = 0;
+    if (!vk_format_block(fmt, &block_w, &block_h, &bytes)) return 0;
+    if (block_w != 1 || block_h != 1) {
+        if ((w % block_w) || (h % block_h)) return 0;
+        *row_bytes = (size_t)(w / block_w) * bytes;
+        *rows = h / block_h;
+    } else {
+        *row_bytes = (size_t)w * bytes;
+        *rows = h;
+    }
+    if (bpp) *bpp = bytes;
+    if (bw) *bw = block_w;
+    if (bh) *bh = block_h;
+    return 1;
+}
+
 static int vk_format_can_blit(VkFormat f, int dst) {
     VkFormatProperties fp;
     vkGetPhysicalDeviceFormatProperties(g.phys, f, &fp);
@@ -6197,14 +6283,10 @@ int gfx_backend_texture_upload(GfxTexture *dst, uint32_t level, uint32_t layer,
     VkDeviceMemory stage_mem = VK_NULL_HANDLE;
     uint32_t ew = 0, eh = 0, ed = 0;
     if (!vk_texture_transfer_check(dst, level, layer, "texture upload", 1)) goto out;
-    if (vk_format_is_compressed(dst->format)) {
-        vk_log("ERROR texture upload: compressed %s region upload is unsupported",
-               vk_format_name(dst->format));
-        goto out;
-    }
-    uint32_t bpp = vk_format_info(dst->format).bpp;
-    if (!bpp) {
-        vk_log("ERROR texture upload: %s has no texel size", vk_format_name(dst->format));
+    int compressed = vk_format_is_compressed(dst->format);
+    if (compressed && (x < 0 || y < 0)) {
+        vk_log("ERROR texture upload: compressed %s region cannot start at a "
+               "negative offset (x=%d y=%d)", vk_format_name(dst->format), x, y);
         goto out;
     }
     vk_texture_level_extent(dst, level, &ew, &eh, &ed);
@@ -6216,17 +6298,26 @@ int gfx_backend_texture_upload(GfxTexture *dst, uint32_t level, uint32_t layer,
         vk_log("ERROR texture upload: region is outside %ux%ux%u", ew, eh, ed);
         goto out;
     }
+    if (!vk_texture_region_check_blocks(dst, x, y, 0, w, h, "texture upload"))
+        goto out;
     uint32_t req_w = width ? width : w + cut_x;
     uint32_t req_h = height ? height : h + cut_y;
-    size_t src_row = (size_t)req_w * bpp;
-    size_t need = src_row * req_h * d;
+    size_t row = 0, src_row = 0;
+    uint32_t rows = 0, src_rows = 0, bpp = 0, bw = 1, bh = 1;
+    if (!vk_texture_packed_geometry(dst->format, w, h, &row, &rows, &bpp, &bw, &bh) ||
+        !vk_texture_packed_geometry(dst->format, req_w, req_h, &src_row, &src_rows,
+                                    NULL, NULL, NULL)) {
+        vk_log("ERROR texture upload: %s region %ux%u is not block-aligned",
+               vk_format_name(dst->format), req_w, req_h);
+        goto out;
+    }
+    size_t need = src_row * src_rows * d;
     if (size < need) {
         vk_log("ERROR texture upload: data size=%zu < %zu (req %ux%u depth=%u)",
                size, need, req_w, req_h, d);
         goto out;
     }
-    size_t row = (size_t)w * bpp;
-    size_t total = row * h * d;
+    size_t total = row * rows * d;
     if (!vk_create_host_buffer(total, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                &staging, &stage_mem))
         goto out;
@@ -6235,10 +6326,11 @@ int gfx_backend_texture_upload(GfxTexture *dst, uint32_t level, uint32_t layer,
                "vkMapMemory(texture upload)"))
         goto out;
     for (uint32_t zz = 0; zz < d; zz++)
-        for (uint32_t yy = 0; yy < h; yy++)
-            memcpy((uint8_t *)mapped + ((size_t)zz * h + yy) * row,
-                   (const uint8_t *)data + (size_t)zz * src_row * req_h +
-                       (size_t)(yy + cut_y) * src_row + (size_t)cut_x * bpp,
+        for (uint32_t yy = 0; yy < rows; yy++)
+            memcpy((uint8_t *)mapped + ((size_t)zz * rows + yy) * row,
+                   (const uint8_t *)data + (size_t)zz * src_row * src_rows +
+                       (size_t)(yy + cut_y / bh) * src_row +
+                       (size_t)(cut_x / bw) * bpp,
                    row);
     vkUnmapMemory(g.dev, stage_mem);
 
@@ -6321,14 +6413,10 @@ int gfx_backend_texture_download(const GfxTexture *src, uint32_t level, uint32_t
                vk_format_name(src->format));
         goto out;
     }
-    if (vk_format_is_compressed(src->format)) {
-        vk_log("ERROR texture download: compressed %s region download is unsupported",
-               vk_format_name(src->format));
-        goto out;
-    }
-    uint32_t bpp = vk_format_info(src->format).bpp;
-    if (!bpp) {
-        vk_log("ERROR texture download: %s has no texel size", vk_format_name(src->format));
+    int compressed = vk_format_is_compressed(src->format);
+    if (compressed && (x < 0 || y < 0)) {
+        vk_log("ERROR texture download: compressed %s region cannot start at a "
+               "negative offset (x=%d y=%d)", vk_format_name(src->format), x, y);
         goto out;
     }
     vk_texture_level_extent(src, level, &ew, &eh, &ed);
@@ -6340,17 +6428,26 @@ int gfx_backend_texture_download(const GfxTexture *src, uint32_t level, uint32_t
         vk_log("ERROR texture download: region is outside %ux%ux%u", ew, eh, ed);
         goto out;
     }
+    if (!vk_texture_region_check_blocks(src, x, y, 0, w, h, "texture download"))
+        goto out;
     uint32_t req_w = width ? width : w + cut_x;
     uint32_t req_h = height ? height : h + cut_y;
-    size_t dst_row = (size_t)req_w * bpp;
-    size_t need = dst_row * req_h * d;
+    size_t row = 0, dst_row = 0;
+    uint32_t rows = 0, dst_rows = 0, bpp = 0, bw = 1, bh = 1;
+    if (!vk_texture_packed_geometry(src->format, w, h, &row, &rows, &bpp, &bw, &bh) ||
+        !vk_texture_packed_geometry(src->format, req_w, req_h, &dst_row, &dst_rows,
+                                    NULL, NULL, NULL)) {
+        vk_log("ERROR texture download: %s region %ux%u is not block-aligned",
+               vk_format_name(src->format), req_w, req_h);
+        goto out;
+    }
+    size_t need = dst_row * dst_rows * d;
     if (size < need) {
         vk_log("ERROR texture download: dst size=%zu < %zu (req %ux%u depth=%u)",
                size, need, req_w, req_h, d);
         goto out;
     }
-    size_t row = (size_t)w * bpp;
-    size_t total = row * h * d;
+    size_t total = row * rows * d;
     if (!vk_create_host_buffer(total, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                &staging, &stage_mem))
         goto out;
@@ -6412,10 +6509,11 @@ int gfx_backend_texture_download(const GfxTexture *src, uint32_t level, uint32_t
                "vkMapMemory(texture download)"))
         goto out;
     for (uint32_t zz = 0; zz < d; zz++)
-        for (uint32_t yy = 0; yy < h; yy++)
-            memcpy((uint8_t *)dst + (size_t)zz * dst_row * req_h +
-                       (size_t)(yy + cut_y) * dst_row + (size_t)cut_x * bpp,
-                   (const uint8_t *)mapped + ((size_t)zz * h + yy) * row,
+        for (uint32_t yy = 0; yy < rows; yy++)
+            memcpy((uint8_t *)dst + (size_t)zz * dst_row * dst_rows +
+                       (size_t)(yy + cut_y / bh) * dst_row +
+                       (size_t)(cut_x / bw) * bpp,
+                   (const uint8_t *)mapped + ((size_t)zz * rows + yy) * row,
                    row);
     vkUnmapMemory(g.dev, stage_mem);
     ok = 1;
@@ -7330,6 +7428,49 @@ int gfx_backend_copy_probe(const char *work_dir) {
             }
         }
         if (ok) vk_log("copy probe: copied and cleared regions match every byte");
+    }
+
+    /* Block-compressed region upload/download.  TOTK renders BC4 textures
+     * through an uncompressed block view, so the block path must round-trip. */
+    if (ok) {
+        const uint32_t BC4_W = 64, BC4_H = 64;
+        size_t bc4_size = (size_t)(BC4_W / 4) * (BC4_H / 4) * 8;
+        uint8_t *zero = calloc(1, bc4_size);
+        GfxTextureDesc bd = {
+            .target = GFX_TEXTURE_2D,
+            .vk_format = VK_FORMAT_BC4_UNORM_BLOCK,
+            .width = BC4_W, .height = BC4_H, .depth = 1,
+            .mip_levels = 1, .array_layers = 1, .samples = 1,
+        };
+        GfxTextureSubresource bs = { 0, 0, zero, bc4_size };
+        GfxTexture *bt = zero ? gfx_backend_texture_create_desc(&bd, &bs, 1) : NULL;
+        uint8_t blocks[32];
+        for (unsigned i = 0; i < sizeof blocks; i++)
+            blocks[i] = (uint8_t)(0x40 + i * 3);
+        if (!bt || !gfx_backend_texture_upload(bt, 0, 0, 8, 8, 8, 8,
+                                               blocks, sizeof blocks)) {
+            vk_log("copy probe FAIL: BC4 block upload failed");
+            ok = 0;
+        } else {
+            uint8_t *got = malloc(bc4_size);
+            if (!got || !gfx_backend_texture_download(bt, 0, 0, 0, 0, BC4_W, BC4_H,
+                                                      got, bc4_size)) {
+                vk_log("copy probe FAIL: BC4 block download failed");
+                ok = 0;
+            } else {
+                size_t row = (BC4_W / 4) * 8;
+                for (uint32_t r = 0; r < 2 && ok; r++) {
+                    if (memcmp(got + (2 + r) * row + 2 * 8, blocks + r * 16, 16)) {
+                        vk_log("copy probe FAIL: BC4 block row %u mismatch", r);
+                        ok = 0;
+                    }
+                }
+                if (ok) vk_log("copy probe: BC4 2x2 block upload/download exact match");
+            }
+            free(got);
+        }
+        if (bt) gfx_backend_texture_destroy(bt);
+        free(zero);
     }
 
     /* Format-mismatch blit, only when the device advertises both sides. */
