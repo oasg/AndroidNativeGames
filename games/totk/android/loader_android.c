@@ -521,14 +521,14 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
                 for (unsigned k = 8; k < 24; k++) fprintf(stderr, " %016llx", (unsigned long long)w[k]);
                 fputc('\n', stderr);
                 for (unsigned li = 0; li < 2; li++) {
-                    unsigned base = 8 + li * 3;   /* w[8+li*3] = +0x48/+0x60 sentinel */
+                    unsigned base = 9 + li * 3;   /* w[9+li*3] = +0x48/+0x60 sentinel */
                     uint64_t sent = rr[0] + 0x48 + li * 0x18;
                     uint64_t head = w[base + 1], cnt = w[base + 2] & 0xffffffffu;
                     fprintf(stderr, "[crash] list%u sent=%#llx head=%#llx count=%llu chain:",
                             li, (unsigned long long)sent, (unsigned long long)head,
                             (unsigned long long)cnt);
                     uint64_t n = head;
-                    for (unsigned k = 0; k < 12 && n; k++) {
+                    for (unsigned k = 0; k < 40 && n; k++) {
                         uint64_t nxt = 0;
                         crash_read(n + 8, &nxt, 8);
                         fprintf(stderr, " %#llx->%#llx", (unsigned long long)n,

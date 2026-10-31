@@ -807,18 +807,18 @@ window frame with **762 unique colours** (dark blue `0d141e` background and an
 orange/red loading strip), instead of an all-zero PPM.  A later run reached
 draw #2100 and the same composite path.
 
-The remaining blocker is a guest crash at `main+0x79a9a4` (a list walk with a
-null link) after `nvnTexturePoolRegisterTexture`; it occurs at varying draws
-(32–300) and prevents a reliable capture of the actual title/save-slot screen.
 The x600 frame is still an early loading screen, not the save-slot UI, and
-A/Continue has therefore not been verified from a visible title screen.
+A/Continue has therefore not been verified from a visible title screen.  The
+guest list walk at `main+0x79a9a4` is now understood and no longer reproduces
+when the virtual-core scheduler is enabled; the current UI blocker is the
+unimplemented compute dispatch (section 9.2).
 
-## 9. Guest texture-pool list crash
+## 9. Guest list walk at `main+0x79a9a4`
 
 The `main+0x79a9a4` SIGSEGV is a guest intrusive-list walk over a 0xd8-byte
-texture-pool record.  The crash dump shows the second list with count 1 but a
-node whose `next` is zero, i.e. a pool node that was never linked/initialised.
-Two host causes were found and fixed:
+per-core record.  The crash dump initially showed a second list with count 1
+and a node whose `next` was zero, which looked like a pool node that was never
+linked.  Two earlier host causes were found and fixed:
 
 - **Retired segments outlived their program/vertex data.**  The scene queue
   can replay a UI recording several frames after retirement; by then the guest
@@ -843,35 +843,80 @@ now commits a 2 MiB window below and 64 KiB above every SVC stack top, and the
 crash handler runs on a per-thread 64 KiB alternate stack.  One run then
 reached present #387 / draw #300 instead of dying at #32.
 
-The guest list walk itself was also affected by the NVN pool ABI: the Android
+The guest list walk was also affected by the NVN pool ABI: the Android
 `tex_pool_t` had `{magic,n,gen,epoch,pool,off}`, while the guest/macOS layout
 is `{pool,off,n}`.  `nvnTexturePoolFinalize` also wrote gen/magic into the
 guest object.  The host now uses the guest layout for the first 0x18 bytes,
 keeps magic/gen in the tail, and finalize leaves the guest object untouched
-(macOS does the same).  The crash moved from draw #32 to #1200/#300, but the
-same list-bucket walk still appears when an engine texture-pool node is torn
-down, so this is not yet a complete fix.
+(macOS does the same).  This moved the crash later but did not remove it.
 
 The per-thread TLS/TLR was also carved out of the guest stack; a later guest
 unmap of that stack made `sdk+0x126efc`/`sdk+0x131818` fault on TLR+0x100.
 It now lives in a dedicated 16 KiB host `mmap` per thread (TPIDR_EL0/TPIDRRO
-values still point at it), and the TLS crash no longer appears.  A run then
-reached draw #600 and hit the remaining list walk at `main+0x79a9a4`.
+values still point at it), and the TLS crash no longer appears.
 
-Crash register/chain instrumentation shows the list at object+0x48 has 7
-nodes and a traversal enters a node whose `next` is zero.  The engine object is
-`0x33e62a1c0`; both list sentinels are `x0+0x48` and `x0+0x60`, counts are at
-+0x58/+0x70.  This is an engine texture-pool bucket, not an NVN pool
-registration argument.
+### 9.1 Root cause: `TOTK_FREE_CORES` invalidated per-core identity
+
+The crash object `0x33e62a1c0` is a 0xd8-byte per-core record.  Its two
+sentinels are `x0+0x48` and `x0+0x60`, with counts at `+0x58`/`+0x70`.
+With the extended crash dump, one run showed:
+
+- list0 (`+0x48`) had 6 nodes and a valid circular chain;
+- list1 (`+0x60`) had count 1, but its head was also the tail of list0;
+- reading the same node twice during the dump returned different `next`
+  values, i.e. another guest thread was relinking it while the destructor
+  walked it.
+
+The engine keys per-core allocators/job queues by
+`GetCurrentProcessorNumber` and assumes Horizon's one-thread-per-core rule.
+`TOTK_FREE_CORES=1` disables the virtual-core scheduler, leaves `cur_core` at
+`-1`, and `runtime_current_core()` falls back to `t->core`; threads created
+with core `-1` therefore report an invalid core, and multiple guest threads
+can mutate the same per-core records concurrently.  This is a host scheduler
+bug, not an NVN pool registration argument.
+
+Evidence with the same save, ROMFS, shader cache and flags:
+
+- `TOTK_FREE_CORES=1`: crashes at draw #169, #600 and #1326 in successive
+  runs (`main+0x79a9a4`, `x0=0x33e62a1c0`).
+- virtual cores enabled (no `TOTK_FREE_CORES`): three runs reached 1,095,
+  1,325 and 3,700+ presents with no list crash.  Those runs still present a
+  black frame because the UI compute pass is missing.
+
+Therefore the Android run recipe must **not** set `TOTK_FREE_CORES=1` for
+TOTK.  The flag remains useful only as a scheduler diagnostic.
+
+### 9.2 Current UI blocker: compute dispatch is a no-op
+
+`nvnCommandBufferDispatchCompute` is still implemented by
+`nvn_trace_dispatch_compute()`, which only counts/logs the call.  The UI
+compositor writes the `0x3f` target through compute shaders.  As a result the
+composite source stays zero:
+
+```
+[totk-frame] composite-window tex ... fmt=0x3f 1920x1080 ... first_nz=none gfx=0x0
+```
+
+The window's six-vertex quad samples that zero texture, so every present is
+`colors=1` (black).  Graphics draws to the `0x3f` target are not recorded in
+this loading state (`draws=0`), so a graphics-only workaround is not enough.
+The next host feature is a Vulkan compute path: compute pipeline creation from
+the cached SPIR-V, storage-image/SSBO descriptors, and dispatch.  The existing
+SPH magic `0x12345679` acceptance and UI compute keys are already in place.
+
+The crash dump now follows both intrusive lists for 40 nodes and uses the
+correct `+0x48`/`+0x60` field indices.  With virtual cores it has not fired
+again, so the list walk itself is no longer the blocker.
 
 ## 10. Next
 
-1. Make scene replay asynchronous (a dedicated host render thread/fence) so
-   the guest threads are not blocked by Vulkan submit timing; this is the
-   remaining host Adreno race.
-2. Re-run after a stable boot past the first `0x3f` submit, capture the
-   title/save-slot frame and verify A/Continue → 3D.
-2. Only the first 360x69 target has a 66x5 loading strip; later UI layers and
+1. Implement Vulkan compute dispatch for the UI compositor
+   (`nvnCommandBufferDispatchCompute`): compute pipeline creation from the
+   cached SPIR-V, storage-image/SSBO descriptors, and dispatch.  Until this
+   runs, the `0x3f` target is always zero and the window composite is black.
+2. Re-run with virtual cores, capture the title/save-slot frame and verify
+   A/Continue → 3D.
+3. Only the first 360x69 target has a 66x5 loading strip; later UI layers and
    the 180x34 mask stay black.  If the loading barrier completes, re-check the
    UI vertex/UI2F and glyph/style inputs before expecting title text.
 3. A real 3D draw list to `0x3f` is still not recorded in this state; it should
