@@ -813,13 +813,41 @@ null link) after `nvnTexturePoolRegisterTexture`; it occurs at varying draws
 The x600 frame is still an early loading screen, not the save-slot UI, and
 A/Continue has therefore not been verified from a visible title screen.
 
-## 9. Next
+## 9. Guest texture-pool list crash
 
-1. Fix the `nvnTexturePoolRegisterTexture` / `main+0x79a9a4` guest list crash
-   (texture-pool registration lifetime or a guest-visible pool field being
-   overwritten), so title/save-slot UI can be captured after the loading strip.
-2. Once the save-slot screen is visible, send A/Continue and verify the
-   transition into gameplay and the first 3D draw list to `0x3f`.
+The `main+0x79a9a4` SIGSEGV is a guest intrusive-list walk over a 0xd8-byte
+texture-pool record.  The crash dump shows the second list with count 1 but a
+node whose `next` is zero, i.e. a pool node that was never linked/initialised.
+Two host causes were found and fixed:
+
+- **Retired segments outlived their program/vertex data.**  The scene queue
+  can replay a UI recording several frames after retirement; by then the guest
+  may have finalized/reused the `NVNprogram` and its per-frame vertex/UBO ring.
+  Retired segments now snapshot the warmed `GfxReflectedPipeline`, keep the
+  `prog_shader_state_t` alive with a reference count, and pad non-converted
+  vertex streams to the recorded draw range.  `execute end drew=1` now appears
+  for the 1920x1080 `0x3f` fade instead of an Adreno segfault.
+- **3D texture creation failed.**  The loader emitted one `GfxTextureSubresource`
+  per depth slice for 3D textures (64x64x64 R8/BC4).  The backend expects one
+  subresource per mip with all depth slices contiguous, so it rejected
+  `size=4096 < 262144`, leaving the engine's texture-pool nodes uninitialised.
+  The upload now packs slices per level; the repeated "texture create target=2"
+  errors are gone.
+
+The remaining failure at the first `0x3f` submit is **not** the guest list
+walk: it is a nondeterministic Adreno segfault reported by the shell without a
+crash-handler frame.  Adding a 5 ms submit delay moved one run to draw #3300,
+while other runs still die at #32, so it is a host/driver timing issue rather
+than a bad guest pointer.  The guest TLS crash (`sdk+0x131818`) also still
+appears on some new threads.
+
+## 10. Next
+
+1. Make scene replay asynchronous (a dedicated host render thread/fence) so
+   the guest threads are not blocked by Vulkan submit timing; this is the
+   remaining host Adreno race.
+2. Re-run after a stable boot past the first `0x3f` submit, capture the
+   title/save-slot frame and verify A/Continue → 3D.
 2. Only the first 360x69 target has a 66x5 loading strip; later UI layers and
    the 180x34 mask stay black.  If the loading barrier completes, re-check the
    UI vertex/UI2F and glyph/style inputs before expecting title text.
