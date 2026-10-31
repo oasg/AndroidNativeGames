@@ -140,10 +140,16 @@ void runtime_thread_init(void) {
     need(mprotect((void *)area_base, area, PROT_READ | PROT_WRITE) == 0,
          "guest stack mapping");
     runtime_guest_commit(area_base, area);
-    hc->guest_tls = (uint8_t *)area_base;
+    /* TLS/TLR lives in a dedicated host mapping, not in the guest stack: the
+     * guest can unmap a thread stack while the SDk still reads the TLS slot,
+     * which produced sdk+0x126efc. */
+    uint8_t *tls = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    need(tls != MAP_FAILED, "thread TLS mapping");
+    hc->guest_tls = tls;
     hc->guest_tlr = hc->guest_tls + 0x2000;
     hc->dummy = hc->guest_tls + 0x3000;
-    uint64_t tb = area_base, ts = area;
+    uint64_t tb = (uintptr_t)tls, ts = 0x4000;
     hc->guest_stack_top = area_base + area - 16;
     memcpy(hc->dummy + 0x50, &tb, 8);           /* ThreadType::stack_base */
     memcpy(hc->dummy + 0x58, &ts, 8);           /* ThreadType::stack_size */
@@ -482,10 +488,14 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
     char pcd[128], lrd[128];
     describe_address(pc, pcd, sizeof pcd);
     describe_address(lr, lrd, sizeof lrd);
-    fprintf(stderr, "[crash] sig=%d pc=%s lr=%s fault=%p sp=%#llx x0=%#llx x1=%#llx x8=%#llx\n",
+    fprintf(stderr, "[crash] sig=%d pc=%s lr=%s fault=%p sp=%#llx x0=%#llx x1=%#llx x8=%#llx"
+                    " x9=%#llx x10=%#llx x11=%#llx x12=%#llx x19=%#llx x20=%#llx\n",
             sig, pcd, lrd, si ? si->si_addr : NULL, (unsigned long long)sp,
             (unsigned long long)u->uc_mcontext.regs[0], (unsigned long long)u->uc_mcontext.regs[1],
-            (unsigned long long)u->uc_mcontext.regs[8]);
+            (unsigned long long)u->uc_mcontext.regs[8], (unsigned long long)u->uc_mcontext.regs[9],
+            (unsigned long long)u->uc_mcontext.regs[10], (unsigned long long)u->uc_mcontext.regs[11],
+            (unsigned long long)u->uc_mcontext.regs[12], (unsigned long long)u->uc_mcontext.regs[19],
+            (unsigned long long)u->uc_mcontext.regs[20]);
 
     if (getenv("TOTK_ANDROID_CRASH_DUMP")) {
         const unsigned long long *rr = (const unsigned long long *)u->uc_mcontext.regs;
@@ -510,6 +520,24 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
                 fprintf(stderr, "\n[crash] x0         +0x40:");
                 for (unsigned k = 8; k < 24; k++) fprintf(stderr, " %016llx", (unsigned long long)w[k]);
                 fputc('\n', stderr);
+                for (unsigned li = 0; li < 2; li++) {
+                    unsigned base = 8 + li * 3;   /* w[8+li*3] = +0x48/+0x60 sentinel */
+                    uint64_t sent = rr[0] + 0x48 + li * 0x18;
+                    uint64_t head = w[base + 1], cnt = w[base + 2] & 0xffffffffu;
+                    fprintf(stderr, "[crash] list%u sent=%#llx head=%#llx count=%llu chain:",
+                            li, (unsigned long long)sent, (unsigned long long)head,
+                            (unsigned long long)cnt);
+                    uint64_t n = head;
+                    for (unsigned k = 0; k < 12 && n; k++) {
+                        uint64_t nxt = 0;
+                        crash_read(n + 8, &nxt, 8);
+                        fprintf(stderr, " %#llx->%#llx", (unsigned long long)n,
+                                (unsigned long long)nxt);
+                        if (nxt == 0 || nxt == sent) break;
+                        n = nxt;
+                    }
+                    fputc('\n', stderr);
+                }
                 uint64_t node = w[13];   /* x0+0x68: second list head */
                 if (node >= 0x1000) {
                     uint64_t nw[8] = {0};
