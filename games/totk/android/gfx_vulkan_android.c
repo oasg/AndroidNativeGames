@@ -2217,7 +2217,7 @@ static VkResult vk_create_graphics_pipelines_bigstack(
     pthread_attr_t attr;
     pthread_t th;
     int attr_ok = pthread_attr_init(&attr) == 0;
-    if (attr_ok && pthread_attr_setstacksize(&attr, 32u << 20) == 0 &&
+    if (attr_ok && pthread_attr_setstacksize(&attr, 128u << 20) == 0 &&
         pthread_create(&th, &attr, vk_pipe_compile_thread, &job) == 0) {
         pthread_attr_destroy(&attr);
         pthread_join(th, NULL);

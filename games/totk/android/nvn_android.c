@@ -1156,6 +1156,18 @@ static void nvnQueueSubmitCommands(queue_t *q, int n, const uint64_t *cmds) { nv
     if (!nvn_obj(q, NVN_MAGIC('Q', 'U', 'E', 'U'), "nvnQueueSubmitCommands")) return;
     if (!cmds && n) { nvn_fail("nvnQueueSubmitCommands", "null command handle array"); return; }
     q->submits += (uint64_t)n;
+    {
+        static int on = -1;
+        if (on < 0) on = getenv("TOTK_ANDROID_TRACE_CB_FLOW") != NULL;
+        if (on) {
+            static unsigned shown;
+            if (shown++ < 240) {
+                fprintf(stderr, "[totk-cb] submit thread=%#x n=%d", runtime_thread_current_handle(), n);
+                for (int i = 0; i < n; i++) fprintf(stderr, " %#llx", (unsigned long long)cmds[i]);
+                fputc('\n', stderr);
+            }
+        }
+    }
     nvn_frame_submit_trace(n, cmds);
     nvn_frame_ubo_trace(n, cmds);
     unsigned total = __atomic_add_fetch(&nvn_gpu_submits, (unsigned)n, __ATOMIC_RELAXED);
@@ -2817,7 +2829,11 @@ typedef struct {
     const void *owner;          /* guest colour-0 texture this image backs */
     GfxOffscreenTarget *gfx;
 } nvn_host_rt_t;
-static nvn_host_rt_t g_host_rts[16];
+/* Title/save UI creates a distinct host target per UI plane/atlas; 16 was
+ * exhausted before the save-slot screen could render.  The host images are
+ * shared per (size, layout, guest owner), so this only bounds the number of
+ * live guest targets, not frames. */
+static nvn_host_rt_t g_host_rts[128];
 static unsigned g_host_rt_count;
 static pthread_mutex_t g_host_rt_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -2874,7 +2890,7 @@ static GfxOffscreenTarget *nvn_host_rt_get_owner(uint32_t width, uint32_t height
     g_host_rts[g_host_rt_count].owner = owner;
     g_host_rts[g_host_rt_count].gfx = gfx;
     g_host_rt_count++;
-    if (g_host_rt_count <= 8 || nvn_trace())
+    if (g_host_rt_count <= 32 || nvn_trace())
         fprintf(stderr, "[totk-nvn] host render target %ux%u colors=%u depth=%#x"
                         " owner=%p created\n", width, height, layout->color_count,
                 layout->depth_format, owner);
@@ -3184,6 +3200,21 @@ static uint32_t nvn_cb_segments(const cb_t *c, nvn_seg_t **out) {
     uint32_t cw = 0, ch = 0;
     int cvalid = 0, cwin = 0;
     const void *ctex = NULL;
+    /* NVN keeps the resolved render targets across BeginRecording.  A UI
+     * recording often starts drawing to the target set before BeginRecording,
+     * then issues its first SetRenderTargets later; seed the prefix segment
+     * with that live target instead of dropping every prefix draw. */
+    {
+        nvn_cb_target_t *seed = nvn_cb_target(c, 0);
+        if (seed && seed->valid) {
+            cur = seed->layout;
+            cw = seed->width;
+            ch = seed->height;
+            cvalid = 1;
+            cwin = seed->window_texture;
+            ctex = seed->color0_tex;
+        }
+    }
     for (uint32_t i = 0; i < c->ncmds; i++) {
         if (c->cmds[i].kind != NVN_CMD_SET_RENDER_TARGETS) continue;
         if (started) {
@@ -3348,28 +3379,43 @@ static nvn_retired_t g_retired[NVN_RETIRED_MAX];
  * compositor submit.  The scene worker retires its command buffer; the main
  * thread's submit drains this FIFO first so the compositor samples a scene
  * that was rendered in this frame. */
-#define NVN_SCENE_QUEUE_MAX 64
-typedef struct { uint64_t handle; uint32_t seg; uint64_t seq; } nvn_scene_item_t;
+#define NVN_SCENE_QUEUE_MAX 1024
+typedef struct { uint64_t handle; uint32_t seg; uint64_t seq; uint32_t prio; } nvn_scene_item_t;
 static nvn_scene_item_t g_scene_pending[NVN_SCENE_QUEUE_MAX];
 static unsigned g_scene_pending_count;
 static unsigned nvn_scene_queued;
 static unsigned nvn_scene_submits, nvn_scene_rendered;
 static pthread_mutex_t g_scene_lock = PTHREAD_MUTEX_INITIALIZER;
-static void nvn_scene_queue(uint64_t handle, uint32_t seg, uint64_t seq) {
+/* The title UI records ~100 targets per frame but only one segment per submit
+ * used to drain.  A plain FIFO overflows and drops the 0x3f composite that the
+ * window samples.  Segments with draws and sampled textures go to the front;
+ * empty clear/state segments stay behind. */
+static void nvn_scene_queue(uint64_t handle, uint32_t seg, uint64_t seq, uint32_t prio) {
     pthread_mutex_lock(&g_scene_lock);
     for (unsigned i = 0; i < g_scene_pending_count; i++)
         if (g_scene_pending[i].handle == handle && g_scene_pending[i].seg == seg) {
+            if (prio > g_scene_pending[i].prio) g_scene_pending[i].prio = prio;
             pthread_mutex_unlock(&g_scene_lock);
             return;
         }
     if (g_scene_pending_count == NVN_SCENE_QUEUE_MAX) {
-        memmove(&g_scene_pending[0], &g_scene_pending[1],
-                (NVN_SCENE_QUEUE_MAX - 1) * sizeof g_scene_pending[0]);
+        /* Drop the oldest lowest-priority entry, never a textured 0x3f pass. */
+        unsigned drop = 0;
+        for (unsigned i = NVN_SCENE_QUEUE_MAX; i-- > 0; ) {
+            if (g_scene_pending[i].prio == 0) { drop = i; break; }
+        }
+        memmove(&g_scene_pending[drop], &g_scene_pending[drop + 1],
+                (NVN_SCENE_QUEUE_MAX - drop - 1) * sizeof g_scene_pending[0]);
         g_scene_pending_count--;
     }
-    g_scene_pending[g_scene_pending_count].handle = handle;
-    g_scene_pending[g_scene_pending_count].seg = seg;
-    g_scene_pending[g_scene_pending_count].seq = seq;
+    unsigned at = g_scene_pending_count;
+    while (at > 0 && g_scene_pending[at - 1].prio < prio) at--;
+    memmove(&g_scene_pending[at + 1], &g_scene_pending[at],
+            (g_scene_pending_count - at) * sizeof g_scene_pending[0]);
+    g_scene_pending[at].handle = handle;
+    g_scene_pending[at].seg = seg;
+    g_scene_pending[at].seq = seq;
+    g_scene_pending[at].prio = prio;
     g_scene_pending_count++;
     nvn_scene_queued++;
     pthread_mutex_unlock(&g_scene_lock);
@@ -3540,15 +3586,58 @@ static void nvn_cb_retire(cb_t *c) {
      * queued; a segment that only clears/state-binds its target is recorded as
      * an empty target so the compositor's sample can be reported honestly. */
     e->nseg = nvn_cb_segments(c, &e->seg);
-    uint32_t queue_segs[64], empty_segs[64];
+    /* A title/UI recording can switch targets dozens of times; the 0x3f
+     * composite is one of the later segments.  Do not truncate the segment
+     * lists at 64 or the compositor's source target never reaches the
+     * scene queue. */
+    uint32_t *queue_segs = e->nseg ? calloc(e->nseg, sizeof *queue_segs) : NULL;
+    uint32_t *queue_prio = e->nseg ? calloc(e->nseg, sizeof *queue_prio) : NULL;
+    uint32_t *empty_segs = e->nseg ? calloc(e->nseg, sizeof *empty_segs) : NULL;
     unsigned nqueue = 0, nempty = 0;
-    for (uint32_t i = 0; i < e->nseg; i++) {
+    for (uint32_t i = 0; e->seg && i < e->nseg; i++) {
         nvn_seg_t *sg = &e->seg[i];
         if (!sg->have_layout || sg->window_texture || !sg->color0_tex) continue;
-        if (sg->draw_count > 0 || sg->clear_count > 0) {
-            if (nqueue < sizeof queue_segs / sizeof queue_segs[0]) queue_segs[nqueue++] = i;
-        } else {
-            if (nempty < sizeof empty_segs / sizeof empty_segs[0]) empty_segs[nempty++] = i;
+        if (sg->draw_count > 0) {
+            uint32_t prio = 1u;
+            if (sg->have_last) {
+                const nvn_bind_state_t *sb = &sg->last.state;
+                if (sb->tex_mask[0][0] || sb->tex_mask[1][0]) prio = 2u;
+            }
+            if (queue_segs && nqueue < e->nseg) {
+                queue_segs[nqueue] = i;
+                if (queue_prio) queue_prio[nqueue] = prio;
+                nqueue++;
+            }
+        } else if (sg->clear_count == 0) {
+            if (empty_segs && nempty < e->nseg) empty_segs[nempty++] = i;
+        }
+    }
+    {
+        static int on = -1;
+        if (on < 0) on = getenv("TOTK_ANDROID_TRACE_SEGS") != NULL;
+        if (on) {
+            static unsigned shown;
+            if ((e->nseg || e->draw_count > 6 || e->color0_tex) && shown++ < 120) {
+                fprintf(stderr, "[totk-segs] handle=%#llx src=%p nseg=%u nqueue=%u nempty=%u"
+                                " draws=%u window=%d\n", (unsigned long long)e->handle,
+                        (void *)c, e->nseg, nqueue, nempty, e->draw_count, c->win != NULL);
+                for (uint32_t si = 0; si < e->nseg; si++) {
+                    nvn_seg_t *sg = &e->seg[si];
+                    int queued = 0;
+                    for (unsigned qi = 0; qi < nqueue; qi++)
+                        if (queue_segs[qi] == si) { queued = 1; break; }
+                    const tex_t *st = nvn_tex_registry_find(sg->color0_tex);
+                    uint32_t fmt = st ? (uint32_t)st->d.format : 0;
+                    if (si != 0 && si + 1 != e->nseg && sg->width < 1024 &&
+                        fmt != 0x3f && !queued)
+                        continue;
+                    fprintf(stderr, "[totk-segs]  %u cmd=[%u,%u) draws=%u tex=%p fmt=%#x"
+                                    " %ux%u win=%d clear=%u queued=%d last=%d\n",
+                            si, sg->first_cmd, sg->first_cmd + sg->ncmds, sg->draw_count,
+                            sg->color0_tex, fmt, sg->width, sg->height,
+                            sg->window_texture, sg->clear_count, queued, sg->have_last);
+                }
+            }
         }
     }
     if ((nvn_trace_frame() || nvn_trace_inputs()) && e->draw_count)
@@ -3609,7 +3698,8 @@ static void nvn_cb_retire(cb_t *c) {
                 (unsigned long long)c->handle, copied, e->draw_count, e->bind != NULL,
                 e->color0_tex, e->nseg, nqueue, nempty);
     for (unsigned i = 0; i < nqueue; i++)
-        nvn_scene_queue(scene_handle, queue_segs[i], rm ? rm->record_seq : 0);
+        nvn_scene_queue(scene_handle, queue_segs[i], rm ? rm->record_seq : 0,
+                        queue_prio ? queue_prio[i] : 0);
     for (unsigned i = 0; i < nempty; i++) {
         nvn_retired_t *re = NULL;
         pthread_mutex_lock(&g_retired_lock);
@@ -3623,6 +3713,9 @@ static void nvn_cb_retire(cb_t *c) {
         pthread_mutex_unlock(&g_retired_lock);
         nvn_note_empty_target(etex);
     }
+    free(queue_segs);
+    free(queue_prio);
+    free(empty_segs);
 }
 /* Drop handles whose command memory is being reused (nvnCommandBufferInitialize
  * on the same guest object): NVN invalidates the old handle at that point. */
@@ -3759,6 +3852,18 @@ static uint64_t nvnCommandBufferEndRecording(cb_t *c) {
     c->recording = 0;
     uint64_t h = 0x100000000ull | (c->serial & 0xffffffffull);
     c->handle = h;
+    {
+        static int on = -1;
+        if (on < 0) on = getenv("TOTK_ANDROID_TRACE_CB_FLOW") != NULL;
+        if (on) {
+            static unsigned shown;
+            if (shown++ < 240)
+                fprintf(stderr, "[totk-cb] end cb=%p h=%#llx ncmds=%u draws=%d prog=%p win=%p"
+                                " thread=%#x\n", (void *)c, (unsigned long long)h, c->ncmds,
+                        c->draw_count, (void *)c->prog, (void *)c->win,
+                        runtime_thread_current_handle());
+        }
+    }
     cb_meta_t *meta = nvn_cb_meta(c, 1);
     uint32_t rec_thread = runtime_thread_current_handle();
     uint64_t rec_lr = 0;
@@ -4598,6 +4703,19 @@ static void nvnCommandBufferCallCommands(cb_t *c, int n, const uint64_t *handles
     nvn_api("nvnCommandBufferCallCommands");
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferCallCommands", "invalid command buffer"); return; }
     if (n < 0 || (!handles && n)) { nvn_fail("nvnCommandBufferCallCommands", "null handle array"); return; }
+    {
+        static int on = -1;
+        if (on < 0) on = getenv("TOTK_ANDROID_TRACE_CB_FLOW") != NULL;
+        if (on) {
+            static unsigned shown;
+            if (shown++ < 240) {
+                fprintf(stderr, "[totk-cb] call dst=%p thread=%#x n=%d", (void *)c,
+                        runtime_thread_current_handle(), n);
+                for (int i = 0; i < n; i++) fprintf(stderr, " %#llx", (unsigned long long)handles[i]);
+                fputc('\n', stderr);
+            }
+        }
+    }
     if (nvn_trace_frame()) {
         fprintf(stderr, "[totk-frame] CallCommands dst=%p thread=%#x n=%d", (void *)c,
                 runtime_thread_current_handle(), n);
@@ -6443,10 +6561,10 @@ static int nvn_window_mirror_target(win_t *w, GfxOffscreenTarget *target) {
  * pipeline instead of creating one on the render thread. */
 static void nvn_warm_recording(void *vc) {
     cb_t *cb = vc;
-    if (!cb || cb->magic != NVN_MAGIC('C', 'M', 'D', 'B') || !cb->prog || !cb->win)
+    if (!cb || cb->magic != NVN_MAGIC('C', 'M', 'D', 'B') || !cb->prog)
         return;
     win_t *w = cb->win;
-    if (w->magic != NVN_MAGIC('W', 'I', 'N', 'D')) return;
+    int have_window = w && w->magic == NVN_MAGIC('W', 'I', 'N', 'D');
     prog_t *p = cb->prog;
     if (p->magic != NVN_MAGIC('P', 'R', 'O', 'G')) return;
     GfxRenderTargetLayout layout;
@@ -6467,20 +6585,21 @@ static void nvn_warm_recording(void *vc) {
         rh = cbt->height;
         window_texture = cbt->window_texture;
         have_layout = 1;
-    } else {
+    } else if (have_window) {
         nvn_window_layout(w, &layout, &rw, &rh);
         have_layout = layout.color_count > 0 && rw && rh;
     }
     if (!have_layout) return;
-    int window_pass = window_texture && nvn_layout_matches_window(w, &layout, rw, rh);
+    int window_pass = have_window && window_texture &&
+                      nvn_layout_matches_window(w, &layout, rw, rh);
+    uint32_t fmt = window_pass ? nvn_window_format(w) : layout.color_formats[0];
     GfxVertexLayout input;
     uint64_t vertex_sig = 0;
     const nvn_bind_state_t *wbs = nvn_cb_draw_state(cb);
     nvn_build_vertex_layout(wbs, &input, &vertex_sig);
     char variant[192];
     nvn_variant_suffix(p, cb, variant, sizeof variant);
-    (void)nvn_program_cached_pipeline(p, nvn_window_format(w), &layout,
-                                      window_pass,
+    (void)nvn_program_cached_pipeline(p, fmt, &layout, window_pass,
                                       input.nattributes ? &input : NULL,
                                       vertex_sig, variant, 1);
 }
@@ -7146,6 +7265,57 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
     return drew;
 }
 
+/* Before the window composite draws, make its sampled 0x3f source fresh even
+ * when the FIFO is deep.  TOTK records ~100 UI targets per frame but the
+ * Adreno submit path cannot replay all of them in one call, so the plain FIFO
+ * would still be empty at the 0x3f segment when the window samples it. */
+static void nvn_scene_submit_sampled_target(const nvn_bind_state_t *bs, cb_t *view) {
+    if (!bs) return;
+    const void *target = NULL;
+    const tex_pool_t *tp = nvn_tex_pool_for(view);
+    for (int st = 0; st < 2 && !target; st++)
+        for (int slot = 0; slot < 128; slot++) {
+            if (!(bs->tex_mask[st][slot / 32] & (1u << (slot % 32)))) continue;
+            uint64_t h = bs->tex[st][slot];
+            const tex_t *t = tp ? nvn_tex_pool_lookup(tp, (int)(h & 0xfffff)) : NULL;
+            if (!t) {
+                uint64_t gh = 0;
+                const tex_t *gt = NULL;
+                if (nvn_global_tex_get(st, slot, &gh, &gt) && gh == h) t = gt;
+            }
+            if (t && t->d.format == 0x3f && t->d.width >= 1024) {
+                target = t;
+                break;
+            }
+        }
+    if (!target) return;
+    uint64_t handle = 0;
+    uint32_t seg = 0;
+    int found = 0;
+    pthread_mutex_lock(&g_scene_lock);
+    for (unsigned i = 0; i < g_scene_pending_count; i++) {
+        handle = g_scene_pending[i].handle;
+        seg = g_scene_pending[i].seg;
+        pthread_mutex_lock(&g_retired_lock);
+        const nvn_retired_t *e = NULL;
+        for (unsigned k = 0; k < NVN_RETIRED_MAX; k++)
+            if (g_retired[k].used && g_retired[k].handle == handle) { e = &g_retired[k]; break; }
+        if (e && seg < e->nseg && e->seg[seg].draw_count > 0 &&
+            e->seg[seg].color0_tex == target) {
+            found = 1;
+        }
+        pthread_mutex_unlock(&g_retired_lock);
+        if (found) {
+            memmove(&g_scene_pending[i], &g_scene_pending[i + 1],
+                    (g_scene_pending_count - i - 1) * sizeof g_scene_pending[0]);
+            g_scene_pending_count--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_scene_lock);
+    if (found) nvn_submit_scene_snapshot(handle, seg);
+}
+
 /* Called at the start of every queue submit: render the retired offscreen
  * passes before the window compositor that samples them. */
 static void nvn_scene_submit_pending(void) {
@@ -7188,6 +7358,19 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             if (cand->handle == cmds[i]) { cb = cand; break; }
         }
         if (!cb || (!cb->draw_count && !cb->ncmds)) continue;
+        {
+            static int on = -1;
+            if (on < 0) on = getenv("TOTK_ANDROID_TRACE_SUBMIT_CB") != NULL;
+            if (on) {
+                static unsigned shown;
+                if (cb->draw_count > 6 && shown++ < 240)
+                    fprintf(stderr, "[totk-submit] handle=%#llx cb=%p ncmds=%u draws=%d"
+                                    " prog=%p win=%p target=%p\n",
+                            (unsigned long long)cmds[i], (void *)cb, cb->ncmds,
+                            cb->draw_count, (void *)cb->prog, (void *)cb->win,
+                            (void *)(nvn_cb_target(cb, 0) ? nvn_cb_target(cb, 0)->color0_tex : NULL));
+            }
+        }
         nvn_cb_apply_uniform_updates(cb);
         if (nvn_trace_first() && nvn_submit_trace++ < 4096) {
             const nvn_bind_state_t *sb = cb->bind_state;
@@ -7227,11 +7410,11 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
         prog_t *p = cb->prog;
         win_t *w = cb->win;
         int has_program = p && p->magic == NVN_MAGIC('P', 'R', 'O', 'G');
-        if (!w || w->magic != NVN_MAGIC('W', 'I', 'N', 'D') ||
-            !runtime_native_window_valid(w->native)) {
-            nvn_fail("nvnQueueSubmitCommands", "command buffer has no drawable window");
-            continue;
-        }
+        int has_window = w && w->magic == NVN_MAGIC('W', 'I', 'N', 'D') &&
+                         runtime_native_window_valid(w->native);
+        /* A UI/scene command buffer may render only to offscreen guest
+         * textures and never call SetWindow.  Do not discard it: the final
+         * window pass samples its 0x3f target. */
 
         /* Resolve the pass target layout.  nvnCommandBufferSetRenderTargets
          * records it; a command buffer that only set a window uses that
@@ -7254,14 +7437,19 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             rh = cbt->height;
             window_texture = cbt->window_texture;
             have_layout = 1;
-        } else {
+        } else if (has_window) {
             nvn_window_layout(w, &layout, &rw, &rh);
             have_layout = layout.color_count > 0 && rw && rh;
         }
+        if (!has_window && !have_layout) {
+            nvn_fail("nvnQueueSubmitCommands", "command buffer has no target");
+            continue;
+        }
         int window_target = window_texture;
-        int window_pass = !have_layout ||
-                          (window_target && nvn_layout_matches_window(w, &layout, rw, rh));
+        int window_pass = has_window && (!have_layout ||
+                          (window_target && nvn_layout_matches_window(w, &layout, rw, rh)));
         const nvn_bind_state_t *bs = nvn_cb_draw_state(cb);
+        if (window_pass) nvn_scene_submit_sampled_target(bs, cb);
         {
             static int uiflow = -1;
             if (uiflow < 0) uiflow = getenv("TOTK_ANDROID_TRACE_UI_FLOW") != NULL;
@@ -7350,9 +7538,10 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             }
         }
         GfxOffscreenTarget *rt = NULL;
+        const void *rt_owner = NULL;
         if (have_layout && !window_pass) {
             nvn_cb_target_t *rt_target = nvn_cb_target(cb, 0);
-            const void *rt_owner = rt_target ? rt_target->color0_tex : NULL;
+            rt_owner = rt_target ? rt_target->color0_tex : NULL;
             rt = nvn_host_rt_get_owner(rw, rh, &layout, rt_owner);
             if (!rt) {
                 nvn_fail("nvnQueueSubmitCommands", "cannot create host render-target layout");
@@ -7397,7 +7586,9 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
         if (!reflected && has_program) {
             char variant[192];
             nvn_variant_suffix(p, cb, variant, sizeof variant);
-            reflected = nvn_program_cached_pipeline(p, nvn_window_format(w),
+            uint32_t pf = window_pass ? nvn_window_format(w)
+                                      : (have_layout ? layout.color_formats[0] : 0);
+            reflected = nvn_program_cached_pipeline(p, pf,
                                                     have_layout ? &layout : NULL,
                                                     window_pass,
                                                     input.nattributes ? &input : NULL,
@@ -7446,11 +7637,16 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                                                         streams, nstreams);
             for (uint32_t oi = 0; oi < nowned; oi++) free(owned[oi]);
             free(translated);
-            if (drew && !window_pass) nvn_window_mirror_target(w, rt);
-        } else if (has_program && ph.textured && ph.gfx_textured_pipeline && ph.gfx_texture) {
+            if (drew && !window_pass) {
+                if (has_window) nvn_window_mirror_target(w, rt);
+                const tex_t *ctex = nvn_tex_registry_find(rt_owner);
+                if (ctex) nvn_tex_set_rt(ctex, rt, &layout, rw, rh);
+            }
+        } else if (has_window && has_program && ph.textured &&
+                   ph.gfx_textured_pipeline && ph.gfx_texture) {
             drew = runtime_native_window_draw_textured_triangle(w->native, ph.gfx_textured_pipeline,
                                                                 ph.gfx_texture);
-        } else if (has_program && ph.gfx_pipeline) {
+        } else if (has_window && has_program && ph.gfx_pipeline) {
             drew = runtime_native_window_draw_triangle_pipeline(w->native, ph.gfx_pipeline);
         } else {
             /* Clear-only command buffer, or a program whose shaders are not in
@@ -7462,9 +7658,13 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             (void)nvn_translate_commands(cb, ignored, 1, NULL, clear, &has_clear);
             if (!window_pass && rt)
                 drew = gfx_backend_offscreen_clear(rt, clear[0], clear[1], clear[2], clear[3]);
-            else
+            else if (has_window)
                 drew = runtime_native_window_clear_rgba(w->native, clear);
-            if (drew && !window_pass) nvn_window_mirror_target(w, rt);
+            if (drew && !window_pass) {
+                if (has_window) nvn_window_mirror_target(w, rt);
+                const tex_t *ctex = nvn_tex_registry_find(rt_owner);
+                if (ctex) nvn_tex_set_rt(ctex, rt, &layout, rw, rh);
+            }
             static unsigned fallback_logged;
             if (fallback_logged++ < 8)
                 fprintf(stderr, "[totk-nvn] no cached pipeline for program=%p: clear-only frame\n",
@@ -7487,7 +7687,7 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
         int dump_now = l2_at
             ? (nvn_nvn_draws == l2_at)
             : (scene_ready && nvn_nvn_draws >= 1);
-        if (l2_frame && *l2_frame && !l2_frame_dumped && dump_now) {
+        if (has_window && l2_frame && *l2_frame && !l2_frame_dumped && dump_now) {
             l2_frame_dumped = 1;
             int shot = runtime_native_window_screenshot(w->native, l2_frame);
             if (l2_at)
@@ -9407,11 +9607,26 @@ static void nvn_trace_draw_indirect(void *c, void *a) {
 static void nvn_trace_draw_arrays_indirect(void *c, void *a) {
     (void)c; (void)a; nvn_zero_call("nvnCommandBufferDrawArraysIndirect");
 }
-static void nvn_trace_draw_texture(void *c, void *h, void *src, void *dst) {
-    (void)c; (void)h; (void)src; (void)dst;
+static void nvn_trace_draw_texture(void *c, uint64_t h, const void *src, const void *dst) {
     nvn_cb_draw_texture_calls++;
-    if (nvn_trace_composite())
-        fprintf(stderr, "[totk-frame] composite draw texture h=%p src=%p dst=%p\n", h, src, dst);
+    uint32_t s[16] = {0}, d[16] = {0};
+    if (src) memcpy(s, src, sizeof s);
+    if (dst) memcpy(d, dst, sizeof d);
+    const tex_pool_t *tp = nvn_tex_pool_for((const cb_t *)c);
+    const tex_t *t = tp ? nvn_tex_pool_lookup(tp, (int)(h & 0xfffff)) : NULL;
+    static unsigned logged;
+    if (nvn_trace_composite() && logged++ < 64)
+        fprintf(stderr, "[totk-drawtex] cb=%p h=%#llx tex=%p fmt=%#x %ux%u mem=%p"
+                        " src=%p[%u %u %u %u | f %.3f %.3f %.3f %.3f]"
+                        " dst=%p[%u %u %u %u | f %.3f %.3f %.3f %.3f]\n",
+                c, (unsigned long long)h, (const void *)t, t ? (unsigned)t->d.format : 0,
+                t ? t->d.width : 0, t ? t->d.height : 0, t ? (void *)t->mem : NULL,
+                src, s[0], s[1], s[2], s[3],
+                *(const float *)&s[0], *(const float *)&s[1],
+                *(const float *)&s[2], *(const float *)&s[3],
+                dst, d[0], d[1], d[2], d[3],
+                *(const float *)&d[0], *(const float *)&d[1],
+                *(const float *)&d[2], *(const float *)&d[3]);
     nvn_zero_call("nvnCommandBufferDrawTexture");
 }
 static void nvn_trace_clear_texture(void *c, void *t, void *v, void *r, void *color, int mask) {
@@ -9656,6 +9871,10 @@ static const nvn_entry nvn_entries[] = {
     NVN_E(nvnCommandBufferBindStorageBuffers), NVN_E(nvnCommandBufferBindTexture),
     NVN_E(nvnCommandBufferBindTextures), NVN_E(nvnCommandBufferBindImage),
     NVN_E(nvnCommandBufferBindImages),
+    NVN_E(nvn_trace_dispatch_compute), NVN_E(nvn_trace_dispatch_indirect),
+    NVN_E(nvn_trace_draw_texture), NVN_E(nvn_trace_clear_texture),
+    NVN_E(nvn_trace_copy_b2t), NVN_E(nvn_trace_copy_t2b), NVN_E(nvn_trace_copy_t2t),
+    NVN_E(nvn_trace_blit),
     NVN_E(nvnBlendStateSetDefaults), NVN_E(nvnBlendStateSetBlendTarget),
     NVN_E(nvnBlendStateSetBlendFunc), NVN_E(nvnBlendStateSetBlendEquation),
     NVN_E(nvnColorStateSetDefaults), NVN_E(nvnColorStateSetBlendEnable),
