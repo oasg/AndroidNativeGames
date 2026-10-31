@@ -923,6 +923,8 @@ static int vk_image_barrier_range(VkCommandBuffer cmd, VkImage image, VkImageLay
 }
 
 static int vk_submit_and_wait(VkCommandBuffer cmd, const char *what) {
+    if (getenv("TOTK_ANDROID_TRACE_SHADER"))
+        vk_log("submit begin %s cmd=%p", what, (void *)cmd);
     VkResult r = vkEndCommandBuffer(cmd);
     if (!vk_ok(r, "vkEndCommandBuffer")) return 0;
     VkSubmitInfo si = {
@@ -936,9 +938,16 @@ static int vk_submit_and_wait(VkCommandBuffer cmd, const char *what) {
     if (!vk_ok(r, "vkQueueSubmit")) return 0;
     r = vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, UINT64_MAX);
     if (!vk_ok(r, "vkWaitForFences")) return 0;
+    if (getenv("TOTK_ANDROID_TRACE_SHADER"))
+        vk_log("submit end %s", what);
     (void)what;
     return 1;
 }
+
+/* Defined below; forward declaration so the present/triangle pipelines use the
+ * same large-stack compile path. */
+static VkResult vk_create_graphics_pipelines_bigstack(
+        VkPipelineCache cache, const VkGraphicsPipelineCreateInfo *ci, VkPipeline *out);
 
 /* Submission fences.  Every backend submission above is synchronous, so a
  * fence can only become signaled once the queue has actually drained.  We
@@ -1692,6 +1701,8 @@ static GfxPresentPipe *vk_present_pipe_get_locked(VkFormat src, VkFormat dst,
     p->final_layout = final_layout;
 
     VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+    if (getenv("TOTK_ANDROID_TRACE_SHADER"))
+        vk_log("present pipeline begin src=%d dst=%d", (int)src, (int)dst);
     if (!vk_ok(vkCreateShaderModule(g.dev, &(VkShaderModuleCreateInfo){
                    .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
                    .codeSize = present_vert_spv_size,
@@ -1817,7 +1828,7 @@ static GfxPresentPipe *vk_present_pipe_get_locked(VkFormat src, VkFormat dst,
         .pRasterizationState = &rast, .pMultisampleState = &ms, .pColorBlendState = &cb,
         .pDynamicState = &ds, .layout = p->layout, .renderPass = p->pass, .subpass = 0,
     };
-    int ok = vk_ok(vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &gpci, NULL, &p->pipe),
+    int ok = vk_ok(vk_create_graphics_pipelines_bigstack(VK_NULL_HANDLE, &gpci, &p->pipe),
                    "vkCreateGraphicsPipelines(present)");
     if (vs) vkDestroyShaderModule(g.dev, vs, NULL);
     if (fs) vkDestroyShaderModule(g.dev, fs, NULL);
@@ -2182,6 +2193,42 @@ struct GfxTrianglePipeline {
     VkImageView fb_view;
 };
 
+/* Adreno's LLVM shader compiler needs more than the 1 MiB host stack that a
+ * guest thread often provides.  vkCreateGraphicsPipelines runs the compiler on
+ * the calling thread, so compile on a dedicated large-stack host thread.  This
+ * is what the BC4 save/title frame hit at libllvm-qgl+0xebb514 (stack guard
+ * page below sp), not the texture upload path. */
+typedef struct {
+    VkPipelineCache cache;
+    const VkGraphicsPipelineCreateInfo *ci;
+    VkPipeline *out;
+    VkResult result;
+} VkPipeCompileJob;
+
+static void *vk_pipe_compile_thread(void *arg) {
+    VkPipeCompileJob *job = arg;
+    job->result = vkCreateGraphicsPipelines(g.dev, job->cache, 1, job->ci, NULL, job->out);
+    return NULL;
+}
+
+static VkResult vk_create_graphics_pipelines_bigstack(
+        VkPipelineCache cache, const VkGraphicsPipelineCreateInfo *ci, VkPipeline *out) {
+    VkPipeCompileJob job = { cache, ci, out, VK_ERROR_UNKNOWN };
+    pthread_attr_t attr;
+    pthread_t th;
+    int attr_ok = pthread_attr_init(&attr) == 0;
+    if (attr_ok && pthread_attr_setstacksize(&attr, 32u << 20) == 0 &&
+        pthread_create(&th, &attr, vk_pipe_compile_thread, &job) == 0) {
+        pthread_attr_destroy(&attr);
+        pthread_join(th, NULL);
+        return job.result;
+    }
+    if (attr_ok) pthread_attr_destroy(&attr);
+    /* If a worker cannot be created, creating the pipeline inline is still
+     * preferable to skipping the draw; the callers report the result. */
+    return vkCreateGraphicsPipelines(g.dev, cache, 1, ci, NULL, out);
+}
+
 static int vk_shader_module(const uint8_t *code, size_t size, const char *what,
                             VkShaderModule *out) {
     if (!code || size < 20 || (size & 3)) {
@@ -2199,7 +2246,12 @@ static int vk_shader_module(const uint8_t *code, size_t size, const char *what,
         .codeSize = size,
         .pCode = (const uint32_t *)code,
     };
-    return vk_ok(vkCreateShaderModule(g.dev, &ci, NULL, out), what);
+    if (getenv("TOTK_ANDROID_TRACE_SHADER"))
+        vk_log("shader module begin %s bytes=%zu", what, size);
+    VkResult r = vkCreateShaderModule(g.dev, &ci, NULL, out);
+    if (getenv("TOTK_ANDROID_TRACE_SHADER"))
+        vk_log("shader module end %s result=%d", what, (int)r);
+    return vk_ok(r, what);
 }
 
 static GfxTrianglePipeline *triangle_create_impl(const uint8_t *vs, size_t vs_size,
@@ -2372,7 +2424,7 @@ static GfxTrianglePipeline *triangle_create_impl(const uint8_t *vs, size_t vs_si
         .renderPass = p->pass,
         .subpass = 0,
     };
-    if (!vk_ok(vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &gpci, NULL, &p->pipe),
+    if (!vk_ok(vk_create_graphics_pipelines_bigstack(VK_NULL_HANDLE, &gpci, &p->pipe),
                "vkCreateGraphicsPipelines(triangle)"))
         goto fail;
     pthread_mutex_unlock(&g_lock);
@@ -2636,6 +2688,12 @@ static GfxTexture *texture_create_desc_locked(const GfxTextureDesc *desc,
     }
     VkFormat fmt = (VkFormat)desc->vk_format;
     VkFormatInfo info = vk_format_info(fmt);
+    int tex_trace = getenv("TOTK_ANDROID_TRACE_TEX") != NULL;
+    if (tex_trace)
+        vk_log("texture desc begin target=%u fmt=%s(%d) %ux%u depth=%u mips=%u layers=%u "
+               "samples=%u subresources=%u",
+               desc->target, info.name, (int)fmt, desc->width, desc->height, desc->depth,
+               desc->mip_levels, desc->array_layers, desc->samples, count);
     uint32_t bw = 0, bh = 0, block_bytes = 0;
     if (!vk_format_block(fmt, &bw, &bh, &block_bytes)) {
         vk_log("ERROR texture desc: unsupported VkFormat %d", (int)fmt);
@@ -2754,6 +2812,7 @@ static GfxTexture *texture_create_desc_locked(const GfxTextureDesc *desc,
                                 desc->mip_levels, desc->array_layers, samples,
                                 usage, flags, &t->image, &t->mem))
         goto fail;
+    if (tex_trace) vk_log("texture desc image ok image=%p", (void *)t->image);
     VkImageViewCreateInfo vci = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .image = t->image,
@@ -2769,6 +2828,7 @@ static GfxTexture *texture_create_desc_locked(const GfxTextureDesc *desc,
     };
     if (!vk_ok(vkCreateImageView(g.dev, &vci, NULL, &t->view), "vkCreateImageView(texture)"))
         goto fail;
+    if (tex_trace) vk_log("texture desc view ok view=%p", (void *)t->view);
     VkSamplerCreateInfo sci = {
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
@@ -2782,8 +2842,10 @@ static GfxTexture *texture_create_desc_locked(const GfxTextureDesc *desc,
     };
     if (!vk_ok(vkCreateSampler(g.dev, &sci, NULL, &t->sampler), "vkCreateSampler(texture)"))
         goto fail;
+    if (tex_trace) vk_log("texture desc sampler ok sampler=%p", (void *)t->sampler);
 
     if (count) {
+        if (tex_trace) vk_log("texture desc upload begin count=%u", count);
         size_t *offsets = calloc(count, sizeof *offsets);
         if (!offsets) goto fail;
         size_t total = 0;
@@ -2884,6 +2946,7 @@ static GfxTexture *texture_create_desc_locked(const GfxTextureDesc *desc,
         vkDestroyBuffer(g.dev, staging, NULL);
         vkFreeMemory(g.dev, stage_mem, NULL);
         if (!submitted) goto fail;
+        if (tex_trace) vk_log("texture desc upload ok total=%zu", total);
         t->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
     vk_log("texture %ux%ux%u target=%u %s mips=%u layers=%u samples=%u image=%p",
@@ -3182,7 +3245,7 @@ GfxTexturedPipeline *gfx_backend_textured_pipeline_create(int vk_format) {
         .pRasterizationState = &rast, .pMultisampleState = &ms, .pColorBlendState = &cb,
         .pDynamicState = &ds, .layout = p->layout, .renderPass = p->pass, .subpass = 0,
     };
-    if (!vk_ok(vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &gpci, NULL, &p->pipe),
+    if (!vk_ok(vk_create_graphics_pipelines_bigstack(VK_NULL_HANDLE, &gpci, &p->pipe),
                "vkCreateGraphicsPipelines(tex)")) goto fail;
     pthread_mutex_unlock(&g_lock);
     vk_log("textured triangle pipeline ready format=%s", vk_format_name(fmt));
@@ -3718,7 +3781,7 @@ static int reflect_create_pipeline(GfxReflectedPipeline *p, const GfxPipelineSta
         .pMultisampleState = &ms, .pColorBlendState = &cb,
         .pDepthStencilState = p->rt_layout.depth_format ? &dss : NULL,
         .pDynamicState = &ds, .layout = p->layout, .renderPass = p->pass };
-    return vk_ok(vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &gpci, NULL, out),
+    return vk_ok(vk_create_graphics_pipelines_bigstack(VK_NULL_HANDLE, &gpci, out),
                  "vkCreateGraphicsPipelines(reflected variant)");
 }
 
@@ -4998,6 +5061,7 @@ int gfx_backend_validate_spirv(const uint8_t *code, size_t size, const char *nam
 
 int gfx_backend_texture_formats_selftest(void);
 int gfx_backend_mrt_selftest(void);
+int gfx_backend_bc4_mips_selftest(void);
 
 static int vk_selftest_read_match(GfxTexture *t, uint32_t level, uint32_t layer,
                                   const uint8_t *expect, size_t n, const char *what) {
@@ -5506,6 +5570,88 @@ int gfx_backend_surface_target_selftest(void) {
     }
     gfx_backend_offscreen_destroy(rgba);
     vk_log("surface target selftest %s", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+
+/* Focused regression for the save/title UI texture: 512x512 BC4_UNORM with a
+ * full 10-level mip chain, including the sub-block mips (2x2 and 1x1), with
+ * real block data uploaded and every level read back byte-exact. */
+int gfx_backend_bc4_mips_selftest(void) {
+    if (!gfx_backend_vulkan_init()) {
+        vk_log("BC4 mips selftest: Vulkan unavailable");
+        return 0;
+    }
+    if (gfx_backend_vk_format_bpp(VK_FORMAT_BC4_UNORM_BLOCK) != 8) {
+        vk_log("BC4 mips selftest: bpp=%d, expected 8-byte blocks",
+               gfx_backend_vk_format_bpp(VK_FORMAT_BC4_UNORM_BLOCK));
+        return 0;
+    }
+    enum { W = 512, H = 512, LEVELS = 10 };
+    GfxTextureDesc desc = {
+        .target = GFX_TEXTURE_2D,
+        .vk_format = VK_FORMAT_BC4_UNORM_BLOCK,
+        .width = W, .height = H, .depth = 1,
+        .mip_levels = LEVELS, .array_layers = 1, .samples = 1,
+    };
+    uint8_t *data[LEVELS] = { 0 };
+    GfxTextureSubresource subs[LEVELS];
+    size_t sizes[LEVELS] = { 0 };
+    int ok = 1;
+    for (uint32_t l = 0; l < LEVELS; l++) {
+        sizes[l] = vk_texture_slice_size(&desc, l);
+        if (!sizes[l]) { ok = 0; break; }
+        data[l] = malloc(sizes[l]);
+        if (!data[l]) { ok = 0; break; }
+        for (size_t i = 0; i < sizes[l]; i++)
+            data[l][i] = (uint8_t)(0x31u * (l + 1) + (uint8_t)i * 7u);
+        subs[l] = (GfxTextureSubresource){ l, 0, data[l], sizes[l] };
+    }
+    GfxTexture *t = ok ? gfx_backend_texture_create_desc(&desc, subs, LEVELS) : NULL;
+    if (!t) {
+        vk_log("BC4 mips selftest: 512x512 mips=10 create failed");
+        ok = 0;
+    } else {
+        for (uint32_t l = 0; l < LEVELS && ok; l++) {
+            uint8_t *got = malloc(sizes[l] ? sizes[l] : 1);
+            if (!got) { ok = 0; break; }
+            if (!gfx_backend_texture_read_pixels(t, l, 0, got, sizes[l])) {
+                vk_log("BC4 mips selftest: read level %u (%zu bytes) failed", l, sizes[l]);
+                ok = 0;
+            } else if (memcmp(got, data[l], sizes[l])) {
+                size_t i = 0;
+                while (i + 1 < sizes[l] && got[i] == data[l][i]) i++;
+                vk_log("BC4 mips selftest: level %u mismatch at byte %zu got=%02x want=%02x",
+                       l, i, got[i], data[l][i]);
+                ok = 0;
+            }
+            free(got);
+        }
+        vk_log("BC4 mips selftest: %s 512x512 mips=%u sizes=%zu,%zu,%zu,%zu",
+               ok ? "PASS" : "FAIL", LEVELS, sizes[0], sizes[1], sizes[8], sizes[9]);
+        gfx_backend_texture_destroy(t);
+    }
+    /* A standalone small BC4 texture also exercises the 1-block case. */
+    if (ok) {
+        uint8_t block[8];
+        for (unsigned i = 0; i < sizeof block; i++) block[i] = (uint8_t)(0xa5u ^ (i * 3));
+        GfxTextureDesc d4 = {
+            .target = GFX_TEXTURE_2D, .vk_format = VK_FORMAT_BC4_UNORM_BLOCK,
+            .width = 4, .height = 4, .depth = 1, .mip_levels = 1,
+            .array_layers = 1, .samples = 1,
+        };
+        GfxTextureSubresource s4 = { 0, 0, block, sizeof block };
+        GfxTexture *t4 = gfx_backend_texture_create_desc(&d4, &s4, 1);
+        uint8_t got[8] = { 0 };
+        if (!t4 || !gfx_backend_texture_read_pixels(t4, 0, 0, got, sizeof got) ||
+            memcmp(got, block, sizeof block)) {
+            vk_log("BC4 mips selftest: 4x4 block round-trip failed");
+            ok = 0;
+        }
+        if (t4) gfx_backend_texture_destroy(t4);
+    }
+    for (uint32_t l = 0; l < LEVELS; l++) free(data[l]);
+    vk_log("BC4 mips selftest %s", ok ? "PASS" : "FAIL");
     return ok;
 }
 

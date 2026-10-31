@@ -2076,6 +2076,15 @@ int main(int argc, char **argv) {
         printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"vulkan-texture-formats\"}\n");
         return 0;
     }
+    if (!strcmp(argv[2], "probe-vulkan-bc4-mips")) {
+        int gfx_backend_bc4_mips_selftest(void);
+        if (!gfx_backend_bc4_mips_selftest()) {
+            fprintf(stderr, "[totk-vk] BC4 mips selftest FAIL\n");
+            return 1;
+        }
+        printf("{\"status\":\"pass\",\"host\":\"android\",\"probe\":\"vulkan-bc4-mips\"}\n");
+        return 0;
+    }
     if (!strcmp(argv[2], "probe-vulkan-mrt")) {
         int gfx_backend_mrt_selftest(void);
         if (!gfx_backend_mrt_selftest()) {
