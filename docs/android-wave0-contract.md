@@ -82,8 +82,13 @@ referenced with environment variables:
 - RomFS: `TOTK_ANDROID_ROMFS=/data/local/tmp/totk-android/romfs-min/totk-romfs-min`
 - full shader cache:
   `TOTK_ANDROID_SHADER_CACHE=/data/local/tmp/totk-android/lanes/shader/shader-cache`
-- save/profile: default `/data/local/tmp/totk-android/user-data` (the
-  `f9cd...` account save is already there)
+- save/profile: default `/data/local/tmp/totk-android/user-data`; **title and
+  save-slot runs must set**
+  `TOTK_ANDROID_ACCOUNT_UID=f9cdd55b6d4c70efc1c8e47378dad985`.
+  Without it the filesystem mounts the profile under UID 0, the imported
+  `save/f9cd...` is invisible, and the game never reaches the UI producer
+  (no 360x69/142x26 target, no copy/dispatch calls). This is not a rendering
+  bug.
 
 Wave 1 device tests are parallel only in code; adb runs queue on the lock.
 Because there is one device, the 30-minute soak belongs to Wave 4: Lane 3 runs
