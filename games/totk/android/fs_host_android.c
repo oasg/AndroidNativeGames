@@ -45,12 +45,11 @@ void runtime_fs_log(const char *what, const char *path) {
     snprintf(g_fs_last, sizeof g_fs_last, "%s %s", what, path ? path : "?");
     fprintf(stderr, "[totk-android] fs %s %s\n", what, path ? path : "?");
 }
-/* The guest's account service is not implemented yet; a single local user is
- * enough for save mounts. */
-void runtime_account_uid(uint64_t out[2]) {
-    out[0] = 0;
-    out[1] = 0;
-}
+/* account_android.c owns the local UID (including the
+ * TOTK_ANDROID_ACCOUNT_UID test hook).  Do not shadow it with a zero UID here:
+ * that selected save/00000000000000000000000000000000 and made an imported
+ * save under its real UID invisible. */
+extern void runtime_account_uid(uint64_t out[2]);
 
 #define R_PATH_NOT_FOUND 0x202u
 #define R_ALREADY_EXISTS 0x402u

@@ -43,6 +43,15 @@ static void account_uid_init(void) {
             local_uid[3], local_uid[2], local_uid[1], local_uid[0]);
 }
 
+/* Consumed by fs_host_android.c to choose save/<uid>.  Keep the byte order
+ * identical to the fs path format: uid[0] is the low 64-bit half, uid[1] the
+ * high half, and fs prints uid[1] first. */
+void runtime_account_uid(uint64_t out[2]) {
+    if (!out) return;
+    memcpy(&out[0], local_uid, 8);
+    memcpy(&out[1], local_uid + 8, 8);
+}
+
 static unsigned account_logged;
 static void account_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     (void)s;

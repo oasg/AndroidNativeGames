@@ -908,6 +908,29 @@ The crash dump now follows both intrusive lists for 40 nodes and uses the
 correct `+0x48`/`+0x60` field indices.  With virtual cores it has not fired
 again, so the list walk itself is no longer the blocker.
 
+### 9.3 Imported save was mounted under the zero UID
+
+`fs_host_android.c` also defined its own `runtime_account_uid()` returning
+`{0,0}`, shadowing the real implementation.  `TOTK_ANDROID_ACCOUNT_UID` changed
+the account service replies, but the filesystem still mounted:
+
+```text
+[totk] host save storage: .../save/00000000000000000000000000000000
+```
+
+so the imported 1.0.0 save under `save/f9cd...` was never visible.  The stub
+was removed; `fs` now uses `account_android.c`'s UID and logs:
+
+```text
+[totk-account] uid=f9cdd55b6d4c70efc1c8e47378dad985
+[totk] host save storage: .../save/f9cdd55b6d4c70efc1c8e47378dad985
+[totk-android] fs read save:/slot_00/caption.sav
+[totk-android] fs read save:/slot_01/caption.sav
+```
+
+This is required for any title/save-slot test.  The UI still stalls later at a
+graphics pipeline/UI step and the `0x3f` compute target remains unwritten.
+
 ## 10. Next
 
 1. Implement Vulkan compute dispatch for the UI compositor
