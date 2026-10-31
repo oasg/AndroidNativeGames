@@ -835,11 +835,23 @@ Two host causes were found and fixed:
   errors are gone.
 
 The remaining failure at the first `0x3f` submit is **not** the guest list
-walk: it is a nondeterministic Adreno segfault reported by the shell without a
-crash-handler frame.  Adding a 5 ms submit delay moved one run to draw #3300,
-while other runs still die at #32, so it is a host/driver timing issue rather
-than a bad guest pointer.  The guest TLS crash (`sdk+0x131818`) also still
-appears on some new threads.
+walk.  With an alternate signal stack installed, it is now visible as
+`vulkan.adreno.so+0x32eff8` with the fault address 0xf0 bytes from the guest
+SP: Adreno's submit path was overflowing the 1 MiB guest stack (NVN procs are
+called directly, not through the HLE gate).  `runtime_thread_prepare_stack()`
+now commits a 2 MiB window below and 64 KiB above every SVC stack top, and the
+crash handler runs on a per-thread 64 KiB alternate stack.  One run then
+reached present #387 / draw #300 instead of dying at #32.
+
+The guest list walk itself was also affected by the NVN pool ABI: the Android
+`tex_pool_t` had `{magic,n,gen,epoch,pool,off}`, while the guest/macOS layout
+is `{pool,off,n}`.  `nvnTexturePoolFinalize` also wrote gen/magic into the
+guest object.  The host now uses the guest layout for the first 0x18 bytes,
+keeps magic/gen in the tail, and finalize leaves the guest object untouched
+(macOS does the same).  The crash moved from draw #32 to #1200/#300, but the
+same list-bucket walk still appears when an engine texture-pool node is torn
+down, so this is not yet a complete fix.  The guest TLS crash
+(`sdk+0x131818`) also still appears on some new threads.
 
 ## 10. Next
 
