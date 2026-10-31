@@ -1917,7 +1917,7 @@ int runtime_nvn_texture_upload_guest(void *texture) {
                     l, t->d.target, t->d.format, w, h, depth);
             return 0;
         }
-        total += is_3d ? slices : layers;
+        total += is_3d ? 1 : layers;
     }
     if (!total) return 0;
 
@@ -1938,25 +1938,49 @@ int runtime_nvn_texture_upload_guest(void *texture) {
             break;
         }
         size_t slice_bytes = (size_t)rb * rows;
-        uint32_t zcount = is_3d ? slices : 1;
-        uint32_t lcount = is_3d ? 1 : layers;
-        for (uint32_t layer = 0; layer < lcount && ok; layer++) {
-            for (uint32_t z = 0; z < zcount && ok; z++) {
+        if (is_3d) {
+            /* The backend takes one subresource per mip level for a 3D image,
+             * with all depth slices contiguous.  Passing one subresource per
+             * slice made it reject the image (size < depth*slice). */
+            uint8_t *buf = malloc(slice_bytes * (slices ? slices : 1));
+            if (!buf) { ok = 0; break; }
+            for (uint32_t z = 0; z < slices && ok; z++) {
+                if (runtime_guest_texture_deswizzle_at(t->mem, buf + (size_t)z * slice_bytes,
+                                                       rb, t->d.target, t->d.format,
+                                                       t->d.flags, t->d.samples, w, h, depth,
+                                                       levels, t->d.stride, t->d.pkg_block_h,
+                                                       l, 0, z, 1)) {
+                    fprintf(stderr, "[totk-nvn] ERROR deswizzle level=%u z=%u"
+                                    " (target=%d format=%#x)\n",
+                            l, z, t->d.target, t->d.format);
+                    free(buf);
+                    ok = 0;
+                    break;
+                }
+            }
+            if (!ok) break;
+            blocks[nsub] = buf;
+            subs[nsub].level = l;
+            subs[nsub].layer = 0;
+            subs[nsub].data = buf;
+            subs[nsub].size = slice_bytes * slices;
+            nsub++;
+        } else {
+            for (uint32_t layer = 0; layer < layers && ok; layer++) {
                 uint8_t *buf = malloc(slice_bytes ? slice_bytes : 1);
                 if (!buf) { ok = 0; break; }
                 if (runtime_guest_texture_deswizzle_at(t->mem, buf, rb, t->d.target,
                                                        t->d.format, t->d.flags, t->d.samples,
                                                        w, h, depth, levels, t->d.stride,
-                                                       t->d.pkg_block_h, l, layer,
-                                                       is_3d ? z : 0, 1)) {
-                    fprintf(stderr, "[totk-nvn] ERROR deswizzle level=%u layer=%u z=%u"
+                                                       t->d.pkg_block_h, l, layer, 0, 1)) {
+                    fprintf(stderr, "[totk-nvn] ERROR deswizzle level=%u layer=%u"
                                     " (target=%d format=%#x)\n",
-                            l, layer, z, t->d.target, t->d.format);
+                            l, layer, t->d.target, t->d.format);
                     free(buf);
                     ok = 0;
                     break;
                 }
-                if (l == 0 && layer == 0 && z == 0 && t->d.width == 96 && t->d.height == 96 &&
+                if (l == 0 && layer == 0 && t->d.width == 96 && t->d.height == 96 &&
                     t->d.format == 0x49) {
                     const char *dp = getenv("TOTK_ANDROID_TEX_DUMP");
                     static int dumped;
@@ -1975,7 +1999,7 @@ int runtime_nvn_texture_upload_guest(void *texture) {
                 }
                 blocks[nsub] = buf;
                 subs[nsub].level = l;
-                subs[nsub].layer = is_3d ? z : layer;
+                subs[nsub].layer = layer;
                 subs[nsub].data = buf;
                 subs[nsub].size = slice_bytes;
                 nsub++;
@@ -5193,7 +5217,7 @@ struct prog_shader_state {
     uint64_t vertex_sig;
     /* A recording can draw the same program into several target layouts
      * (scene + UI atlases), so keep one pipeline per layout/variant key. */
-#define NVN_PROG_PIPE_SLOTS 64
+#define NVN_PROG_PIPE_SLOTS 512
     GfxReflectedPipeline *pipes[NVN_PROG_PIPE_SLOTS];
     int pipe_fmt[NVN_PROG_PIPE_SLOTS];
     uint64_t pipe_layout_sig[NVN_PROG_PIPE_SLOTS];
@@ -7414,6 +7438,10 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
                                                          &nowned, sg->draw_count);
             if (getenv("TOTK_ANDROID_TRACE_SCENE_STEPS"))
                 fprintf(stderr, "[totk-scene-step] execute begin streams=%u\n", nstreams);
+            {
+                const char *ds = getenv("TOTK_ANDROID_SCENE_DELAY_US");
+                if (ds && *ds) usleep((useconds_t)strtoul(ds, NULL, 0));
+            }
             drew = gfx_backend_reflected_execute_ex(rp, rt, translated, count,
                                                     has_clear ? clear : NULL,
                                                     streams, nstreams);

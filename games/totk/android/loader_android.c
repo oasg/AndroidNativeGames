@@ -142,7 +142,10 @@ void runtime_thread_init(void) {
     gs->reserved[0] = TLS_CANARY;   /* crash-dump canary: "TLSOK" */
     pthread_once(&ipc_key_once, ipc_key_init);
     pthread_setspecific(runtime_keys[2], hc->guest_tlr);
-    const size_t hs = 1u << 20;
+    /* Vulkan/Adreno submission and shader setup run inside HLE gates on this
+     * stack.  1 MiB overflowed during the first 0x3f UI submit; the trace
+     * printing only masked it by changing frame layout. */
+    const size_t hs = 16u << 20;
     uint8_t *stack = mmap(NULL, hs, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     need(stack != MAP_FAILED, "host stack mmap");
     need(mprotect(stack, page_size(), PROT_NONE) == 0, "host stack guard");
@@ -472,6 +475,25 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
                 slots_read = crash_read((uintptr_t)(slots_at + 8), &ktls, 8);
                 crash_read((uintptr_t)(slots_at + 16), &ktlr, 8);
                 crash_read((uintptr_t)(slots_at + 0x18), &canary, 8);
+            }
+        }
+        if (rr[0] >= 0x1000) {
+            uint64_t w[32] = {0};
+            if (crash_read(rr[0], w, sizeof w)) {
+                fprintf(stderr, "[crash] x0[%#llx] +0x00:", (unsigned long long)rr[0]);
+                for (unsigned k = 0; k < 16; k++) fprintf(stderr, " %016llx", (unsigned long long)w[k]);
+                fprintf(stderr, "\n[crash] x0         +0x40:");
+                for (unsigned k = 8; k < 24; k++) fprintf(stderr, " %016llx", (unsigned long long)w[k]);
+                fputc('\n', stderr);
+                uint64_t node = w[13];   /* x0+0x68: second list head */
+                if (node >= 0x1000) {
+                    uint64_t nw[8] = {0};
+                    if (crash_read(node, nw, sizeof nw)) {
+                        fprintf(stderr, "[crash] node[%#llx]:", (unsigned long long)node);
+                        for (unsigned k = 0; k < 8; k++) fprintf(stderr, " %016llx", (unsigned long long)nw[k]);
+                        fputc('\n', stderr);
+                    }
+                }
             }
         }
         fprintf(stderr, "[crash] tls tp=%#llx slots=%#llx slots_ok=%d read=%d ktls=%#llx"
