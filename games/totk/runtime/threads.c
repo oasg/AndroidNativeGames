@@ -42,6 +42,11 @@
 #define R_BAD_HANDLE  0xE401u   // 114
 #define R_BAD_STATE   0xFA01u   // 125
 #define R_OUT_OF_RES  0xCE01u   // 103
+#ifndef GAME_BOTW
+/* The same Horizon kernel results are used by the Android core-mask checks. */
+#define R_BAD_CORE    0xE201u   // 113 InvalidCoreId
+#define R_BAD_COMBO   0xE801u   // 116 InvalidCombination
+#endif
 #ifdef GAME_BOTW
 #define R_BAD_CORE    0xE201u   // 113 InvalidCoreId
 #define R_BAD_COMBO   0xE801u   // 116 InvalidCombination
@@ -78,6 +83,12 @@ typedef struct thr {
     int cur_core;              // virtual core held while running guest code, -1 while blocked / not started
     int preempt;               // a higher-priority thread waits for this thread's core
     uint64_t cseq, core_since; struct thr *cnext;
+    uint64_t core_wait_ns;     // when this thread queued for a virtual core (0 while running / not queued)
+    uint64_t kick_ns;          // when this owner last got an asynchronous preemption kick (rate limit)
+    uint64_t stall_since;      // core_since of the last stall report for this owner (one report per stall)
+    uint64_t sample_pc, sample_lr, sample_fp;   // last diagnostic sample taken in the SIGUSR2 handler
+    int sample_top;            // that sample was original guest code at the top level
+    int sample_want;           // the stall watchdog asked for a sample
     uint32_t wh[4]; int nwh;   // handles of the current WaitSynchronization (state dump)
     int last_hle;              // 1 + wrapper index of the last host call made while "hletrace" was on (state dump)
     uint64_t yrun_ns, yrun_svc;   // the current run of yields: when it started, and nsvc at its last yield (yield_backoff_ns)
@@ -184,13 +195,38 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns);
 // GetCurrentCoreNumber without locks. Guest threads therefore hold one of the three application cores while they
 // run guest code; a core is given up only where Horizon would switch threads (waits, sleep, yield, exit, blocking
 // host services) and handed to the best waiting thread (lowest priority value, then first come). A thread that a
-// higher-priority waiter wants to preempt gives its core up at its next SVC. TOTK_FREE_CORES=1 disables this.
+// higher-priority waiter wants to preempt gives its core up at its next SVC.
+// TOTK_FREE_CORES=1 used to disable this and is now ignored (with a warning): with the virtual cores off, threads
+// created with core -1 reported an invalid core and several guest threads mutated the same per-core records, which
+// is the main+0x79a9a4 list crash (docs/android-hle-phase2b3-rendering.md 9.1).
 #define NCORE 3
 static thr_t *g_core_owner[NCORE];
 static thr_t *g_core_wait;
 static int g_cores_on = -1;
-static int cores_enabled(void) { if (g_cores_on < 0) g_cores_on = getenv("TOTK_FREE_CORES") ? 0 : 1; return g_cores_on; }
+static int cores_enabled(void) {
+    if (g_cores_on < 0) {
+        g_cores_on = 1;
+        if (getenv("TOTK_FREE_CORES"))
+            fprintf(stderr, "[threads] TOTK_FREE_CORES is ignored: virtual cores stay enabled "
+                            "(per-core identity, android-hle-phase2b3-rendering.md 9.1)\n");
+    }
+    return g_cores_on;
+}
 static int core_allowed(const thr_t *t, int c) { return (int)((t->mask >> c) & 1); }
+/* A virtual core number the guest may see: always one of the application cores 0..NCORE-1.  A thread blocked in a
+   host service (runtime_core_away) or one whose ideal core was never set falls back to its ideal core, clamped, so
+   GetCurrentProcessorNumber never returns -1/-2/-3 or a core the process does not have. */
+static int core_number_for(const thr_t *t) {
+    int c = t->cur_core >= 0 ? t->cur_core : t->core;
+    if (c < 0 || c >= NCORE) {
+        static int warned;
+        if (__atomic_fetch_add(&warned, 1, __ATOMIC_RELAXED) < 8)
+            fprintf(stderr, "[threads] virtual core %d for thread %#x is not an application core: reporting 0\n",
+                    c, t->handle);
+        c = 0;
+    }
+    return c;
+}
 #ifdef GAME_BOTW
 /* Priority inheritance (Breath of the Wild, botw.md): a thread that owns a guest mutex runs, for the virtual cores, at
    the priority of the best thread blocked on that mutex, as Horizon raises a mutex owner. The owner is read from the
@@ -237,12 +273,23 @@ static void core_grant(int c) {   // holding G: give free core c to the best wai
         if (core_allowed(*p, c) && (!b || (*p)->prio < b->prio || ((*p)->prio == b->prio && (*p)->cseq < b->cseq))) { b = *p; bp = p; }
 #endif
     if (!b) return;
-    *bp = b->cnext; b->cnext = NULL; b->cur_core = c; b->core_since = now_ns(); g_core_owner[c] = b; pthread_cond_signal(&b->cv);
+    *bp = b->cnext; b->cnext = NULL; b->cur_core = c; b->core_since = now_ns(); b->core_wait_ns = 0; g_core_owner[c] = b; pthread_cond_signal(&b->cv);
 }
 static void core_put(thr_t *t) {   // holding G
     if (t->cur_core < 0) return;
     int c = t->cur_core; t->cur_core = -1; t->preempt = 0; g_core_owner[c] = NULL; core_grant(c);
 }
+#ifndef GAME_BOTW
+/* The virtual-core rule of the non-BotW build (Android): a waiter whose numeric priority is lower beats the owner.
+   core_take kicks such owners; the SIGUSR2 handler and the SVC checkpoint re-check this instead of trusting a stale
+   preempt flag (the waiter may have gone away or changed priority meanwhile).  Holding G. */
+static int core_beats_plain(const thr_t *w, const thr_t *o) { return w->prio < o->prio; }
+static int core_should_yield_plain(const thr_t *t) {   // holding G
+    for (const thr_t *w = g_core_wait; w; w = w->cnext)
+        if (core_allowed(w, t->cur_core) && core_beats_plain(w, t)) return 1;
+    return 0;
+}
+#endif
 #ifdef GAME_BOTW
 /* Asynchronous preemption (Breath of the Wild, botw.md). Horizon switches a core to a better thread the moment that thread
    becomes ready, wherever the running one is. BotW's job workers spin on user-mode spinlocks without any SVC, so preempting
@@ -339,10 +386,17 @@ static void core_wait_report(const thr_t *w) {
 #endif
 #ifdef __ANDROID__
 static void android_preempt_kick(thr_t *o);
+static void stall_watchdog_start(void);
 #endif
 static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask is handed over
     if (!cores_enabled() || t->cur_core >= 0) return;
-    if (!(t->mask & ((1u << NCORE) - 1))) die("thread %#x core mask %#llx has no application core", t->handle, (unsigned long long)t->mask);
+    if (!(t->mask & ((1u << NCORE) - 1))) {   // defensive: an invalid mask must not kill the game
+        static int warned;
+        if (warned++ < 8)
+            fprintf(stderr, "[threads] thread %#x core mask %#llx has no application core: using all %d cores\n",
+                    t->handle, (unsigned long long)t->mask, NCORE);
+        t->mask = (1u << NCORE) - 1;
+    }
     int c = t->core >= 0 && t->core < NCORE && core_allowed(t, t->core) && !g_core_owner[t->core] ? t->core : -1;
     for (int i = 0; c < 0 && i < NCORE; i++) if (core_allowed(t, i) && !g_core_owner[i]) c = i;
 #ifdef GAME_BOTW
@@ -356,15 +410,15 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
     }
     t->cwait_ns = 0;
 #else
-    if (c >= 0) { t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
-    t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
+    if (c >= 0) { t->cur_core = c; t->core_since = now_ns(); t->core_wait_ns = 0; g_core_owner[c] = t; return; }
+    t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t; t->core_wait_ns = now_ns();
     while (t->cur_core < 0) {
         /* Re-check periodically, not only when this waiter first queues: the
          * owner may have acquired the core after the queue entry, and a guest
          * spinlock needs an asynchronous kick to give it up. */
         for (int i = 0; i < NCORE; i++)
             if (core_allowed(t, i) && g_core_owner[i] &&
-                g_core_owner[i]->prio > t->prio) {
+                core_beats_plain(t, g_core_owner[i])) {
                 g_core_owner[i]->preempt = 1;
 #ifdef __ANDROID__
                 android_preempt_kick(g_core_owner[i]);
@@ -376,6 +430,7 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
         if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
         pthread_cond_timedwait(&t->cv, &G, &ts);
     }
+    t->core_wait_ns = 0;
 #endif
 }
 static thr_t *me_or_null(void) { return g_keythr ? pthread_getspecific(g_keythr) : NULL; }
@@ -421,61 +476,142 @@ void runtime_core_checkpoint(void) {
     else t->preempt = 0;
     pthread_mutex_unlock(&G);
     return;
+#else
+    /* Same rule as the signal handler: re-check the wait queue, do not trust a stale preempt flag. */
+    if (!t || t->cur_core < 0 || !t->preempt) return;
+    pthread_mutex_lock(&G);
+    if (t->cur_core >= 0 && t->preempt && core_should_yield_plain(t)) { core_put(t); core_take(t); }
+    else t->preempt = 0;
+    pthread_mutex_unlock(&G);
 #endif
-    if (!t || !t->preempt) return;
-    pthread_mutex_lock(&G); t->preempt = 0; core_put(t); core_take(t); pthread_mutex_unlock(&G);
 }
 
 #ifdef __ANDROID__
 /* Android runs the guest threads as host pthreads and cannot use the Darwin
  * thread_suspend path.  A guest spinlock owner that never enters an SVC can
  * keep a core forever while a better thread waits for it (TOTK's UI loader
- * does exactly this).  A waiter signals the owner with SIGUSR2; the handler
- * only switches cores when the interrupted PC is original guest code at the
- * top level, so it never runs concurrently with a host HLE call. */
+ * does exactly this, docs/android-hle-phase2b3-rendering.md 9.4).  A waiter
+ * signals the owner with SIGUSR2; the handler switches cores only when the
+ * interrupted PC is original guest code at the top level (not a rewritten gate
+ * in the patch area, not an HLE host call), so it holds no host lock.
+ *
+ * The documented switch is TOTK_ANDROID_ASYNC_PREEMPT; TOTK_ASYNC_PREEMPT is
+ * still accepted for older scripts but the Android name wins and the log says
+ * which one was used.  Preemption is on by default.  TOTK_ANDROID_TRACE_PREEMPT
+ * adds per-kick lines (off by default).  TOTK_ANDROID_PREEMPT_KICK_MS is the
+ * per-owner kick interval (default 2 ms) so two waiters cannot storm an owner.
+ * The SIGUSR2 handler is also the sampling hook of the stall watchdog below. */
 extern int runtime_guest_top_level(uint64_t pc);
-static int g_android_async_preempt = -1;
-static uint64_t g_android_preempt_kicks, g_android_preempt_async;
+extern int runtime_guest_code_pc(uint64_t pc);
+int runtime_guest_chain(uint64_t lr, uint64_t fp, char *out, size_t cap);
+static int g_android_preempt_ready;
+static int g_android_signal_ok;        // SIGUSR2 handler installed
+static int g_android_async_preempt;    // kicks actually switch cores
+static int g_android_trace_preempt;    // TOTK_ANDROID_TRACE_PREEMPT
+static uint64_t g_android_preempt_kicks, g_android_preempt_suppressed, g_android_preempt_fail;
+static uint64_t g_android_preempt_async, g_android_preempt_not_top, g_android_preempt_busy;
+static uint64_t g_android_handler_entries, g_android_samples, g_android_trace_lines;
+static __thread int g_android_in_handler;
+static void android_preempt_signal(int sig, siginfo_t *si, void *ctx);
+static int android_async_preempt_init(void) {   // idempotent; first caller holds G
+    if (g_android_preempt_ready) return g_android_async_preempt;
+    g_android_preempt_ready = 1;
+    const char *a = getenv("TOTK_ANDROID_ASYNC_PREEMPT");
+    const char *b = getenv("TOTK_ASYNC_PREEMPT");
+    const char *used = "default";
+    int want = 1;
+    if (a && *a) { used = "TOTK_ANDROID_ASYNC_PREEMPT"; want = !(a[0] == '0' && a[1] == 0); }
+    else if (b && *b) { used = "TOTK_ASYNC_PREEMPT legacy"; want = !(b[0] == '0' && b[1] == 0); }
+    if (a && *a && b && *b) {
+        int av = !(a[0] == '0' && a[1] == 0), bv = !(b[0] == '0' && b[1] == 0);
+        if (av != bv)
+            fprintf(stderr, "[threads] TOTK_ANDROID_ASYNC_PREEMPT=%s wins over TOTK_ASYNC_PREEMPT=%s\n", a, b);
+    }
+    g_android_trace_preempt = getenv("TOTK_ANDROID_TRACE_PREEMPT") != NULL;
+    struct sigaction sa = {0};
+    sa.sa_sigaction = android_preempt_signal;
+    /* No SA_NODEFER: SIGUSR2 stays blocked while the handler runs, and the
+       explicit guard below covers a caller that changes the mask later. */
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaddset(&sa.sa_mask, SIGUSR2);
+    g_android_signal_ok = sigaction(SIGUSR2, &sa, NULL) == 0;
+    g_android_async_preempt = want && g_android_signal_ok;
+    char why[96];
+    if (want) snprintf(why, sizeof why, "%s", used);
+    else snprintf(why, sizeof why, "%s=0", used);
+    fprintf(stderr, "[threads] Android async core preemption: %s (%s); SIGUSR2 handler %s\n",
+            g_android_async_preempt ? "on" : "off", why,
+            g_android_signal_ok ? "installed" : "FAILED TO INSTALL");
+    return g_android_async_preempt;
+}
+static uint64_t android_kick_gap_ns(void) {
+    static int64_t v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_ANDROID_PREEMPT_KICK_MS");
+        v = e && *e ? atoll(e) * 1000000ll : 2000000ll;
+        if (v < 100000) v = 100000;   /* never below 0.1 ms */
+    }
+    return (uint64_t)v;
+}
 static void android_preempt_signal(int sig, siginfo_t *si, void *ctx) {
     (void)sig; (void)si;
+    if (g_android_in_handler) return;   /* never recurse, whatever the signal mask says */
+    g_android_in_handler = 1;
     thr_t *t = me_or_null();
-    if (!t || !__atomic_load_n(&t->preempt, __ATOMIC_ACQUIRE) || t->cur_core < 0) return;
-    uint64_t pc = (uint64_t)((ucontext_t *)ctx)->uc_mcontext.pc;
-    int top = runtime_guest_top_level(pc);
-    if (top && g_android_preempt_async < 8 && getenv("TOTK_ANDROID_TRACE_PREEMPT"))
-        fprintf(stderr, "[threads] preempt h=%#x pc=%#llx core=%d\n",
-                t->handle, (unsigned long long)pc, t->cur_core);
-    if (!top) return;
-    int saved = errno;
-    pthread_mutex_lock(&G);
-    if (t->cur_core >= 0 && t->preempt) {
-        core_put(t); core_take(t);
-        g_android_preempt_async++;
-    } else {
-        t->preempt = 0;
+    if (!t) goto out;
+    ucontext_t *u = ctx;
+    uint64_t pc = (uint64_t)u->uc_mcontext.pc;
+    __atomic_fetch_add(&g_android_handler_entries, 1, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&t->sample_want, __ATOMIC_ACQUIRE)) {   /* stall watchdog: sample wherever this thread is */
+        t->sample_pc = pc;
+        t->sample_lr = (uint64_t)u->uc_mcontext.regs[30];
+        t->sample_fp = (uint64_t)u->uc_mcontext.regs[29];
+        t->sample_top = runtime_guest_top_level(pc);
+        __atomic_store_n(&t->sample_want, 0, __ATOMIC_RELEASE);
+        __atomic_fetch_add(&g_android_samples, 1, __ATOMIC_RELAXED);
     }
-    pthread_mutex_unlock(&G);
+    if (!g_android_async_preempt) goto out;
+    if (!__atomic_load_n(&t->preempt, __ATOMIC_ACQUIRE) || t->cur_core < 0) goto out;
+    if (!runtime_guest_top_level(pc)) {   /* inside an HLE host call, a rewritten gate or host code */
+        __atomic_fetch_add(&g_android_preempt_not_top, 1, __ATOMIC_RELAXED);
+        if (g_android_trace_preempt && __atomic_fetch_add(&g_android_trace_lines, 1, __ATOMIC_RELAXED) < 64)
+            fprintf(stderr, "[threads] preempt skipped h=%#x pc=%#llx core=%d: not top-level guest code\n",
+                    t->handle, (unsigned long long)pc, t->cur_core);
+        goto out;
+    }
+    int saved = errno;
+    /* Never block in the handler: if G is held (by us or another thread) the next rate-limited kick retries. */
+    if (pthread_mutex_trylock(&G) == 0) {
+        if (t->cur_core >= 0 && t->preempt && core_should_yield_plain(t)) {
+            core_put(t); core_take(t);
+            __atomic_fetch_add(&g_android_preempt_async, 1, __ATOMIC_RELAXED);
+            if (g_android_trace_preempt && __atomic_fetch_add(&g_android_trace_lines, 1, __ATOMIC_RELAXED) < 64)
+                fprintf(stderr, "[threads] preempt h=%#x pc=%#llx core=%d: core given up\n",
+                        t->handle, (unsigned long long)pc, t->cur_core);
+        } else t->preempt = 0;
+        pthread_mutex_unlock(&G);
+    } else {
+        __atomic_fetch_add(&g_android_preempt_busy, 1, __ATOMIC_RELAXED);
+    }
     errno = saved;
+out:
+    g_android_in_handler = 0;
 }
 static void android_preempt_kick(thr_t *o) {   // holding G
-    if (g_android_async_preempt < 0) {
-        const char *e = getenv("TOTK_ANDROID_ASYNC_PREEMPT");
-        g_android_async_preempt = !(e && !strcmp(e, "0"));
-        if (g_android_async_preempt) {
-            struct sigaction a = {0};
-            a.sa_sigaction = android_preempt_signal;
-            a.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
-            sigemptyset(&a.sa_mask);
-            if (sigaction(SIGUSR2, &a, NULL)) g_android_async_preempt = 0;
-            fprintf(stderr, "[threads] Android async core preemption: %s\n",
-                    g_android_async_preempt ? "on" : "off");
-        }
+    android_async_preempt_init();
+    if (!g_android_async_preempt || !o || !o->pt || o->exited) return;
+    uint64_t now = now_ns();
+    if (o->kick_ns && now - o->kick_ns < android_kick_gap_ns()) {   /* one kick per owner per interval */
+        __atomic_fetch_add(&g_android_preempt_suppressed, 1, __ATOMIC_RELAXED);
+        return;
     }
-    if (!g_android_async_preempt || !o || !o->pt) return;
-    if (!pthread_kill(o->pt, SIGUSR2)) g_android_preempt_kicks++;
+    o->kick_ns = now;
+    if (!pthread_kill(o->pt, SIGUSR2)) __atomic_fetch_add(&g_android_preempt_kicks, 1, __ATOMIC_RELAXED);
+    else __atomic_fetch_add(&g_android_preempt_fail, 1, __ATOMIC_RELAXED);
 }
 #endif
-int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_core >= 0 ? t->cur_core : t->core) : -1; }
+int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? core_number_for(t) : -1; }
 
 static int64_t block(thr_t *t,int kind,int64_t ns) {
     if (ns == 0) return block_inner(t, kind, ns);
@@ -606,6 +742,10 @@ uint32_t svc_thread_main_init(void) {
     pthread_setspecific(g_keythr, t);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
+#ifdef __ANDROID__
+    android_async_preempt_init();   /* install SIGUSR2 before the first waiter needs it */
+    stall_watchdog_start();
+#endif
     return t->handle;
 }
 
@@ -796,7 +936,8 @@ int svc_thread(int num, uint64_t *regs) {
           if (c < 0 || c > 2) { free(t); regs[0] = R_BAD_CORE; return 1; }   // Horizon: only -2 is adjusted, other negatives are invalid here
           t->prio = (int)regs[4]; t->core = c; t->mask = 1ull << c; }
 #else
-        t->prio = (int)regs[4]; t->core = (int)regs[5]; t->mask = t->core >= 0 ? 1ull << t->core : 7;
+        { int c = (int)regs[5]; if (c < 0) c = -1;   // -1/-2/-3 all mean "no ideal core"; the mask stays all application cores
+          t->prio = (int)regs[4]; t->core = c; t->mask = c >= 0 ? 1ull << c : (1u << NCORE) - 1; }
 #endif
         t->born_ns = now_ns(); t->born_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
         pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
@@ -867,12 +1008,34 @@ int svc_thread(int num, uint64_t *regs) {
                            if (t == cur() && t->cur_core >= 0 && !core_allowed(t, t->cur_core)) { core_put(t); core_take(t); } }   // migrate off a core no longer allowed
                  regs[0] = r; pthread_mutex_unlock(&G); return 1; }
 #else
-        if (t) { int c = (int)regs[1]; if (c >= 0) t->core = c; else if (c == -1) t->core = 0; if (regs[2]) t->mask = regs[2];
+        /* Non-BotW build (Android): validate the ideal core and the mask instead of storing whatever the guest
+           passed.  An out-of-range ideal core or a mask without an application core used to reach core_take and
+           either report an invalid GetCurrentProcessorNumber or abort the run.  Rejections are logged (first 8). */
+        if (t) { int c = (int)regs[1]; uint64_t m = regs[2] ? regs[2] : t->mask; uint32_t r = 0;
+                 if (c < -3 || c >= NCORE) r = R_BAD_CORE;
+                 if (m & ~((1ull << NCORE) - 1)) {
+                     static int clamped;
+                     if (clamped++ < 8)
+                         fprintf(stderr, "[threads] SetThreadCoreMask h=%#x mask %#llx clamped to application cores\n",
+                                 t->handle, (unsigned long long)m);
+                     m &= (1ull << NCORE) - 1;
+                 }
+                 if (!r && !m) r = R_BAD_COMBO;
+                 if (!r && c >= 0 && !((m >> c) & 1)) r = R_BAD_COMBO;
+                 if (r) {
+                     static int rejected;
+                     if (rejected++ < 8)
+                         fprintf(stderr, "[threads] SetThreadCoreMask h=%#x ideal=%d mask=%#llx rejected %#x\n",
+                                 t->handle, c, (unsigned long long)m, r);
+                     regs[0] = r; pthread_mutex_unlock(&G); return 1;
+                 }
+                 if (c >= 0) t->core = c; else if (c == -1) t->core = 0;   /* -2/-3 keep the ideal core */
+                 t->mask = m;
                  if (t == cur() && t->cur_core >= 0 && !core_allowed(t, t->cur_core)) { core_put(t); core_take(t); } }   // migrate off a core no longer allowed
 #endif
         regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1;
     }
-    case 0x10: { thr_t *t = cur(); regs[0] = (uint64_t)(uint32_t)(t->cur_core >= 0 ? t->cur_core : t->core); return 1; }   // GetCurrentProcessorNumber
+    case 0x10: { thr_t *t = cur(); regs[0] = (uint64_t)(uint32_t)core_number_for(t); return 1; }   // GetCurrentProcessorNumber: always an application core 0..NCORE-1
     case 0x25: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? t->id : 0;pthread_mutex_unlock(&G); return 1; }
 
     case 0x1A: {  // ArbitrateLock(w0 持有者句柄, x1 地址, w2 本线程标签) | ArbitrateLock(w0 owner handle, x1 address, w2 this thread's tag)
@@ -1210,6 +1373,13 @@ static void *list_check(void *arg) {
         }
     }
 }
+static uint64_t thread_host_tid(pthread_t pt) {
+#ifdef __ANDROID__
+    return pt ? (uint64_t)pthread_gettid_np(pt) : 0;   /* the compat shim's pthread_threadid_np ignores its argument */
+#else
+    uint64_t id = 0; if (pt) pthread_threadid_np(pt, &id); return id;
+#endif
+}
 static void dump_threads(unsigned secs) {
     int locked = 0; for (int i = 0; i < 100 && !(locked = pthread_mutex_trylock(&G) == 0); i++) usleep(10000);
     fprintf(stderr, "[totk-dump] global thread lock %s\n", locked ? "acquired" : "HELD BY ANOTHER THREAD (dumping without it)");
@@ -1223,10 +1393,22 @@ static void dump_threads(unsigned secs) {
             (unsigned long long)g_preempt_kicks, (unsigned long long)g_preempt_async, (unsigned long long)g_starve_grants);
     for (thr_t *w = g_core_wait; w; w = w->cnext) if (eff_prio(w) != w->prio) fprintf(stderr, "[totk-dump] core waiter %#x runs at %d (owns a mutex a better thread waits for)\n", w->handle, eff_prio(w));
 #endif
+#ifdef __ANDROID__
+    fprintf(stderr, "[totk-dump] android preempt: kicks %llu (suppressed %llu, failed %llu), handler entries %llu,"
+                    " cores given up %llu, not-top-level %llu, G busy %llu, samples %llu\n",
+            (unsigned long long)__atomic_load_n(&g_android_preempt_kicks, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_android_preempt_suppressed, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_android_preempt_fail, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_android_handler_entries, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_android_preempt_async, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_android_preempt_not_top, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_android_preempt_busy, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_android_samples, __ATOMIC_RELAXED));
+#endif
     thr_t *run[64]; int nrun = 0;
     for (thr_t *t = g_all; t; t = t->all) {
         uint32_t word = 0; if (t->wkind == 1 && t->waddr) memcpy(&word, (const void *)(uintptr_t)t->waddr, 4);
-        uint64_t htid = 0; if (t->pt) pthread_threadid_np(t->pt, &htid);
+        uint64_t htid = thread_host_tid(t->pt);
         fprintf(stderr, "[totk-dump] tid=%llu ", (unsigned long long)htid);
         fprintf(stderr, "core=%d mask=%#llx ", t->cur_core, (unsigned long long)t->mask);
         fprintf(stderr, "h=%#x prio=%d %s wait=%d addr=%#llx key=%#llx tag=%#x word=%#x last_svc=%#x nsvc=%llu\n", t->handle, t->prio,
@@ -1257,6 +1439,140 @@ static void dump_threads(unsigned secs) {
     }
 #endif
 }
+#ifdef __ANDROID__
+/* ---- Core-occupancy stall diagnostics (Lane 3, Wave 1) -------------------
+   A guest spin loop can hold a core for tens of seconds without an SVC (the
+   remaining 39 s class in docs/android-hle-phase2b3-rendering.md 9.4).  The
+   asynchronous preemption above removes the common case; this watchdog reports
+   the rest once per stall instead of waiting for a crash dump.  It never blocks
+   on G (trylock only), never prints every second, and keeps the crash dump
+   path unchanged.  TOTK_ANDROID_STALL_MS tunes the threshold (default 5000,
+   0 disables). */
+#define STALL_REPORTS_MAX 16
+typedef struct {
+    int core, gone, moved, sample_top, prio, last_svc;
+    uint64_t handle, tid, mask, held_ns, nsvc, pc, lr, fp;
+    uint64_t last_lr, last_fp;   /* the owner's last SVC site, a fallback guest chain */
+    int nwait;
+    struct { uint64_t handle, tid, mask, waited_ns, last_lr; int prio, last_svc; } w[4];
+} stall_info_t;
+static uint64_t stall_threshold_ns(void) {
+    static int64_t v = -1;
+    if (v < 0) {
+        const char *e = getenv("TOTK_ANDROID_STALL_MS");
+        v = e && *e ? atoll(e) * 1000000ll : 5000000000ll;
+        if (v && v < 500000000ll) v = 500000000ll;   /* never below 0.5 s */
+    }
+    return (uint64_t)v;
+}
+static int stall_in_all(const thr_t *p) {   // holding G: is p still a live thread object?
+    for (const thr_t *t = g_all; t; t = t->all) if (t == p) return 1;
+    return 0;
+}
+static void *stall_watchdog(void *unused) {
+    (void)unused;
+    uint64_t threshold = stall_threshold_ns();
+    unsigned reports = 0;
+    while (reports < STALL_REPORTS_MAX) {
+        struct timespec tick = {0, 250000000};
+        nanosleep(&tick, NULL);
+        if (pthread_mutex_trylock(&G)) continue;
+        uint64_t now = now_ns();
+        thr_t *o = NULL; int oc = -1; uint64_t best = threshold;
+        for (int c = 0; c < NCORE; c++) {
+            thr_t *x = g_core_owner[c];
+            if (!x || x->exited || x->stall_since == x->core_since) continue;
+            uint64_t held = now - x->core_since;
+            if (held >= best) { best = held; o = x; oc = c; }
+        }
+        if (!o) { pthread_mutex_unlock(&G); continue; }
+        o->stall_since = o->core_since;   /* claim this stall: one report */
+        o->sample_pc = 0;
+        __atomic_store_n(&o->sample_want, 1, __ATOMIC_RELEASE);
+        if (g_android_signal_ok && o->pt) pthread_kill(o->pt, SIGUSR2);
+        pthread_mutex_unlock(&G);
+        usleep(3000);   /* let the handler run on the owner */
+        stall_info_t si;
+        memset(&si, 0, sizeof si);
+        si.core = oc;
+        si.held_ns = best;   /* occupancy observed when the stall was claimed */
+        int locked = 0;
+        for (int i = 0; i < 20 && !locked; i++) { locked = pthread_mutex_trylock(&G) == 0; if (!locked) usleep(1000); }
+        if (locked) {
+            if (stall_in_all(o)) {
+                si.handle = o->handle; si.tid = thread_host_tid(o->pt); si.prio = o->prio;
+                si.mask = o->mask; si.nsvc = o->nsvc;
+                si.last_svc = o->last_svc;
+                si.last_lr = o->last_lr; si.last_fp = o->last_fp;
+                /* The owner may have given the core up between the sample
+                   request and this read: then the sampled PC describes the
+                   time after the stall, not the stall itself. */
+                if (g_core_owner[oc] != o || o->cur_core != oc) si.moved = 1;
+                if (!__atomic_load_n(&o->sample_want, __ATOMIC_ACQUIRE)) {
+                    si.pc = __atomic_load_n(&o->sample_pc, __ATOMIC_RELAXED);
+                    si.lr = __atomic_load_n(&o->sample_lr, __ATOMIC_RELAXED);
+                    si.fp = __atomic_load_n(&o->sample_fp, __ATOMIC_RELAXED);
+                    si.sample_top = o->sample_top;
+                }
+                for (thr_t *w = g_core_wait; w && si.nwait < 4; w = w->cnext) {
+                    if (!core_allowed(w, oc)) continue;
+                    si.w[si.nwait].handle = w->handle; si.w[si.nwait].tid = thread_host_tid(w->pt);
+                    si.w[si.nwait].mask = w->mask; si.w[si.nwait].prio = w->prio;
+                    si.w[si.nwait].last_svc = w->last_svc; si.w[si.nwait].last_lr = w->last_lr;
+                    si.w[si.nwait].waited_ns = w->core_wait_ns ? now_ns() - w->core_wait_ns : 0;
+                    si.nwait++;
+                }
+            } else si.gone = 1;
+            pthread_mutex_unlock(&G);
+        }
+        reports++;
+        char where[160];
+        if (si.gone) { fprintf(stderr, "[totk-stall] core %d: owner left while sampling\n", si.core); continue; }
+        if (!si.handle) { fprintf(stderr, "[totk-stall] core %d: no sample (G busy)\n", si.core); continue; }
+        fprintf(stderr, "[totk-stall] core %d held %.1f s: owner h=%#x tid=%llu prio=%d mask=%#llx nsvc=%llu last_svc=%#x\n",
+                si.core, si.held_ns / 1e9, (unsigned)si.handle, (unsigned long long)si.tid, si.prio,
+                (unsigned long long)si.mask, (unsigned long long)si.nsvc, si.last_svc);
+        if (si.pc) {
+            char lr[96] = "?"; runtime_describe_address(si.pc, where, sizeof where);
+            runtime_describe_address(si.lr, lr, sizeof lr);
+            fprintf(stderr, "[totk-stall]   owner pc=%s lr=%s guest=%d top_level=%d%s\n",
+                    where, lr, runtime_guest_code_pc(si.pc), si.sample_top,
+                    si.moved ? " (sampled after the owner left the core)" : "");
+            uint64_t clr = si.lr, cfp = si.fp;
+            const char *from = "sampled";
+            if (!si.sample_top || si.moved) { clr = si.last_lr; cfp = si.last_fp; from = "last SVC"; }
+            if (clr) {
+                char chain[512];
+                runtime_guest_chain(clr, cfp, chain, sizeof chain);
+                fprintf(stderr, "[totk-stall]   owner guest chain (%s): %s\n", from, chain);
+            }
+        } else {
+            fprintf(stderr, "[totk-stall]   owner pc=no sample (signal not delivered yet)\n");
+        }
+        for (int i = 0; i < si.nwait; i++) {
+            char site[96] = "?"; runtime_describe_address(si.w[i].last_lr, site, sizeof site);
+            fprintf(stderr, "[totk-stall]   waiter h=%#x tid=%llu prio=%d mask=%#llx waited=%.1f s last_svc=%#x svc_site=%s\n",
+                    (unsigned)si.w[i].handle, (unsigned long long)si.w[i].tid, si.w[i].prio,
+                    (unsigned long long)si.w[i].mask, si.w[i].waited_ns / 1e9, si.w[i].last_svc, site);
+        }
+        if (!si.nwait) fprintf(stderr, "[totk-stall]   waiters: none (no thread is queued for this core)\n");
+    }
+    return NULL;
+}
+static void stall_watchdog_start(void) {
+    static int started;
+    if (started) return;
+    started = 1;
+    uint64_t threshold = stall_threshold_ns();
+    if (!threshold) { fprintf(stderr, "[threads] core stall diagnostics: off (TOTK_ANDROID_STALL_MS=0)\n"); return; }
+    pthread_t th;
+    if (!pthread_create(&th, NULL, stall_watchdog, NULL)) {
+        pthread_detach(th);
+        fprintf(stderr, "[threads] core stall diagnostics: on (owner held > %.1f s, TOTK_ANDROID_STALL_MS)\n",
+                threshold / 1e9);
+    }
+}
+#endif
 /* Low-noise probe for first-frame tracing: where is a guest thread now?
  * Returns 0 when the thread is gone or the global lock is busy; the caller
  * must not block a recording/submit path on the diagnostic. */

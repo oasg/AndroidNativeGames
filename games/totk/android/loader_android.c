@@ -414,7 +414,10 @@ int runtime_guest_top_level(uint64_t pc) {
     uintptr_t tp;
     __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
     uint64_t off = __atomic_load_n(&runtime_host_ctx_off, __ATOMIC_RELAXED);
-    if (!off) return 1;
+    /* Not initialised (or a host thread): the host-stack slot cannot prove
+     * this is top-level guest code, so never preempt.  The old code returned 1
+     * here, which would let SIGUSR2 take the global lock from a host frame. */
+    if (!off || !tp) return 0;
     HostContext *hc = *(HostContext **)(tp + off);
     return hc && hc->host_stack_top != 0;
 }
@@ -497,6 +500,34 @@ void runtime_guest_frame_report(uint64_t fp, uint64_t lr) {
         if (!pair[0] || (pair[0] & 7) || pair[0] <= chain_fp) break;
         chain_fp = pair[0];
     }
+}
+
+/* One-line guest frame chain for the core-stall watchdog (threads.c).  Runs on
+ * an ordinary thread, not in a signal handler; /proc/self/mem turns a stale
+ * frame pointer into a short read instead of a nested SIGSEGV. */
+static void chain_append(char *out, size_t cap, size_t *n, const char *s) {
+    if (*n >= cap) return;
+    int k = snprintf(out + *n, cap - *n, "%s", s);
+    if (k > 0) *n += (size_t)k;
+    if (*n > cap) *n = cap;
+}
+int runtime_guest_chain(uint64_t lr, uint64_t fp, char *out, size_t cap) {
+    if (!out || !cap) return 0;
+    size_t n = 0;
+    char d[128];
+    describe_address(lr, d, sizeof d);
+    chain_append(out, cap, &n, d);
+    uint64_t chain_fp = fp;
+    for (unsigned i = 0; i < 12 && chain_fp && !(chain_fp & 7); i++) {
+        uint64_t pair[2];
+        if (!crash_read(chain_fp, pair, sizeof pair)) break;
+        describe_address(pair[1], d, sizeof d);
+        chain_append(out, cap, &n, " <- ");
+        chain_append(out, cap, &n, d);
+        if (!pair[0] || (pair[0] & 7) || pair[0] <= chain_fp) break;
+        chain_fp = pair[0];
+    }
+    return 1;
 }
 
 const char *runtime_nvn_last_api(void);
