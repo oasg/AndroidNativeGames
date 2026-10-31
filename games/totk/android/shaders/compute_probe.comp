@@ -1,0 +1,31 @@
+#version 450
+/* Repository-owned compute probe (no game data).
+ *
+ * Writes a deterministic uint pattern into the SSBO and samples a small
+ * RGBA8 texture.  Descriptor set 0 matches the backend's GfxBindingSpec
+ * reflection: 0 = UBO, 1 = SSBO, 2 = combined image sampler.
+ */
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform Params {
+    uint width;
+    uint height;
+    uint seed;
+    uint pad;
+    vec4 scale;
+} pc;
+
+layout(set = 0, binding = 1) buffer Out {
+    uint values[];
+} out_buf;
+
+layout(set = 0, binding = 2) uniform sampler2D src_tex;
+
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.width || p.y >= pc.height) return;
+    uint idx = p.y * pc.width + p.x;
+    uint texv = uint(round(texelFetch(src_tex, ivec2(p) & ivec2(3), 0).r * 255.0));
+    uint v = (p.x + 1u) * 3u + (p.y + 1u) * 5u + pc.seed + texv * 7u;
+    out_buf.values[idx] = v;
+}
