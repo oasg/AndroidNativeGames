@@ -1374,11 +1374,9 @@ static void *list_check(void *arg) {
     }
 }
 static uint64_t thread_host_tid(pthread_t pt) {
-#ifdef __ANDROID__
-    return pt ? (uint64_t)pthread_gettid_np(pt) : 0;   /* the compat shim's pthread_threadid_np ignores its argument */
-#else
-    uint64_t id = 0; if (pt) pthread_threadid_np(pt, &id); return id;
-#endif
+    uint64_t id = 0;
+    if (pt) pthread_threadid_np(pt, &id);
+    return id;
 }
 static void dump_threads(unsigned secs) {
     int locked = 0; for (int i = 0; i < 100 && !(locked = pthread_mutex_trylock(&G) == 0); i++) usleep(10000);
