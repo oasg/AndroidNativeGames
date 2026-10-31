@@ -669,8 +669,34 @@ Host-side work in this round:
   connects the JoyDual/JoyLeft/JoyRight states, so a title that polls one of
   those sees the scripted A/Plus.
 
-No 3D draw list to `0x3f` is recorded in this state.  A 1.0.0 save is still
-absent; the 1.4.3 macOS save is incompatible and crashes a worker.
+A genuine **Yuzu 1.0.0 save** was then imported (profile
+`F9CDD55B6D4C70EFC1C8E47378DAD985`, slots 00/01/02).  It is readable:
+`slot_NN/caption.sav`, `direct_file_save_related.sav`, etc. are opened, and the
+save-data format matches the 1.0.0 header (`progress.sav c8c34600`).  The 1.4.3
+macOS save remains incompatible.
+
+The save path exposed two real host bugs that are now fixed:
+
+- **`NVNprogram` ABI**: the guest object is `{magic, nstage,
+  NVNshaderData sd[6], serial}` (interleaved data/control, `sd[2]` at
+  `0x28/0x30`, `serial` at `0x68`, 112 bytes).  The Android host had
+  `data[6]` + `control[6]` plus host pointers inside the guest object, which
+  made the save/UI code dereference a null `sd[2].control`.  Host pipeline/
+  texture state now lives in a side map; `probe-nvn-prog-abi` covers the ABI.
+- **compute shader magic**: save/UI compute shaders use SPH magic
+  `0x12345679` (graphics uses `0x12345678`).  The BAHS resolver now accepts the
+  compute magic and caches the UI compute keys.
+- **sparse MRT**: the guest binds slots `0,1,null,3,null,5,null,7`; the
+  resolver treated null gaps as textures.  `probe-nvn-sparse-targets` covers
+  the active-slot/dummy-gap path.
+- **pipeline compile stack**: Adreno's LLVM compiler overflowed the 1 MiB guest
+  stack while creating a UI state variant.  Pipeline creation now runs on a
+  32 MiB host stack; `probe-vulkan-bc4-mips` covers 512x512 BC4 with 10 mips.
+
+After these fixes a save run reaches 804–1372 presents without the previous
+crashes.  The final window PPM is still black and no 1920x1080 `0x3f` pass is
+submitted: the remaining gap is the title/save-slot UI/composite path and the
+Continue input transition, not the save format or device ABI.
 
 Remaining first-frame/scene work:
 
