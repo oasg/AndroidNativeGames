@@ -36,9 +36,51 @@ The "9015" figure in the task brief is the sum of several work trees
 mirrors).  The live `shader-cache` root used by the runtime contains 5,819
 `.spv` files.  Nine canonical modules have no `.res.json` (vs 8, ps 1); they
 still create a `VkShaderModule` but cannot provide descriptor reflection.
+They are all synthetic `probe-nvn-state` selftest entries, not game modules;
+section 1.1 lists them and the UI-path verdict.
 
 All 5,819 files passed `vkCreateShaderModule` on the Adreno 830; see
 `docs/android-shader-cache-flow.md` section 7.2 for the probe output.
+
+### 1.1 Canonical modules without `.res.json`
+
+The nine files are `<stage>/<key>.spv` under the live cache root:
+
+| stage | key | filename | synthetic source | UI path? | recovery |
+| --- | --- | --- | --- | --- | --- |
+| vs | `00c212f732855a11dd1d9774e3663216d2bb1b98c82cd9ba98ad0322e758f723` | `vs/00c212f732855a11dd1d9774e3663216d2bb1b98c82cd9ba98ad0322e758f723.spv` | `nvn_probe_pair_load()` tag 0x90 | no | not recoverable from a dump |
+| vs | `4ce76f1f469624df9248f099b647aa3ae4ab03738712fa5cb8237a178b77dbe9` | `vs/4ce76f1f469624df9248f099b647aa3ae4ab03738712fa5cb8237a178b77dbe9.spv` | tag 0x80 | no | not recoverable from a dump |
+| vs | `74142a5d3aa6d01c753659096561e2b80ac6b58f6cdaf46bdb7668f52df37769` | `vs/74142a5d3aa6d01c753659096561e2b80ac6b58f6cdaf46bdb7668f52df37769.spv` | tag 0x50 | no | not recoverable from a dump |
+| vs | `76340a07db3800d86df452c769178d2e0463403086520c7287f217c956735506` | `vs/76340a07db3800d86df452c769178d2e0463403086520c7287f217c956735506.spv` | tag 0x40 | no | not recoverable from a dump |
+| vs | `9ac58c71fd3940914153f1da646b3a9cbc6c545f5def1b51554226e83ac71490` | `vs/9ac58c71fd3940914153f1da646b3a9cbc6c545f5def1b51554226e83ac71490.spv` | tag 0x70 | no | not recoverable from a dump |
+| vs | `a0e2b6aaa7c8fcb8298b20e9684b985a51a44787630ad30c9e3153b0b218498d` | `vs/a0e2b6aaa7c8fcb8298b20e9684b985a51a44787630ad30c9e3153b0b218498d.spv` | tag 0x60 | no | not recoverable from a dump |
+| vs | `efcbbc24f24ef09d47ed7d65ee36bb6d88bb476421dc0de41111ea5fd26eab46` | `vs/efcbbc24f24ef09d47ed7d65ee36bb6d88bb476421dc0de41111ea5fd26eab46.spv` | tag 0x30 | no | not recoverable from a dump |
+| vs | `fe49faa860af26cf573615994503e31b4013d4a0d32d568ac50b28100bfb9e13` | `vs/fe49faa860af26cf573615994503e31b4013d4a0d32d568ac50b28100bfb9e13.spv` | tag 0xA0 | no | not recoverable from a dump |
+| ps | `f5262785ce537de20be020f0e395dc1501a3e006ada9962b96f31daef797db5f` | `ps/f5262785ce537de20be020f0e395dc1501a3e006ada9962b96f31daef797db5f.spv` | tag 0xA0 | no | not recoverable from a dump |
+
+Evidence that these are not on the title/save-slot UI path:
+
+- the keys are the exact deterministic hashes produced by
+  `nvn_probe_pair_load()` in `runtime_nvn_state_selftest()` for tags
+  `0x30..0x90` (stage 0) and `0xA0` (both stages); the code bytes are
+  `tag + stage * 0x40`, the control block is the synthetic 0x880/0x100 pair;
+- the same nine `.spv` files exist byte-for-byte in `probe-cache2`, `pc2` and
+  `pcs` (synthetic probe trees); `sha256` matches the live cache for all nine;
+- none of the nine keys occurs in any of the 508 `.log` files under
+  `/data/local/tmp/totk-android/lanes` (4.0 GB, including the 170 shader-cache
+  logs and the 3.1 GB `svc.log`/`svc2.log`); 0 occurrences;
+- none of the nine has a `<key>.ctl`/`<key>.code` pair in any
+  `shader-dump*`/`missdump*` directory (0 pairs); they are not in
+  `translation-report.json`, which was built from the game UI dump.
+
+Why no `.res.json` can be regenerated: `nvn_probe_pair_load()` passes
+`NULL` for the vertex-stage `res_json` on every tag, and `NULL` for both
+stages on tag `0xA0`.  There is no dumped NVN control/code pair to feed to
+`translate_dump.py`; the control/code are generated in memory by the probe.
+Fabricating a reflection from the probe's other stage or from the built-in
+triangle module would invent descriptor data, so this audit leaves the files
+as-is.  They are unused synthetic entries and can be deleted from the live
+cache without changing the UI path; the audit did not modify the cache.
 
 ## 2. Compute (`cs`) reflection
 
@@ -255,3 +297,8 @@ storage_image_modules=0 missing=0 problems=0
 A non-zero exit means a missing canonical key, a bad SPIR-V header, a missing
 `.res.json` (unless `--no-verify`) or a `res.json.key` mismatch.  The tool never
 writes to the cache.
+
+A full-cache audit with the default verification reports the nine synthetic
+`probe-nvn-state` modules from section 1.1 as `missing .res.json`.  That is
+expected; use `--no-verify` when auditing the whole live root for game
+coverage, or keep the `--stage cs` invocation above for the compute audit.
