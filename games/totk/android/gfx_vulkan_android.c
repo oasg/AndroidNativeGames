@@ -17,11 +17,15 @@
 #include <android/native_window.h>
 
 #include "gfx_backend_android.h"
+#include "gfx_compute_spv.h"
+#include "probe_hooks_android.h"
 #include "triangle_spv.h"
 
 #include <pthread.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <time.h>
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
@@ -2657,6 +2661,8 @@ struct GfxTexture {
     VkImageViewType view_type;
     VkImageLayout layout;
     int readback_ok;
+    int transfer_dst_ok;
+    int storage_ok;
 };
 
 static void vk_mip_extent(const GfxTextureDesc *d, uint32_t level,
@@ -2799,11 +2805,17 @@ static GfxTexture *texture_create_desc_locked(const GfxTextureDesc *desc,
     t->layout = VK_IMAGE_LAYOUT_UNDEFINED;
     t->readback_ok = samples == VK_SAMPLE_COUNT_1_BIT &&
                      (features & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) != 0;
+    t->transfer_dst_ok = samples == VK_SAMPLE_COUNT_1_BIT &&
+                         (features & VK_FORMAT_FEATURE_TRANSFER_DST_BIT) != 0;
+    t->storage_ok = samples == VK_SAMPLE_COUNT_1_BIT &&
+                    !vk_format_is_compressed(fmt) && !vk_format_is_depth(fmt) &&
+                    (features & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
 
     VkImageUsageFlags usage;
     if (samples == VK_SAMPLE_COUNT_1_BIT) {
         usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (t->readback_ok) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if (t->storage_ok) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     } else {
         usage = VK_IMAGE_USAGE_SAMPLED_BIT;
         if (vk_format_is_color_target(fmt)) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -5686,4 +5698,1704 @@ int gfx_backend_selftest(void) {
            ok ? "PASS" : "FAIL", px[0], px[1], px[2], px[3], g.props.deviceName);
     gfx_backend_offscreen_destroy(t);
     return ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* Compute and texture transfer (Wave 0 contract).
+ *
+ * All entry points below are synchronous: they submit and wait before
+ * returning.  Failures are explicit (0/NULL) and never reported as success.
+ */
+
+#define GFX_COMPUTE_MAX_BINDINGS 64
+
+static double vk_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
+
+static void vk_texture_level_extent(const GfxTexture *t, uint32_t level,
+                                    uint32_t *w, uint32_t *h, uint32_t *d) {
+    *w = t->width >> level; if (!*w) *w = 1;
+    *h = t->height >> level; if (!*h) *h = 1;
+    *d = t->target == GFX_TEXTURE_3D ? (t->depth >> level) : 1;
+    if (!*d) *d = 1;
+}
+
+/* Clamp one axis of a region to [0, extent).  A negative start is cut from
+ * the region (the caller sees how many texels were skipped through `cut`).
+ * A zero length means "to the edge".  Returns 0 when nothing remains. */
+static int vk_clamp_axis(int32_t *pos, uint32_t *len, uint32_t extent, uint32_t *cut) {
+    int64_t p = *pos;
+    uint32_t l = *len;
+    uint32_t c = 0;
+    if (p < 0) {
+        uint64_t skip = (uint64_t)(-p);
+        if (skip >= l) return 0;
+        c = (uint32_t)skip;
+        p = 0;
+        l -= c;
+    }
+    if ((uint64_t)p >= extent) return 0;
+    if (l == 0) l = extent - (uint32_t)p;
+    else if ((uint64_t)p + l > extent) l = extent - (uint32_t)p;
+    if (!l) return 0;
+    *pos = (int32_t)p;
+    *len = l;
+    if (cut) *cut = c;
+    return 1;
+}
+
+static int vk_clamp_region(int32_t *x, int32_t *y, int32_t *z,
+                           uint32_t *w, uint32_t *h, uint32_t *d,
+                           uint32_t ew, uint32_t eh, uint32_t ed,
+                           uint32_t *cx, uint32_t *cy, uint32_t *cz) {
+    uint32_t ax = 0, ay = 0, az = 0;
+    if (!vk_clamp_axis(x, w, ew, &ax) ||
+        !vk_clamp_axis(y, h, eh, &ay) ||
+        !vk_clamp_axis(z, d, ed, &az))
+        return 0;
+    if (cx) *cx = ax;
+    if (cy) *cy = ay;
+    if (cz) *cz = az;
+    return 1;
+}
+
+static int vk_texture_transfer_check(const GfxTexture *t, uint32_t level, uint32_t layer,
+                                     const char *what, int need_dst) {
+    if (!t) return 0;
+    if (level >= t->mip_levels || layer >= t->array_layers) {
+        vk_log("ERROR %s: level=%u/%u layer=%u/%u", what, level, t->mip_levels,
+               layer, t->array_layers);
+        return 0;
+    }
+    if (t->target == GFX_TEXTURE_3D && layer != 0) {
+        vk_log("ERROR %s: 3D texture layer must be 0 (got %u)", what, layer);
+        return 0;
+    }
+    if (t->samples != 1) {
+        vk_log("ERROR %s: %u-sample texture is unsupported", what, t->samples);
+        return 0;
+    }
+    if (vk_format_is_depth(t->format) || t->format == VK_FORMAT_S8_UINT) {
+        vk_log("ERROR %s: depth/stencil format %s is unsupported", what,
+               vk_format_name(t->format));
+        return 0;
+    }
+    if (need_dst && !t->transfer_dst_ok) {
+        vk_log("ERROR %s: %s was created without transfer-dst support", what,
+               vk_format_name(t->format));
+        return 0;
+    }
+    return 1;
+}
+
+static int vk_texture_region_check_blocks(const GfxTexture *t, int32_t x, int32_t y,
+                                          int32_t z, uint32_t w, uint32_t h,
+                                          const char *what) {
+    uint32_t bw = 0, bh = 0, bytes = 0;
+    if (!vk_format_block(t->format, &bw, &bh, &bytes)) return 0;
+    if (bw == 1 && bh == 1) return 1;
+    if ((x % (int32_t)bw) || (y % (int32_t)bh) || (w % bw) || (h % bh) || z) {
+        vk_log("ERROR %s: compressed %s region needs %ux%u alignment "
+               "(x=%d y=%d z=%d w=%u h=%u)", what, vk_format_name(t->format),
+               bw, bh, x, y, z, w, h);
+        return 0;
+    }
+    return 1;
+}
+
+static int vk_format_can_blit(VkFormat f, int dst) {
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(g.phys, f, &fp);
+    VkFormatFeatureFlags need = dst ? VK_FORMAT_FEATURE_BLIT_DST_BIT
+                                    : VK_FORMAT_FEATURE_BLIT_SRC_BIT;
+    return (fp.optimalTilingFeatures & need) == need;
+}
+
+static uint8_t vk_unorm8(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+/* Pack a clear colour for the sub-region path, which has to go through a
+ * staging buffer because vkCmdClearColorImage only clears whole
+ * subresources.  Unsupported formats are rejected explicitly; the whole-level
+ * path still uses vkCmdClearColorImage for any colour format. */
+static int vk_pack_clear_texel(VkFormat fmt, const float rgba[4],
+                               uint8_t *out, uint32_t *bpp) {
+    VkFormatInfo info = vk_format_info(fmt);
+    if (!info.bpp || vk_format_is_compressed(fmt) || vk_format_is_depth(fmt) ||
+        fmt == VK_FORMAT_S8_UINT)
+        return 0;
+    *bpp = info.bpp;
+    memset(out, 0, info.bpp);
+    switch (fmt) {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+        out[0] = vk_unorm8(rgba[0]);
+        out[1] = vk_unorm8(rgba[1]);
+        out[2] = vk_unorm8(rgba[2]);
+        out[3] = vk_unorm8(rgba[3]);
+        return 1;
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+        out[0] = vk_unorm8(rgba[2]);
+        out[1] = vk_unorm8(rgba[1]);
+        out[2] = vk_unorm8(rgba[0]);
+        out[3] = vk_unorm8(rgba[3]);
+        return 1;
+    case VK_FORMAT_R8_UNORM:
+        out[0] = vk_unorm8(rgba[0]);
+        return 1;
+    case VK_FORMAT_R8G8_UNORM:
+        out[0] = vk_unorm8(rgba[0]);
+        out[1] = vk_unorm8(rgba[1]);
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+int gfx_backend_texture_copy(GfxTexture *dst, uint32_t dst_level, uint32_t dst_layer,
+                             int32_t dst_x, int32_t dst_y, int32_t dst_z,
+                             const GfxTexture *src, uint32_t src_level, uint32_t src_layer,
+                             int32_t src_x, int32_t src_y, int32_t src_z,
+                             uint32_t width, uint32_t height, uint32_t depth) {
+    if (!dst || !src) return 0;
+    pthread_mutex_lock(&g_lock);
+    if (!g.ready || !g.cmd) { pthread_mutex_unlock(&g_lock); return 0; }
+
+    int ok = 0;
+    VkCommandBuffer cmd = g.cmd;
+    uint32_t sw = 0, sh = 0, sd = 0, dw = 0, dh = 0, dd = 0;
+    if (!vk_texture_transfer_check(dst, dst_level, dst_layer, "texture copy dst", 1) ||
+        !vk_texture_transfer_check(src, src_level, src_layer, "texture copy src", 0))
+        goto out;
+    if (!src->readback_ok) {
+        vk_log("ERROR texture copy: src %s was created without transfer-src support",
+               vk_format_name(src->format));
+        goto out;
+    }
+    if ((dst->target != GFX_TEXTURE_3D && (dst_z != 0 || depth > 1)) ||
+        (src->target != GFX_TEXTURE_3D && (src_z != 0 || depth > 1))) {
+        vk_log("ERROR texture copy: 2D/array region needs z=0 depth<=1 "
+               "(dst z=%d depth=%u src z=%d)", dst_z, depth, src_z);
+        goto out;
+    }
+    vk_texture_level_extent(src, src_level, &sw, &sh, &sd);
+    vk_texture_level_extent(dst, dst_level, &dw, &dh, &dd);
+    uint32_t cw = width, ch = height, cd = depth;
+    uint32_t dw2 = cw, dh2 = ch, dd2 = cd;
+    if (!vk_clamp_region(&src_x, &src_y, &src_z, &cw, &ch, &cd,
+                         sw, sh, sd, NULL, NULL, NULL)) {
+        vk_log("ERROR texture copy: source region is outside %ux%ux%u", sw, sh, sd);
+        goto out;
+    }
+    if (!vk_clamp_region(&dst_x, &dst_y, &dst_z, &dw2, &dh2, &dd2,
+                         dw, dh, dd, NULL, NULL, NULL)) {
+        vk_log("ERROR texture copy: destination region is outside %ux%ux%u", dw, dh, dd);
+        goto out;
+    }
+    if (dw2 < cw) cw = dw2;
+    if (dh2 < ch) ch = dh2;
+    if (dd2 < cd) cd = dd2;
+    if (!cw || !ch || !cd) {
+        vk_log("ERROR texture copy: empty clamped region");
+        goto out;
+    }
+    if (!vk_texture_region_check_blocks(src, src_x, src_y, src_z, cw, ch, "texture copy src") ||
+        !vk_texture_region_check_blocks(dst, dst_x, dst_y, dst_z, cw, ch, "texture copy dst"))
+        goto out;
+
+    int same_format = src->format == dst->format;
+    int same_image = src == dst;
+    if (!same_format) {
+        if (vk_format_is_compressed(src->format) || vk_format_is_compressed(dst->format)) {
+            vk_log("ERROR texture copy: compressed format conversion %s -> %s is unsupported",
+                   vk_format_name(src->format), vk_format_name(dst->format));
+            goto out;
+        }
+        if (!vk_format_can_blit(src->format, 0) || !vk_format_can_blit(dst->format, 1)) {
+            vk_log("ERROR texture copy: blit %s -> %s lacks BLIT_SRC/BLIT_DST",
+                   vk_format_name(src->format), vk_format_name(dst->format));
+            goto out;
+        }
+    }
+
+    VkCommandBufferBeginInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    if (!vk_ok(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer(texture copy)"))
+        goto out;
+
+    VkImageAspectFlags src_aspect = vk_format_copy_aspect(src->format);
+    VkImageAspectFlags dst_aspect = vk_format_copy_aspect(dst->format);
+    VkImageLayout src_layout = same_image ? VK_IMAGE_LAYOUT_GENERAL
+                                          : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    VkImageLayout dst_layout = same_image ? VK_IMAGE_LAYOUT_GENERAL
+                                          : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    VkAccessFlags src_prior_access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                     VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    VkPipelineStageFlags src_prior_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkAccessFlags dst_prior_access = src_prior_access;
+    VkPipelineStageFlags dst_prior_stage = src_prior_stage;
+    if (src->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+        src_prior_access = 0;
+        src_prior_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    }
+    if (dst->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+        dst_prior_access = 0;
+        dst_prior_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    }
+
+    if (same_image) {
+        vk_image_barrier_range(cmd, src->image, src->layout, VK_IMAGE_LAYOUT_GENERAL,
+                               src_prior_access, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                               src_prior_stage, VK_PIPELINE_STAGE_TRANSFER_BIT, src_aspect,
+                               0, src->mip_levels, 0,
+                               src->target == GFX_TEXTURE_3D ? 1 : src->array_layers);
+    } else {
+        vk_image_barrier_range(cmd, src->image, src->layout, src_layout,
+                               src_prior_access, VK_ACCESS_TRANSFER_READ_BIT, src_prior_stage,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, src_aspect,
+                               src_level, 1, src->target == GFX_TEXTURE_3D ? 0 : src_layer, 1);
+        vk_image_barrier_range(cmd, dst->image, dst->layout, dst_layout,
+                               dst_prior_access, VK_ACCESS_TRANSFER_WRITE_BIT, dst_prior_stage,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, dst_aspect,
+                               dst_level, 1, dst->target == GFX_TEXTURE_3D ? 0 : dst_layer, 1);
+    }
+
+    if (same_format) {
+        VkImageCopy region = {
+            .srcSubresource = {
+                .aspectMask = src_aspect,
+                .mipLevel = src_level,
+                .baseArrayLayer = src->target == GFX_TEXTURE_3D ? 0 : src_layer,
+                .layerCount = 1,
+            },
+            .srcOffset = { src_x, src_y, src_z },
+            .dstSubresource = {
+                .aspectMask = dst_aspect,
+                .mipLevel = dst_level,
+                .baseArrayLayer = dst->target == GFX_TEXTURE_3D ? 0 : dst_layer,
+                .layerCount = 1,
+            },
+            .dstOffset = { dst_x, dst_y, dst_z },
+            .extent = { cw, ch, cd },
+        };
+        vkCmdCopyImage(cmd, src->image, src_layout, dst->image, dst_layout, 1, &region);
+    } else {
+        VkImageBlit region = {
+            .srcSubresource = {
+                .aspectMask = src_aspect,
+                .mipLevel = src_level,
+                .baseArrayLayer = src->target == GFX_TEXTURE_3D ? 0 : src_layer,
+                .layerCount = 1,
+            },
+            .srcOffsets = {
+                { src_x, src_y, src_z },
+                { src_x + (int32_t)cw, src_y + (int32_t)ch, src_z + (int32_t)cd },
+            },
+            .dstSubresource = {
+                .aspectMask = dst_aspect,
+                .mipLevel = dst_level,
+                .baseArrayLayer = dst->target == GFX_TEXTURE_3D ? 0 : dst_layer,
+                .layerCount = 1,
+            },
+            .dstOffsets = {
+                { dst_x, dst_y, dst_z },
+                { dst_x + (int32_t)cw, dst_y + (int32_t)ch, dst_z + (int32_t)cd },
+            },
+        };
+        vkCmdBlitImage(cmd, src->image, src_layout, dst->image, dst_layout, 1, &region,
+                       VK_FILTER_NEAREST);
+    }
+
+    if (same_image) {
+        vk_image_barrier_range(cmd, dst->image, VK_IMAGE_LAYOUT_GENERAL,
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, dst_aspect,
+                               0, dst->mip_levels, 0,
+                               dst->target == GFX_TEXTURE_3D ? 1 : dst->array_layers);
+    } else {
+        vk_image_barrier_range(cmd, src->image, src_layout,
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                               VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, src_aspect,
+                               src_level, 1, src->target == GFX_TEXTURE_3D ? 0 : src_layer, 1);
+        vk_image_barrier_range(cmd, dst->image, dst_layout,
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                               VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, dst_aspect,
+                               dst_level, 1, dst->target == GFX_TEXTURE_3D ? 0 : dst_layer, 1);
+    }
+
+    if (!vk_submit_and_wait(cmd, same_format ? "texture copy" : "texture blit"))
+        goto out;
+    dst->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    if (!same_image) ((GfxTexture *)src)->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    ok = 1;
+    vk_log("texture %s %s -> %s %ux%ux%u src=(%d,%d,%d) dst=(%d,%d,%d)",
+           same_format ? "copy" : "blit", vk_format_name(src->format),
+           vk_format_name(dst->format), cw, ch, cd, src_x, src_y, src_z,
+           dst_x, dst_y, dst_z);
+out:
+    pthread_mutex_unlock(&g_lock);
+    return ok;
+}
+
+int gfx_backend_texture_clear(GfxTexture *dst, uint32_t level, uint32_t layer,
+                              const float rgba[4],
+                              int32_t x, int32_t y, uint32_t width, uint32_t height) {
+    if (!dst || !rgba) return 0;
+    pthread_mutex_lock(&g_lock);
+    if (!g.ready || !g.cmd) { pthread_mutex_unlock(&g_lock); return 0; }
+
+    int ok = 0;
+    VkCommandBuffer cmd = g.cmd;
+    uint32_t ew = 0, eh = 0, ed = 0;
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stage_mem = VK_NULL_HANDLE;
+    if (!vk_texture_transfer_check(dst, level, layer, "texture clear", 1)) goto out;
+    if (vk_format_is_compressed(dst->format)) {
+        vk_log("ERROR texture clear: compressed %s region clear is unsupported",
+               vk_format_name(dst->format));
+        goto out;
+    }
+    vk_texture_level_extent(dst, level, &ew, &eh, &ed);
+    uint32_t w = width, h = height, d = dst->target == GFX_TEXTURE_3D ? ed : 1;
+    int32_t z = 0;
+    if (!vk_clamp_region(&x, &y, &z, &w, &h, &d, ew, eh, ed, NULL, NULL, NULL)) {
+        vk_log("ERROR texture clear: region is outside %ux%ux%u", ew, eh, ed);
+        goto out;
+    }
+    int whole_level = x == 0 && y == 0 && w == ew && h == eh;
+    uint8_t texel[16];
+    uint32_t bpp = 0;
+    size_t row = 0, total = 0;
+    if (!whole_level) {
+        if (!vk_pack_clear_texel(dst->format, rgba, texel, &bpp)) {
+            vk_log("ERROR texture clear: sub-region clear of %s is unsupported "
+                   "(only whole-level clears use vkCmdClearColorImage)",
+                   vk_format_name(dst->format));
+            goto out;
+        }
+        row = (size_t)w * bpp;
+        total = row * h * d;
+        if (!vk_create_host_buffer(total, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                   &staging, &stage_mem))
+            goto out;
+        void *mapped = NULL;
+        if (!vk_ok(vkMapMemory(g.dev, stage_mem, 0, VK_WHOLE_SIZE, 0, &mapped),
+                   "vkMapMemory(texture clear)"))
+            goto out;
+        for (uint32_t zz = 0; zz < d; zz++)
+            for (uint32_t yy = 0; yy < h; yy++)
+                for (uint32_t xx = 0; xx < w; xx++)
+                    memcpy((uint8_t *)mapped + ((size_t)zz * h + yy) * row + (size_t)xx * bpp,
+                           texel, bpp);
+        vkUnmapMemory(g.dev, stage_mem);
+    }
+
+    VkCommandBufferBeginInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    if (!vk_ok(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer(texture clear)"))
+        goto out;
+
+    VkImageAspectFlags aspect = vk_format_copy_aspect(dst->format);
+    VkAccessFlags prior_access = dst->layout == VK_IMAGE_LAYOUT_UNDEFINED
+        ? 0
+        : (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+           VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+    VkPipelineStageFlags prior_stage = dst->layout == VK_IMAGE_LAYOUT_UNDEFINED
+        ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    vk_image_barrier_range(cmd, dst->image, dst->layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           prior_access, VK_ACCESS_TRANSFER_WRITE_BIT, prior_stage,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, aspect, level, 1,
+                           dst->target == GFX_TEXTURE_3D ? 0 : layer, 1);
+
+    if (whole_level) {
+        VkClearColorValue color;
+        memcpy(color.float32, rgba, sizeof color.float32);
+        VkImageSubresourceRange range = {
+            .aspectMask = aspect,
+            .baseMipLevel = level,
+            .levelCount = 1,
+            .baseArrayLayer = dst->target == GFX_TEXTURE_3D ? 0 : layer,
+            .layerCount = 1,
+        };
+        vkCmdClearColorImage(cmd, dst->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             &color, 1, &range);
+    } else {
+        VkBufferMemoryBarrier bmb = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = staging, .offset = 0, .size = VK_WHOLE_SIZE,
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &bmb, 0, NULL);
+        VkBufferImageCopy region = {
+            .bufferOffset = 0,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource = {
+                .aspectMask = aspect,
+                .mipLevel = level,
+                .baseArrayLayer = dst->target == GFX_TEXTURE_3D ? 0 : layer,
+                .layerCount = 1,
+            },
+            .imageOffset = { x, y, 0 },
+            .imageExtent = { w, h, d },
+        };
+        vkCmdCopyBufferToImage(cmd, staging, dst->image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    }
+
+    vk_image_barrier_range(cmd, dst->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                           VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, aspect, level, 1,
+                           dst->target == GFX_TEXTURE_3D ? 0 : layer, 1);
+    if (!vk_submit_and_wait(cmd, "texture clear")) goto out;
+    dst->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    ok = 1;
+    vk_log("texture clear %s level=%u layer=%u rect=(%d,%d %ux%u) whole=%d",
+           vk_format_name(dst->format), level, layer, x, y, w, h, whole_level);
+out:
+    if (staging) vkDestroyBuffer(g.dev, staging, NULL);
+    if (stage_mem) vkFreeMemory(g.dev, stage_mem, NULL);
+    pthread_mutex_unlock(&g_lock);
+    return ok;
+}
+
+int gfx_backend_texture_upload(GfxTexture *dst, uint32_t level, uint32_t layer,
+                               int32_t x, int32_t y, uint32_t width, uint32_t height,
+                               const void *data, size_t size) {
+    if (!dst || !data || !size) return 0;
+    pthread_mutex_lock(&g_lock);
+    if (!g.ready || !g.cmd) { pthread_mutex_unlock(&g_lock); return 0; }
+
+    int ok = 0;
+    VkCommandBuffer cmd = g.cmd;
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stage_mem = VK_NULL_HANDLE;
+    uint32_t ew = 0, eh = 0, ed = 0;
+    if (!vk_texture_transfer_check(dst, level, layer, "texture upload", 1)) goto out;
+    if (vk_format_is_compressed(dst->format)) {
+        vk_log("ERROR texture upload: compressed %s region upload is unsupported",
+               vk_format_name(dst->format));
+        goto out;
+    }
+    uint32_t bpp = vk_format_info(dst->format).bpp;
+    if (!bpp) {
+        vk_log("ERROR texture upload: %s has no texel size", vk_format_name(dst->format));
+        goto out;
+    }
+    vk_texture_level_extent(dst, level, &ew, &eh, &ed);
+    uint32_t w = width, h = height, d = dst->target == GFX_TEXTURE_3D ? ed : 1;
+    int32_t z = 0;
+    uint32_t cut_x = 0, cut_y = 0;
+    if (!vk_clamp_region(&x, &y, &z, &w, &h, &d, ew, eh, ed,
+                         &cut_x, &cut_y, NULL)) {
+        vk_log("ERROR texture upload: region is outside %ux%ux%u", ew, eh, ed);
+        goto out;
+    }
+    uint32_t req_w = width ? width : w + cut_x;
+    uint32_t req_h = height ? height : h + cut_y;
+    size_t src_row = (size_t)req_w * bpp;
+    size_t need = src_row * req_h * d;
+    if (size < need) {
+        vk_log("ERROR texture upload: data size=%zu < %zu (req %ux%u depth=%u)",
+               size, need, req_w, req_h, d);
+        goto out;
+    }
+    size_t row = (size_t)w * bpp;
+    size_t total = row * h * d;
+    if (!vk_create_host_buffer(total, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                               &staging, &stage_mem))
+        goto out;
+    void *mapped = NULL;
+    if (!vk_ok(vkMapMemory(g.dev, stage_mem, 0, VK_WHOLE_SIZE, 0, &mapped),
+               "vkMapMemory(texture upload)"))
+        goto out;
+    for (uint32_t zz = 0; zz < d; zz++)
+        for (uint32_t yy = 0; yy < h; yy++)
+            memcpy((uint8_t *)mapped + ((size_t)zz * h + yy) * row,
+                   (const uint8_t *)data + (size_t)zz * src_row * req_h +
+                       (size_t)(yy + cut_y) * src_row + (size_t)cut_x * bpp,
+                   row);
+    vkUnmapMemory(g.dev, stage_mem);
+
+    VkCommandBufferBeginInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    if (!vk_ok(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer(texture upload)"))
+        goto out;
+    VkImageAspectFlags aspect = vk_format_copy_aspect(dst->format);
+    VkAccessFlags prior_access = dst->layout == VK_IMAGE_LAYOUT_UNDEFINED
+        ? 0
+        : (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+           VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+    VkPipelineStageFlags prior_stage = dst->layout == VK_IMAGE_LAYOUT_UNDEFINED
+        ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkBufferMemoryBarrier bmb = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = staging, .offset = 0, .size = VK_WHOLE_SIZE,
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &bmb, 0, NULL);
+    vk_image_barrier_range(cmd, dst->image, dst->layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           prior_access, VK_ACCESS_TRANSFER_WRITE_BIT, prior_stage,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, aspect, level, 1,
+                           dst->target == GFX_TEXTURE_3D ? 0 : layer, 1);
+    VkBufferImageCopy region = {
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = {
+            .aspectMask = aspect,
+            .mipLevel = level,
+            .baseArrayLayer = dst->target == GFX_TEXTURE_3D ? 0 : layer,
+            .layerCount = 1,
+        },
+        .imageOffset = { x, y, 0 },
+        .imageExtent = { w, h, d },
+    };
+    vkCmdCopyBufferToImage(cmd, staging, dst->image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    vk_image_barrier_range(cmd, dst->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                           VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, aspect, level, 1,
+                           dst->target == GFX_TEXTURE_3D ? 0 : layer, 1);
+    if (!vk_submit_and_wait(cmd, "texture upload")) goto out;
+    dst->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    ok = 1;
+    vk_log("texture upload %s level=%u layer=%u rect=(%d,%d %ux%u) depth=%u bytes=%zu",
+           vk_format_name(dst->format), level, layer, x, y, w, h, d, total);
+out:
+    if (staging) vkDestroyBuffer(g.dev, staging, NULL);
+    if (stage_mem) vkFreeMemory(g.dev, stage_mem, NULL);
+    pthread_mutex_unlock(&g_lock);
+    return ok;
+}
+
+int gfx_backend_texture_download(const GfxTexture *src, uint32_t level, uint32_t layer,
+                                 int32_t x, int32_t y, uint32_t width, uint32_t height,
+                                 void *dst, size_t size) {
+    if (!src || !dst || !size) return 0;
+    pthread_mutex_lock(&g_lock);
+    if (!g.ready || !g.cmd) { pthread_mutex_unlock(&g_lock); return 0; }
+
+    int ok = 0;
+    VkCommandBuffer cmd = g.cmd;
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stage_mem = VK_NULL_HANDLE;
+    uint32_t ew = 0, eh = 0, ed = 0;
+    if (!vk_texture_transfer_check(src, level, layer, "texture download", 0)) goto out;
+    if (!src->readback_ok) {
+        vk_log("ERROR texture download: %s was created without transfer-src support",
+               vk_format_name(src->format));
+        goto out;
+    }
+    if (vk_format_is_compressed(src->format)) {
+        vk_log("ERROR texture download: compressed %s region download is unsupported",
+               vk_format_name(src->format));
+        goto out;
+    }
+    uint32_t bpp = vk_format_info(src->format).bpp;
+    if (!bpp) {
+        vk_log("ERROR texture download: %s has no texel size", vk_format_name(src->format));
+        goto out;
+    }
+    vk_texture_level_extent(src, level, &ew, &eh, &ed);
+    uint32_t w = width, h = height, d = src->target == GFX_TEXTURE_3D ? ed : 1;
+    int32_t z = 0;
+    uint32_t cut_x = 0, cut_y = 0;
+    if (!vk_clamp_region(&x, &y, &z, &w, &h, &d, ew, eh, ed,
+                         &cut_x, &cut_y, NULL)) {
+        vk_log("ERROR texture download: region is outside %ux%ux%u", ew, eh, ed);
+        goto out;
+    }
+    uint32_t req_w = width ? width : w + cut_x;
+    uint32_t req_h = height ? height : h + cut_y;
+    size_t dst_row = (size_t)req_w * bpp;
+    size_t need = dst_row * req_h * d;
+    if (size < need) {
+        vk_log("ERROR texture download: dst size=%zu < %zu (req %ux%u depth=%u)",
+               size, need, req_w, req_h, d);
+        goto out;
+    }
+    size_t row = (size_t)w * bpp;
+    size_t total = row * h * d;
+    if (!vk_create_host_buffer(total, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                               &staging, &stage_mem))
+        goto out;
+
+    VkCommandBufferBeginInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    if (!vk_ok(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer(texture download)"))
+        goto out;
+    VkImageAspectFlags aspect = vk_format_copy_aspect(src->format);
+    VkAccessFlags prior_access = src->layout == VK_IMAGE_LAYOUT_UNDEFINED
+        ? 0
+        : (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+           VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+    VkPipelineStageFlags prior_stage = src->layout == VK_IMAGE_LAYOUT_UNDEFINED
+        ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    vk_image_barrier_range(cmd, src->image, src->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           prior_access, VK_ACCESS_TRANSFER_READ_BIT, prior_stage,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, aspect, level, 1,
+                           src->target == GFX_TEXTURE_3D ? 0 : layer, 1);
+    VkBufferImageCopy region = {
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = {
+            .aspectMask = aspect,
+            .mipLevel = level,
+            .baseArrayLayer = src->target == GFX_TEXTURE_3D ? 0 : layer,
+            .layerCount = 1,
+        },
+        .imageOffset = { x, y, 0 },
+        .imageExtent = { w, h, d },
+    };
+    vkCmdCopyImageToBuffer(cmd, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           staging, 1, &region);
+    VkBufferMemoryBarrier bmb = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = staging, .offset = 0, .size = VK_WHOLE_SIZE,
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &bmb, 0, NULL);
+    vk_image_barrier_range(cmd, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                           VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, aspect, level, 1,
+                           src->target == GFX_TEXTURE_3D ? 0 : layer, 1);
+    if (!vk_submit_and_wait(cmd, "texture download")) goto out;
+    ((GfxTexture *)src)->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    void *mapped = NULL;
+    if (!vk_ok(vkMapMemory(g.dev, stage_mem, 0, VK_WHOLE_SIZE, 0, &mapped),
+               "vkMapMemory(texture download)"))
+        goto out;
+    for (uint32_t zz = 0; zz < d; zz++)
+        for (uint32_t yy = 0; yy < h; yy++)
+            memcpy((uint8_t *)dst + (size_t)zz * dst_row * req_h +
+                       (size_t)(yy + cut_y) * dst_row + (size_t)cut_x * bpp,
+                   (const uint8_t *)mapped + ((size_t)zz * h + yy) * row,
+                   row);
+    vkUnmapMemory(g.dev, stage_mem);
+    ok = 1;
+    vk_log("texture download %s level=%u layer=%u rect=(%d,%d %ux%u) depth=%u bytes=%zu",
+           vk_format_name(src->format), level, layer, x, y, w, h, d, total);
+out:
+    if (staging) vkDestroyBuffer(g.dev, staging, NULL);
+    if (stage_mem) vkFreeMemory(g.dev, stage_mem, NULL);
+    pthread_mutex_unlock(&g_lock);
+    return ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* Compute pipelines and dispatch.                                     */
+
+typedef struct {
+    int bound;
+    GfxBindingKind kind;
+    VkBuffer buffer;
+    VkDeviceMemory mem;
+    void *mapped;
+    VkDeviceSize capacity;
+    const GfxTexture *texture;
+    VkImageLayout layout;
+} GfxComputeBinding;
+
+struct GfxComputePipeline {
+    VkShaderModule cs;
+    VkDescriptorSetLayout dsl;
+    VkDescriptorPool pool;
+    VkDescriptorSet dset;
+    VkPipelineLayout layout;
+    VkPipeline pipe;
+    uint32_t nspec;
+    GfxBindingSpec spec[GFX_COMPUTE_MAX_BINDINGS];
+    GfxComputeBinding bind[GFX_COMPUTE_MAX_BINDINGS];
+};
+
+static int vk_compute_desc_type(GfxBindingKind kind, VkDescriptorType *out) {
+    switch (kind) {
+    case GFX_BIND_UBO: *out = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; return 1;
+    case GFX_BIND_SSBO: *out = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; return 1;
+    case GFX_BIND_SAMPLED_IMAGE: *out = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; return 1;
+    case GFX_BIND_COMBINED_IMAGE_SAMPLER:
+        *out = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; return 1;
+    case GFX_BIND_STORAGE_IMAGE: *out = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; return 1;
+    default:
+        return 0;
+    }
+}
+
+static uint32_t vk_compute_binding_count(const GfxBindingSpec *s) {
+    if (s->kind == GFX_BIND_UBO || s->kind == GFX_BIND_SSBO) return 1;
+    return s->count ? s->count : GFX_REFLECT_RUNTIME_ARRAY;
+}
+
+static VkDeviceSize vk_compute_align_up(VkDeviceSize v, VkDeviceSize a) {
+    if (a <= 1) return v;
+    return (v + a - 1) / a * a;
+}
+
+static int vk_compute_buffer_create(VkDeviceSize size, VkBufferUsageFlags usage,
+                                    VkBuffer *buf, VkDeviceMemory *mem,
+                                    void **mapped) {
+    if (!size) size = 1;
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    if (!vk_ok(vkCreateBuffer(g.dev, &bci, NULL, buf), "vkCreateBuffer(compute)"))
+        return 0;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(g.dev, *buf, &req);
+    uint32_t mt = 0;
+    if (!vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &mt)) {
+        vk_log("ERROR compute buffer: no host-visible coherent memory type");
+        vkDestroyBuffer(g.dev, *buf, NULL);
+        *buf = VK_NULL_HANDLE;
+        return 0;
+    }
+    VkMemoryAllocateInfo mai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size,
+        .memoryTypeIndex = mt,
+    };
+    if (!vk_ok(vkAllocateMemory(g.dev, &mai, NULL, mem), "vkAllocateMemory(compute)")) {
+        vkDestroyBuffer(g.dev, *buf, NULL);
+        *buf = VK_NULL_HANDLE;
+        return 0;
+    }
+    if (!vk_ok(vkBindBufferMemory(g.dev, *buf, *mem, 0), "vkBindBufferMemory(compute)")) {
+        vkFreeMemory(g.dev, *mem, NULL);
+        vkDestroyBuffer(g.dev, *buf, NULL);
+        *buf = VK_NULL_HANDLE;
+        *mem = VK_NULL_HANDLE;
+        return 0;
+    }
+    if (!vk_ok(vkMapMemory(g.dev, *mem, 0, VK_WHOLE_SIZE, 0, mapped),
+               "vkMapMemory(compute)")) {
+        vkFreeMemory(g.dev, *mem, NULL);
+        vkDestroyBuffer(g.dev, *buf, NULL);
+        *buf = VK_NULL_HANDLE;
+        *mem = VK_NULL_HANDLE;
+        return 0;
+    }
+    memset(*mapped, 0, (size_t)size);
+    return 1;
+}
+
+static void vk_compute_binding_release(GfxComputeBinding *b) {
+    if (!b) return;
+    if (g.dev) {
+        if (b->mapped && b->mem) vkUnmapMemory(g.dev, b->mem);
+        if (b->buffer) vkDestroyBuffer(g.dev, b->buffer, NULL);
+        if (b->mem) vkFreeMemory(g.dev, b->mem, NULL);
+    }
+    memset(b, 0, sizeof *b);
+    b->kind = (GfxBindingKind)-1;
+}
+
+typedef struct {
+    VkPipelineCache cache;
+    const VkComputePipelineCreateInfo *ci;
+    VkPipeline *out;
+    VkResult result;
+} VkComputeCompileJob;
+
+static void *vk_compute_compile_thread(void *arg) {
+    VkComputeCompileJob *job = arg;
+    job->result = vkCreateComputePipelines(g.dev, job->cache, 1, job->ci, NULL, job->out);
+    return NULL;
+}
+
+/* Adreno's pipeline compiler can recurse; give it the same 128 MiB stack the
+ * graphics path uses instead of the small default Android thread stack. */
+static VkResult vk_create_compute_pipeline_bigstack(
+        VkPipelineCache cache, const VkComputePipelineCreateInfo *ci, VkPipeline *out) {
+    VkComputeCompileJob job = { cache, ci, out, VK_ERROR_UNKNOWN };
+    pthread_attr_t attr;
+    pthread_t th;
+    int attr_ok = pthread_attr_init(&attr) == 0;
+    if (attr_ok && pthread_attr_setstacksize(&attr, 128u << 20) == 0 &&
+        pthread_create(&th, &attr, vk_compute_compile_thread, &job) == 0) {
+        pthread_attr_destroy(&attr);
+        pthread_join(th, NULL);
+        return job.result;
+    }
+    if (attr_ok) pthread_attr_destroy(&attr);
+    /* Inline creation is still better than refusing a valid shader. */
+    return vkCreateComputePipelines(g.dev, cache, 1, ci, NULL, out);
+}
+
+static int vk_compute_find_spec(const GfxComputePipeline *p, uint32_t set, uint32_t binding) {
+    if (!p || set != 0) return -1;
+    for (uint32_t i = 0; i < p->nspec; i++)
+        if (p->spec[i].binding == binding) return (int)i;
+    return -1;
+}
+
+static void vk_compute_pipeline_destroy_locked(GfxComputePipeline *p) {
+    if (!p) return;
+    if (g.dev) {
+        for (uint32_t i = 0; i < GFX_COMPUTE_MAX_BINDINGS; i++)
+            vk_compute_binding_release(&p->bind[i]);
+        if (p->pipe) vkDestroyPipeline(g.dev, p->pipe, NULL);
+        if (p->layout) vkDestroyPipelineLayout(g.dev, p->layout, NULL);
+        if (p->pool) vkDestroyDescriptorPool(g.dev, p->pool, NULL);
+        if (p->dsl) vkDestroyDescriptorSetLayout(g.dev, p->dsl, NULL);
+        if (p->cs) vkDestroyShaderModule(g.dev, p->cs, NULL);
+    }
+    free(p);
+}
+
+GfxComputePipeline *gfx_backend_compute_pipeline_create(const uint8_t *cs, size_t cs_size,
+                                                        const GfxBindingSpec *specs,
+                                                        uint32_t nspec) {
+    if (!cs || cs_size < 20) {
+        vk_log("ERROR compute pipeline: invalid SPIR-V module");
+        return NULL;
+    }
+    if (!specs && nspec) {
+        vk_log("ERROR compute pipeline: %u bindings but no specs", nspec);
+        return NULL;
+    }
+    if (nspec > GFX_COMPUTE_MAX_BINDINGS) {
+        vk_log("ERROR compute pipeline: %u bindings > %u", nspec, GFX_COMPUTE_MAX_BINDINGS);
+        return NULL;
+    }
+    pthread_mutex_lock(&g_lock);
+    if (!vk_init_locked()) { pthread_mutex_unlock(&g_lock); return NULL; }
+
+    double t0 = vk_now_ms();
+    GfxComputePipeline *p = calloc(1, sizeof *p);
+    if (!p) { pthread_mutex_unlock(&g_lock); return NULL; }
+    for (uint32_t i = 0; i < GFX_COMPUTE_MAX_BINDINGS; i++)
+        p->bind[i].kind = (GfxBindingKind)-1;
+    p->nspec = nspec;
+
+    VkDescriptorSetLayoutBinding layout_b[GFX_COMPUTE_MAX_BINDINGS];
+    VkDescriptorPoolSize pool[8];
+    uint32_t npool = 0;
+    int bad = 0;
+    memset(pool, 0, sizeof pool);
+    for (uint32_t i = 0; i < nspec; i++) {
+        const GfxBindingSpec *s = &specs[i];
+        VkDescriptorType dt;
+        if (s->set != 0) {
+            vk_log("ERROR compute pipeline: binding %u uses set %u (only set 0)",
+                   s->binding, s->set);
+            bad = 1;
+            break;
+        }
+        if (!vk_compute_desc_type(s->kind, &dt)) {
+            vk_log("ERROR compute pipeline: binding %u has unsupported kind %d",
+                   s->binding, (int)s->kind);
+            bad = 1;
+            break;
+        }
+        uint32_t count = vk_compute_binding_count(s);
+        if (!count || count > GFX_COMPUTE_MAX_BINDINGS) {
+            vk_log("ERROR compute pipeline: binding %u count=%u", s->binding, count);
+            bad = 1;
+            break;
+        }
+        p->spec[i] = *s;
+        p->spec[i].set = 0;
+        p->spec[i].count = count;
+        layout_b[i] = (VkDescriptorSetLayoutBinding){
+            .binding = s->binding,
+            .descriptorType = dt,
+            .descriptorCount = count,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        };
+        int found = -1;
+        for (uint32_t j = 0; j < npool; j++)
+            if (pool[j].type == dt) { found = (int)j; break; }
+        if (found < 0) {
+            if (npool >= sizeof pool / sizeof pool[0]) { bad = 1; break; }
+            found = (int)npool++;
+            pool[found].type = dt;
+        }
+        pool[found].descriptorCount += count;
+    }
+    if (bad) goto fail;
+
+    if (!vk_shader_module(cs, cs_size, "vkCreateShaderModule(compute)", &p->cs))
+        goto fail;
+    VkDescriptorSetLayoutCreateInfo dlci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = nspec,
+        .pBindings = nspec ? layout_b : NULL,
+    };
+    if (!vk_ok(vkCreateDescriptorSetLayout(g.dev, &dlci, NULL, &p->dsl),
+               "vkCreateDescriptorSetLayout(compute)"))
+        goto fail;
+    if (npool == 0) {
+        /* A shader with no descriptors still needs a non-empty pool. */
+        pool[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        pool[0].descriptorCount = 1;
+        npool = 1;
+    }
+    VkDescriptorPoolCreateInfo dpci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1,
+        .poolSizeCount = npool,
+        .pPoolSizes = npool ? pool : NULL,
+    };
+    if (!vk_ok(vkCreateDescriptorPool(g.dev, &dpci, NULL, &p->pool),
+               "vkCreateDescriptorPool(compute)"))
+        goto fail;
+    VkDescriptorSetAllocateInfo dsai = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = p->pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &p->dsl,
+    };
+    if (!vk_ok(vkAllocateDescriptorSets(g.dev, &dsai, &p->dset),
+               "vkAllocateDescriptorSets(compute)"))
+        goto fail;
+    VkPipelineLayoutCreateInfo lci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &p->dsl,
+    };
+    if (!vk_ok(vkCreatePipelineLayout(g.dev, &lci, NULL, &p->layout),
+               "vkCreatePipelineLayout(compute)"))
+        goto fail;
+    VkComputePipelineCreateInfo ci = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = p->cs,
+            .pName = "main",
+        },
+        .layout = p->layout,
+        .basePipelineHandle = VK_NULL_HANDLE,
+        .basePipelineIndex = -1,
+    };
+    if (!vk_ok(vk_create_compute_pipeline_bigstack(VK_NULL_HANDLE, &ci, &p->pipe),
+               "vkCreateComputePipelines"))
+        goto fail;
+    vk_log("compute pipeline ready bindings=%u time=%.2f ms",
+           nspec, vk_now_ms() - t0);
+    pthread_mutex_unlock(&g_lock);
+    return p;
+
+fail:
+    vk_compute_pipeline_destroy_locked(p);
+    pthread_mutex_unlock(&g_lock);
+    return NULL;
+}
+
+void gfx_backend_compute_pipeline_destroy(GfxComputePipeline *pipeline) {
+    if (!pipeline) return;
+    pthread_mutex_lock(&g_lock);
+    vk_compute_pipeline_destroy_locked(pipeline);
+    pthread_mutex_unlock(&g_lock);
+}
+
+int gfx_backend_compute_bind_buffer(GfxComputePipeline *pipeline, uint32_t set,
+                                    uint32_t binding, const void *data, size_t size) {
+    if (!pipeline || !data || !size) return 0;
+    pthread_mutex_lock(&g_lock);
+    if (!g.ready) { pthread_mutex_unlock(&g_lock); return 0; }
+    int i = vk_compute_find_spec(pipeline, set, binding);
+    if (i < 0) {
+        vk_log("ERROR compute bind buffer: set=%u binding=%u not in pipeline", set, binding);
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    GfxBindingSpec *s = &pipeline->spec[i];
+    VkDescriptorType dt;
+    if (!vk_compute_desc_type(s->kind, &dt) ||
+        (s->kind != GFX_BIND_UBO && s->kind != GFX_BIND_SSBO)) {
+        vk_log("ERROR compute bind buffer: binding %u is kind %d, not UBO/SSBO",
+               binding, (int)s->kind);
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    VkDeviceSize align = s->kind == GFX_BIND_UBO
+        ? g.props.limits.minUniformBufferOffsetAlignment
+        : g.props.limits.minStorageBufferOffsetAlignment;
+    if (align < 4) align = 4;
+    VkDeviceSize cap = vk_compute_align_up((VkDeviceSize)size, align);
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    void *mapped = NULL;
+    VkBufferUsageFlags usage = s->kind == GFX_BIND_UBO
+        ? VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+        : VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    if (!vk_compute_buffer_create(cap, usage, &buf, &mem, &mapped)) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    memcpy(mapped, data, size);
+
+    GfxComputeBinding *b = &pipeline->bind[i];
+    VkBuffer old_buf = b->buffer;
+    VkDeviceMemory old_mem = b->mem;
+    void *old_mapped = b->mapped;
+    b->bound = 1;
+    b->kind = s->kind;
+    b->buffer = buf;
+    b->mem = mem;
+    b->mapped = mapped;
+    b->capacity = cap;
+    b->texture = NULL;
+    b->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VkDescriptorBufferInfo bi = { .buffer = buf, .offset = 0, .range = cap };
+    VkWriteDescriptorSet w = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = pipeline->dset,
+        .dstBinding = binding,
+        .descriptorCount = 1,
+        .descriptorType = dt,
+        .pBufferInfo = &bi,
+    };
+    vkUpdateDescriptorSets(g.dev, 1, &w, 0, NULL);
+    if (old_mapped && old_mem) vkUnmapMemory(g.dev, old_mem);
+    if (old_buf) vkDestroyBuffer(g.dev, old_buf, NULL);
+    if (old_mem) vkFreeMemory(g.dev, old_mem, NULL);
+    if (getenv("TOTK_ANDROID_TRACE_COMPUTE"))
+        vk_log("compute bind buffer set=%u binding=%u kind=%d size=%zu cap=%zu",
+               set, binding, (int)s->kind, size, (size_t)cap);
+    pthread_mutex_unlock(&g_lock);
+    return 1;
+}
+
+int gfx_backend_compute_bind_texture(GfxComputePipeline *pipeline, uint32_t set,
+                                     uint32_t binding, const GfxTexture *texture) {
+    if (!pipeline || !texture) return 0;
+    pthread_mutex_lock(&g_lock);
+    if (!g.ready) { pthread_mutex_unlock(&g_lock); return 0; }
+    int i = vk_compute_find_spec(pipeline, set, binding);
+    if (i < 0) {
+        vk_log("ERROR compute bind texture: set=%u binding=%u not in pipeline", set, binding);
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    GfxBindingSpec *s = &pipeline->spec[i];
+    VkDescriptorType dt;
+    if (!vk_compute_desc_type(s->kind, &dt) ||
+        (s->kind != GFX_BIND_SAMPLED_IMAGE &&
+         s->kind != GFX_BIND_COMBINED_IMAGE_SAMPLER &&
+         s->kind != GFX_BIND_STORAGE_IMAGE)) {
+        vk_log("ERROR compute bind texture: binding %u is kind %d, not an image",
+               binding, (int)s->kind);
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    int storage = s->kind == GFX_BIND_STORAGE_IMAGE;
+    if (storage && !texture->storage_ok) {
+        vk_log("ERROR compute bind texture: %s texture %p was not created with "
+               "storage usage; refusing to bind it as a storage image",
+               vk_format_name(texture->format), (const void *)texture);
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    if (!texture->view) {
+        vk_log("ERROR compute bind texture: texture %p has no view",
+               (const void *)texture);
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    VkImageLayout want = storage ? VK_IMAGE_LAYOUT_GENERAL
+                                 : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    uint32_t count = s->count;
+    VkDescriptorImageInfo ii[GFX_COMPUTE_MAX_BINDINGS];
+    for (uint32_t k = 0; k < count; k++) {
+        ii[k] = (VkDescriptorImageInfo){
+            .sampler = s->kind == GFX_BIND_COMBINED_IMAGE_SAMPLER
+                           ? texture->sampler : VK_NULL_HANDLE,
+            .imageView = texture->view,
+            .imageLayout = want,
+        };
+    }
+    VkWriteDescriptorSet w = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = pipeline->dset,
+        .dstBinding = binding,
+        .descriptorCount = count,
+        .descriptorType = dt,
+        .pImageInfo = ii,
+    };
+    vkUpdateDescriptorSets(g.dev, 1, &w, 0, NULL);
+    GfxComputeBinding *b = &pipeline->bind[i];
+    vk_compute_binding_release(b);
+    b->bound = 1;
+    b->kind = s->kind;
+    b->texture = texture;
+    b->layout = want;
+    if (getenv("TOTK_ANDROID_TRACE_COMPUTE"))
+        vk_log("compute bind texture set=%u binding=%u kind=%d texture=%p format=%s",
+               set, binding, (int)s->kind, (const void *)texture,
+               vk_format_name(texture->format));
+    pthread_mutex_unlock(&g_lock);
+    return 1;
+}
+
+int gfx_backend_compute_write_buffer(GfxComputePipeline *pipeline, uint32_t set,
+                                     uint32_t binding, uint32_t offset,
+                                     const void *data, size_t size) {
+    if (!pipeline || !data || !size) return 0;
+    pthread_mutex_lock(&g_lock);
+    if (!g.ready) { pthread_mutex_unlock(&g_lock); return 0; }
+    int i = vk_compute_find_spec(pipeline, set, binding);
+    if (i < 0) { pthread_mutex_unlock(&g_lock); return 0; }
+    GfxComputeBinding *b = &pipeline->bind[i];
+    if (!b->bound || !b->mapped ||
+        (b->kind != GFX_BIND_UBO && b->kind != GFX_BIND_SSBO) ||
+        (uint64_t)offset + size > b->capacity) {
+        vk_log("ERROR compute write buffer: set=%u binding=%u offset=%u size=%zu "
+               "not bound or out of range", set, binding, offset, size);
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    memcpy((uint8_t *)b->mapped + offset, data, size);
+    pthread_mutex_unlock(&g_lock);
+    return 1;
+}
+
+int gfx_backend_compute_read_buffer(GfxComputePipeline *pipeline, uint32_t set,
+                                    uint32_t binding, void *dst, size_t size) {
+    if (!pipeline || !dst || !size) return 0;
+    pthread_mutex_lock(&g_lock);
+    if (!g.ready) { pthread_mutex_unlock(&g_lock); return 0; }
+    int i = vk_compute_find_spec(pipeline, set, binding);
+    if (i < 0) { pthread_mutex_unlock(&g_lock); return 0; }
+    GfxComputeBinding *b = &pipeline->bind[i];
+    if (!b->bound || !b->mapped ||
+        (b->kind != GFX_BIND_UBO && b->kind != GFX_BIND_SSBO) ||
+        size > b->capacity) {
+        vk_log("ERROR compute read buffer: set=%u binding=%u size=%zu not bound "
+               "or out of range", set, binding, size);
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    memcpy(dst, b->mapped, size);
+    pthread_mutex_unlock(&g_lock);
+    return 1;
+}
+
+int gfx_backend_compute_dispatch(GfxComputePipeline *pipeline,
+                                 uint32_t group_x, uint32_t group_y, uint32_t group_z) {
+    if (!pipeline || !group_x || !group_y || !group_z) return 0;
+    pthread_mutex_lock(&g_lock);
+    if (!g.ready || !g.cmd || !pipeline->pipe || !pipeline->dset) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    for (uint32_t i = 0; i < pipeline->nspec; i++) {
+        if (!pipeline->bind[i].bound) {
+            vk_log("ERROR compute dispatch: binding %u (kind %d) was never bound",
+                   pipeline->spec[i].binding, (int)pipeline->spec[i].kind);
+            pthread_mutex_unlock(&g_lock);
+            return 0;
+        }
+    }
+    double t0 = vk_now_ms();
+    VkCommandBuffer cmd = g.cmd;
+    VkCommandBufferBeginInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    if (!vk_ok(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer(compute dispatch)")) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipe);
+
+    /* Make host writes to the coherent UBO/SSBO arenas visible to the shader. */
+    for (uint32_t i = 0; i < pipeline->nspec; i++) {
+        GfxComputeBinding *b = &pipeline->bind[i];
+        if (b->kind != GFX_BIND_UBO && b->kind != GFX_BIND_SSBO) continue;
+        VkBufferMemoryBarrier bmb = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = b->buffer,
+            .offset = 0,
+            .size = VK_WHOLE_SIZE,
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 1, &bmb,
+                             0, NULL);
+    }
+
+    /* Transition bound images to the layout their descriptor declares. */
+    for (uint32_t i = 0; i < pipeline->nspec; i++) {
+        GfxComputeBinding *b = &pipeline->bind[i];
+        if (!b->texture) continue;
+        const GfxTexture *t = b->texture;
+        VkAccessFlags src_access = t->layout == VK_IMAGE_LAYOUT_UNDEFINED
+            ? 0
+            : (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+               VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+               VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        VkPipelineStageFlags src_stage = t->layout == VK_IMAGE_LAYOUT_UNDEFINED
+            ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        vk_image_barrier_range(cmd, t->image, t->layout, b->layout,
+                               src_access,
+                               VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                               src_stage, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               vk_format_copy_aspect(t->format), 0, t->mip_levels, 0,
+                               t->target == GFX_TEXTURE_3D ? 1 : t->array_layers);
+    }
+
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout,
+                            0, 1, &pipeline->dset, 0, NULL);
+    vkCmdDispatch(cmd, group_x, group_y, group_z);
+
+    /* Make shader writes visible to the host readback and to later passes. */
+    for (uint32_t i = 0; i < pipeline->nspec; i++) {
+        GfxComputeBinding *b = &pipeline->bind[i];
+        if (b->kind != GFX_BIND_UBO && b->kind != GFX_BIND_SSBO) continue;
+        VkBufferMemoryBarrier bmb = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
+                             VK_ACCESS_SHADER_WRITE_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = b->buffer,
+            .offset = 0,
+            .size = VK_WHOLE_SIZE,
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT |
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 0, NULL, 1, &bmb, 0, NULL);
+    }
+    for (uint32_t i = 0; i < pipeline->nspec; i++) {
+        GfxComputeBinding *b = &pipeline->bind[i];
+        if (!b->texture) continue;
+        const GfxTexture *t = b->texture;
+        VkImageLayout final_layout = b->kind == GFX_BIND_STORAGE_IMAGE
+            ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        vk_image_barrier_range(cmd, t->image, b->layout, final_layout,
+                               VK_ACCESS_SHADER_WRITE_BIT,
+                               VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               vk_format_copy_aspect(t->format), 0, t->mip_levels, 0,
+                               t->target == GFX_TEXTURE_3D ? 1 : t->array_layers);
+    }
+
+    int submitted = vk_submit_and_wait(cmd, "compute dispatch");
+    if (submitted) {
+        for (uint32_t i = 0; i < pipeline->nspec; i++) {
+            GfxComputeBinding *b = &pipeline->bind[i];
+            if (!b->texture) continue;
+            VkImageLayout final_layout = b->kind == GFX_BIND_STORAGE_IMAGE
+                ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            ((GfxTexture *)b->texture)->layout = final_layout;
+        }
+        if (getenv("TOTK_ANDROID_TRACE_COMPUTE"))
+            vk_log("compute dispatch groups=%ux%ux%u bindings=%u time=%.2f ms",
+                   group_x, group_y, group_z, pipeline->nspec, vk_now_ms() - t0);
+    }
+    pthread_mutex_unlock(&g_lock);
+    return submitted;
+}
+
+/* ------------------------------------------------------------------ */
+/* Repository-owned probes.                                            */
+
+typedef struct {
+    uint32_t width, height, seed, pad;
+    float scale[4];
+} GfxComputeProbeParams;
+
+static uint32_t vk_compute_probe_value(uint32_t x, uint32_t y, const uint8_t *tex,
+                                       uint32_t seed) {
+    uint32_t texv = tex[((y & 3u) * 4u + (x & 3u)) * 4u];
+    return (x + 1u) * 3u + (y + 1u) * 5u + seed + texv * 7u;
+}
+
+static void vk_compute_probe_fill_texture(uint8_t *pixels, uint32_t w, uint32_t h) {
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) {
+            uint8_t *p = pixels + ((size_t)y * w + x) * 4;
+            p[0] = (uint8_t)((x + y * 4u) * 16u);
+            p[1] = (uint8_t)(x * 32u);
+            p[2] = (uint8_t)(y * 64u);
+            p[3] = 255;
+        }
+    }
+}
+
+int gfx_backend_compute_probe(const char *work_dir) {
+    vk_log("compute probe begin work=%s", work_dir ? work_dir : "(null)");
+    if (!gfx_backend_vulkan_init()) {
+        vk_log("compute probe FAIL: Vulkan unavailable");
+        return 1;
+    }
+    int ok = 1;
+    uint8_t texels[4 * 4 * 4];
+    vk_compute_probe_fill_texture(texels, 4, 4);
+    GfxTexture *tex = gfx_backend_texture_create_rgba8(4, 4, texels);
+    if (!tex) {
+        vk_log("compute probe FAIL: sampled texture creation failed");
+        return 1;
+    }
+    GfxBindingSpec specs[3] = {
+        { .set = 0, .binding = 0, .kind = GFX_BIND_UBO, .count = 1 },
+        { .set = 0, .binding = 1, .kind = GFX_BIND_SSBO, .count = 1 },
+        { .set = 0, .binding = 2, .kind = GFX_BIND_COMBINED_IMAGE_SAMPLER, .count = 1 },
+    };
+    GfxComputePipeline *p = gfx_backend_compute_pipeline_create(
+        (const uint8_t *)compute_probe_comp_spv, compute_probe_comp_spv_size, specs, 3);
+    if (!p) {
+        vk_log("compute probe FAIL: pipeline creation failed");
+        gfx_backend_texture_destroy(tex);
+        return 1;
+    }
+    GfxComputeProbeParams params = {
+        .width = 8, .height = 8, .seed = 0x12345678u, .pad = 0,
+        .scale = { 1.0f, 1.0f, 1.0f, 1.0f },
+    };
+    uint32_t out[64];
+    memset(out, 0, sizeof out);
+    if (!gfx_backend_compute_bind_buffer(p, 0, 0, &params, sizeof params) ||
+        !gfx_backend_compute_bind_buffer(p, 0, 1, out, sizeof out) ||
+        !gfx_backend_compute_bind_texture(p, 0, 2, tex)) {
+        vk_log("compute probe FAIL: buffer/texture bind failed");
+        ok = 0;
+    }
+    if (ok && !gfx_backend_compute_dispatch(p, 1, 1, 1)) {
+        vk_log("compute probe FAIL: dispatch failed");
+        ok = 0;
+    }
+    if (ok) {
+        uint32_t got[64];
+        memset(got, 0, sizeof got);
+        if (!gfx_backend_compute_read_buffer(p, 0, 1, got, sizeof got)) {
+            vk_log("compute probe FAIL: SSBO readback failed");
+            ok = 0;
+        } else {
+            for (uint32_t y = 0; y < 8 && ok; y++) {
+                for (uint32_t x = 0; x < 8 && ok; x++) {
+                    uint32_t want = vk_compute_probe_value(x, y, texels, params.seed);
+                    uint32_t have = got[y * 8 + x];
+                    if (want != have) {
+                        vk_log("compute probe FAIL: SSBO[%u,%u] got=%08x want=%08x",
+                               x, y, have, want);
+                        ok = 0;
+                    }
+                }
+            }
+            if (ok) vk_log("compute probe: SSBO 8x8 exact match");
+        }
+    }
+
+    /* Storage image path, only when the device advertises the format. */
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(g.phys, VK_FORMAT_R8G8B8A8_UNORM, &fp);
+    int storage_supported =
+        (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0 &&
+        (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) != 0;
+    if (!storage_supported) {
+        vk_log("compute probe: storage image case skipped (RGBA8 optimal=%#x)",
+               fp.optimalTilingFeatures);
+    } else {
+        GfxTextureDesc d = {
+            .target = GFX_TEXTURE_2D,
+            .vk_format = VK_FORMAT_R8G8B8A8_UNORM,
+            .width = 8, .height = 8, .depth = 1,
+            .mip_levels = 1, .array_layers = 1, .samples = 1,
+        };
+        GfxTexture *img = gfx_backend_texture_create_desc(&d, NULL, 0);
+        GfxBindingSpec specs4[4] = {
+            { .set = 0, .binding = 0, .kind = GFX_BIND_UBO, .count = 1 },
+            { .set = 0, .binding = 1, .kind = GFX_BIND_SSBO, .count = 1 },
+            { .set = 0, .binding = 2, .kind = GFX_BIND_COMBINED_IMAGE_SAMPLER, .count = 1 },
+            { .set = 0, .binding = 3, .kind = GFX_BIND_STORAGE_IMAGE, .count = 1 },
+        };
+        GfxComputePipeline *p2 = gfx_backend_compute_pipeline_create(
+            (const uint8_t *)compute_probe_image_comp_spv,
+            compute_probe_image_comp_spv_size, specs4, 4);
+        if (!img || !p2) {
+            vk_log("compute probe FAIL: storage image texture/pipeline creation failed");
+            ok = 0;
+        } else {
+            uint32_t out2[64];
+            memset(out2, 0, sizeof out2);
+            if (!gfx_backend_compute_bind_buffer(p2, 0, 0, &params, sizeof params) ||
+                !gfx_backend_compute_bind_buffer(p2, 0, 1, out2, sizeof out2) ||
+                !gfx_backend_compute_bind_texture(p2, 0, 2, tex) ||
+                !gfx_backend_compute_bind_texture(p2, 0, 3, img)) {
+                vk_log("compute probe FAIL: storage image bind failed");
+                ok = 0;
+            } else if (!gfx_backend_compute_dispatch(p2, 1, 1, 1)) {
+                vk_log("compute probe FAIL: storage image dispatch failed");
+                ok = 0;
+            } else {
+                uint8_t pixels[8 * 8 * 4];
+                memset(pixels, 0, sizeof pixels);
+                if (!gfx_backend_texture_read_pixels(img, 0, 0, pixels, sizeof pixels)) {
+                    vk_log("compute probe FAIL: storage image readback failed");
+                    ok = 0;
+                } else {
+                    for (uint32_t y = 0; y < 8 && ok; y++) {
+                        for (uint32_t x = 0; x < 8 && ok; x++) {
+                            uint32_t v = vk_compute_probe_value(x, y, texels, params.seed);
+                            uint8_t want[4] = {
+                                (uint8_t)(v & 255u), (uint8_t)((v >> 8) & 255u),
+                                (uint8_t)((v >> 16) & 255u), (uint8_t)((v >> 24) & 255u),
+                            };
+                            if (memcmp(pixels + ((size_t)y * 8 + x) * 4, want, 4)) {
+                                uint8_t *g = pixels + ((size_t)y * 8 + x) * 4;
+                                vk_log("compute probe FAIL: image[%u,%u] got=%02x%02x%02x%02x "
+                                       "want=%02x%02x%02x%02x", x, y, g[0], g[1], g[2], g[3],
+                                       want[0], want[1], want[2], want[3]);
+                                ok = 0;
+                            }
+                        }
+                    }
+                    if (ok) vk_log("compute probe: storage image 8x8 exact match");
+                }
+            }
+        }
+        if (p2) gfx_backend_compute_pipeline_destroy(p2);
+        if (img) gfx_backend_texture_destroy(img);
+    }
+
+    gfx_backend_compute_pipeline_destroy(p);
+    gfx_backend_texture_destroy(tex);
+    vk_log("compute probe %s", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+static void vk_copy_probe_fill(uint8_t *p, uint32_t w, uint32_t h, uint32_t seed) {
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) {
+            uint8_t *q = p + ((size_t)y * w + x) * 4;
+            for (uint32_t c = 0; c < 4; c++)
+                q[c] = (uint8_t)(seed + x * 3u + y * 5u + c * 7u);
+        }
+    }
+}
+
+static float vk_decode_ufloat11(uint32_t v) {
+    uint32_t e = (v >> 6) & 0x1f, m = v & 0x3f;
+    if (!e) return ldexpf((float)m, -20);
+    return ldexpf(1.0f + (float)m / 64.0f, (int)e - 15);
+}
+
+static float vk_decode_ufloat10(uint32_t v) {
+    uint32_t e = (v >> 5) & 0x1f, m = v & 0x1f;
+    if (!e) return ldexpf((float)m, -19);
+    return ldexpf(1.0f + (float)m / 32.0f, (int)e - 15);
+}
+
+/* VK_FORMAT_B10G11R11_UFLOAT_PACK32: R in the low 11 bits, G in bits
+ * 11..21 and B in the high 10 bits (Vulkan lists packed components MSB
+ * first). */
+static void vk_decode_b10g11r11(uint32_t v, float out[3]) {
+    out[0] = vk_decode_ufloat11(v & 0x7ffu);
+    out[1] = vk_decode_ufloat11((v >> 11) & 0x7ffu);
+    out[2] = vk_decode_ufloat10((v >> 22) & 0x3ffu);
+}
+
+int gfx_backend_copy_probe(const char *work_dir) {
+    vk_log("copy probe begin work=%s", work_dir ? work_dir : "(null)");
+    if (!gfx_backend_vulkan_init()) {
+        vk_log("copy probe FAIL: Vulkan unavailable");
+        return 1;
+    }
+    const uint32_t W = 64, H = 64;
+    const size_t BYTES = (size_t)W * H * 4;
+    uint8_t *pat_a = malloc(BYTES), *pat_b = malloc(BYTES);
+    uint8_t *got_a = malloc(BYTES), *got_b = malloc(BYTES);
+    int ok = pat_a && pat_b && got_a && got_b;
+    if (!ok) {
+        vk_log("copy probe FAIL: host allocation failed");
+        free(pat_a); free(pat_b); free(got_a); free(got_b);
+        return 1;
+    }
+    vk_copy_probe_fill(pat_a, W, H, 0x20);
+    vk_copy_probe_fill(pat_b, W, H, 0x80);
+
+    GfxTextureDesc desc = {
+        .target = GFX_TEXTURE_2D,
+        .vk_format = VK_FORMAT_R8G8B8A8_UNORM,
+        .width = W, .height = H, .depth = 1,
+        .mip_levels = 1, .array_layers = 1, .samples = 1,
+    };
+    GfxTexture *a = gfx_backend_texture_create_desc(&desc, NULL, 0);
+    GfxTexture *b = gfx_backend_texture_create_desc(&desc, NULL, 0);
+    if (!a || !b) {
+        vk_log("copy probe FAIL: RGBA8 texture creation failed");
+        ok = 0;
+    }
+    if (ok && (!gfx_backend_texture_upload(a, 0, 0, 0, 0, W, H, pat_a, BYTES) ||
+               !gfx_backend_texture_upload(b, 0, 0, 0, 0, W, H, pat_b, BYTES))) {
+        vk_log("copy probe FAIL: upload failed");
+        ok = 0;
+    }
+    if (ok && !gfx_backend_texture_copy(b, 0, 0, 16, 16, 0,
+                                        a, 0, 0, 8, 8, 0, 16, 16, 1)) {
+        vk_log("copy probe FAIL: same-format copy failed");
+        ok = 0;
+    }
+    const float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+    if (ok && !gfx_backend_texture_clear(b, 0, 0, red, 0, 0, 8, 8)) {
+        vk_log("copy probe FAIL: sub-region clear failed");
+        ok = 0;
+    }
+    if (ok) {
+        memset(got_a, 0, BYTES);
+        memset(got_b, 0, BYTES);
+        if (!gfx_backend_texture_download(a, 0, 0, 0, 0, W, H, got_a, BYTES) ||
+            !gfx_backend_texture_download(b, 0, 0, 0, 0, W, H, got_b, BYTES)) {
+            vk_log("copy probe FAIL: download failed");
+            ok = 0;
+        } else if (memcmp(got_a, pat_a, BYTES)) {
+            size_t i = 0;
+            while (i < BYTES && got_a[i] == pat_a[i]) i++;
+            vk_log("copy probe FAIL: A upload/download mismatch at byte %zu got=%02x want=%02x",
+                   i, got_a[i], pat_a[i]);
+            ok = 0;
+        } else {
+            vk_log("copy probe: A upload/download %ux%u exact match", W, H);
+        }
+    }
+    if (ok) {
+        for (uint32_t y = 0; y < H && ok; y++) {
+            for (uint32_t x = 0; x < W && ok; x++) {
+                const uint8_t *want;
+                if (x < 8 && y < 8) {
+                    want = (const uint8_t[]){ 255, 0, 0, 255 };
+                } else if (x >= 16 && x < 32 && y >= 16 && y < 32) {
+                    uint32_t sx = x - 16 + 8, sy = y - 16 + 8;
+                    want = pat_a + ((size_t)sy * W + sx) * 4;
+                } else {
+                    want = pat_b + ((size_t)y * W + x) * 4;
+                }
+                const uint8_t *have = got_b + ((size_t)y * W + x) * 4;
+                if (memcmp(have, want, 4)) {
+                    vk_log("copy probe FAIL: B[%u,%u] got=%02x%02x%02x%02x "
+                           "want=%02x%02x%02x%02x", x, y, have[0], have[1], have[2],
+                           have[3], want[0], want[1], want[2], want[3]);
+                    ok = 0;
+                }
+            }
+        }
+        if (ok) vk_log("copy probe: copied and cleared regions match every byte");
+    }
+
+    /* Format-mismatch blit, only when the device advertises both sides. */
+    VkFormat hdr_fmt = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(g.phys, hdr_fmt, &fp);
+    VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                                VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    int hdr_ok = (fp.optimalTilingFeatures & need) == need &&
+                 vk_format_can_blit(VK_FORMAT_R8G8B8A8_UNORM, 0);
+    if (!hdr_ok) {
+        vk_log("copy probe: format-mismatch blit skipped (RGBA8 -> B10G11R11 features=%#x)",
+               fp.optimalTilingFeatures);
+    } else if (ok) {
+        GfxTextureDesc hd = {
+            .target = GFX_TEXTURE_2D,
+            .vk_format = hdr_fmt,
+            .width = W, .height = H, .depth = 1,
+            .mip_levels = 1, .array_layers = 1, .samples = 1,
+        };
+        GfxTexture *hdr = gfx_backend_texture_create_desc(&hd, NULL, 0);
+        if (!hdr) {
+            vk_log("copy probe: format-mismatch blit skipped (HDR texture creation failed)");
+        } else if (!gfx_backend_texture_copy(hdr, 0, 0, 0, 0, 0,
+                                             a, 0, 0, 0, 0, 0, W, H, 1)) {
+            vk_log("copy probe: format-mismatch blit skipped (backend rejected blit)");
+        } else {
+            uint8_t *got = malloc(BYTES);
+            if (!got) {
+                vk_log("copy probe FAIL: HDR readback allocation failed");
+                ok = 0;
+            } else if (!gfx_backend_texture_download(hdr, 0, 0, 0, 0, W, H, got, BYTES)) {
+                vk_log("copy probe FAIL: HDR blit readback failed");
+                ok = 0;
+            } else {
+                static const uint32_t probes[3][2] = { {0, 0}, {10, 10}, {63, 63} };
+                for (unsigned i = 0; i < 3 && ok; i++) {
+                    uint32_t x = probes[i][0], y = probes[i][1];
+                    uint32_t packed;
+                    memcpy(&packed, got + ((size_t)y * W + x) * 4, 4);
+                    float rgb[3];
+                    vk_decode_b10g11r11(packed, rgb);
+                    const uint8_t *src = pat_a + ((size_t)y * W + x) * 4;
+                    float want[3] = { src[0] / 255.0f, src[1] / 255.0f, src[2] / 255.0f };
+                    for (unsigned c = 0; c < 3; c++) {
+                        float diff = rgb[c] - want[c];
+                        if (diff < 0) diff = -diff;
+                        if (diff > 0.02f) {
+                            vk_log("copy probe FAIL: blit[%u,%u] channel %u got=%.4f "
+                                   "want=%.4f", x, y, c, rgb[c], want[c]);
+                            ok = 0;
+                        }
+                    }
+                }
+                if (ok) vk_log("copy probe: RGBA8 -> B10G11R11 nearest blit verified");
+            }
+            free(got);
+        }
+        if (hdr) gfx_backend_texture_destroy(hdr);
+    }
+
+    if (a) gfx_backend_texture_destroy(a);
+    if (b) gfx_backend_texture_destroy(b);
+    free(pat_a); free(pat_b); free(got_a); free(got_b);
+    vk_log("copy probe %s", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
 }

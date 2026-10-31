@@ -1,0 +1,37 @@
+#version 450
+/* Repository-owned compute probe with a storage image (no game data).
+ *
+ * Same deterministic SSBO pattern as compute_probe.comp, plus an RGBA8
+ * storage image write.  The probe only uses this module when the device
+ * advertises VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT for RGBA8.
+ */
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform Params {
+    uint width;
+    uint height;
+    uint seed;
+    uint pad;
+    vec4 scale;
+} pc;
+
+layout(set = 0, binding = 1) buffer Out {
+    uint values[];
+} out_buf;
+
+layout(set = 0, binding = 2) uniform sampler2D src_tex;
+
+layout(set = 0, binding = 3, rgba8) uniform image2D out_img;
+
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.width || p.y >= pc.height) return;
+    uint idx = p.y * pc.width + p.x;
+    uint texv = uint(round(texelFetch(src_tex, ivec2(p) & ivec2(3), 0).r * 255.0));
+    uint v = (p.x + 1u) * 3u + (p.y + 1u) * 5u + pc.seed + texv * 7u;
+    out_buf.values[idx] = v;
+    imageStore(out_img, ivec2(p), vec4(float(v & 255u) / 255.0,
+                                       float((v >> 8) & 255u) / 255.0,
+                                       float((v >> 16) & 255u) / 255.0,
+                                       float((v >> 24) & 255u) / 255.0));
+}
