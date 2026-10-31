@@ -29,6 +29,8 @@
 #include <fcntl.h>
 #include "gfx_backend_android.h"
 #include "shader_cache_android.h"
+/* Repository-owned compute SPIR-V used by probe-nvn-compute (read-only). */
+#include "gfx_compute_spv.h"
 
 typedef uint32_t NvnBool;
 typedef void *NvnNativeWindow;
@@ -154,6 +156,14 @@ enum {
     NVN_CMD_DRAW,
     NVN_CMD_DRAW_INDEXED,
     NVN_CMD_UPDATE_UBO,
+    /* GPU transfer / compute commands (Wave 1 Lane 2).  Their payload is a
+     * snapshot taken while the guest records, because a guest ring buffer can
+     * be recycled long before the submit replays the command. */
+    NVN_CMD_CLEAR_TEXTURE,
+    NVN_CMD_COPY_TEXTURE_TO_TEXTURE,
+    NVN_CMD_COPY_BUFFER_TO_TEXTURE,
+    NVN_CMD_COPY_TEXTURE_TO_BUFFER,
+    NVN_CMD_DISPATCH,
 };
 
 /* Packed NVN state objects (same layout as the macOS NVN layer). */
@@ -200,6 +210,9 @@ static void nvn_render_state_defaults(nvn_render_state_t *r) {
                          .fail_b = 1, .zfail_b = 1, .zpass_b = 1 };
 }
 
+/* Host-side shader state of one NVNprogram (defined further down). */
+typedef struct prog_shader_state prog_shader_state_t;
+
 typedef struct {
     uint32_t kind;
     union {
@@ -220,17 +233,73 @@ typedef struct {
         /* Copy of nvnCommandBufferUpdateUniformBuffer's payload; written to
          * dst at submit time, in recorded order (NVN semantics). */
         struct { uint64_t dst; uint32_t size; uint8_t *data; } update;
+        /* ClearTexture: full payload snapshot (texture object, view level /
+         * layer, texel region, colour and channel mask). */
+        struct {
+            void *tex;
+            uint32_t level, layer;
+            int32_t x, y;
+            uint32_t width, height;
+            float rgba[4];
+            uint32_t mask;
+            uint32_t integer;      /* ClearTexturei/ui: rgba holds raw int bits */
+        } tex_clear;
+        /* CopyTextureToTexture: both ends, both views and both regions. */
+        struct {
+            void *src, *dst;
+            uint32_t src_level, src_layer, dst_level, dst_layer;
+            int32_t sx, sy, sz, dx, dy, dz;
+            uint32_t width, height, depth;
+            uint32_t flags;
+        } tex_copy;
+        /* CopyBufferToTexture.  `data` is a private copy of the guest buffer
+         * bytes taken at record time, so a recycled ring buffer cannot
+         * corrupt the replay. */
+        struct {
+            void *tex;
+            uint32_t level, layer;
+            int32_t x, y;
+            uint32_t width, height;
+            uint64_t address;      /* guest buffer address (for evidence) */
+            size_t size;           /* guest buffer size */
+            uint8_t *data;
+            size_t data_size;
+            uint32_t flags;
+        } buf_to_tex;
+        /* CopyTextureToBuffer: read back into the guest buffer at submit. */
+        struct {
+            void *tex;
+            uint32_t level, layer;
+            int32_t x, y;
+            uint32_t width, height;
+            uint64_t address;
+            size_t size;
+            uint32_t flags;
+        } tex_to_buf;
+        /* DispatchCompute: the program and the descriptor snapshot are taken
+         * while recording, never from the submit-time final state. */
+        struct {
+            uint32_t x, y, z;
+            void *prog;
+            struct nvn_dispatch_snap *bind;   /* private snapshot */
+            prog_shader_state_t *pstate;      /* retained program state */
+        } dispatch;
     } u;
 } nvn_cmd_t;
 
 /* Last bound descriptor state of a command buffer.  NVN binds by stage/slot;
  * the reflected pipeline maps that to a SPIR-V binding through .res.json. */
-typedef struct {
+typedef struct nvn_bind_state {
     struct { uint64_t address; size_t size; } ubo[6][16];
     struct { uint64_t address; size_t size; } ssbo[6][16];
     uint64_t tex[6][128];
+    /* Storage-image handles (nvnCommandBufferBindImage).  NVN's compute path
+     * binds images at the same compact indices as textures, so keep the same
+     * shape and mask convention. */
+    uint64_t img[6][16];
     uint32_t ubo_mask[6], ssbo_mask[6];
     uint32_t tex_mask[6][4];
+    uint32_t img_mask[6];
     uint32_t va[16];
     uint64_t vs[16];
     struct { uint64_t address; size_t size; } vb[16];
@@ -238,6 +307,27 @@ typedef struct {
     nvn_render_state_t rs;
     const void *depth_tex;
 } nvn_bind_state_t;
+
+/* A dispatch's immutable descriptor snapshot.  Texture handles are resolved to
+ * guest NVN texture objects while the texture pool is still live, so the
+ * submit path never has to dereference a pool that the guest recycled. */
+typedef struct nvn_dispatch_snap {
+    nvn_bind_state_t state;
+    const void *img_tex[16];
+    const void *tex_tex[128];
+} nvn_dispatch_snap_t;
+
+static void nvn_cmd_payload_free(nvn_cmd_t *cmd);
+
+/* Recorded GPU transfer/compute entry points (defined with the proc-address
+ * shims at the end of the file) and the program-state refcount helper. */
+static void nvn_trace_dispatch_compute(void *c, int x, int y, int z);
+static void nvn_trace_clear_texture(void *c, void *t, void *v, void *r, void *color, int mask);
+static void nvn_trace_copy_b2t(void *c, void *buf, void *t, void *v, void *r, int flags);
+static void nvn_trace_copy_t2t(void *c, const void *src, const void *sv, const void *sr,
+                               const void *dst, const void *dv, const void *dr, int flags);
+static void nvn_trace_copy_t2b(void *c, void *t, void *v, void *r, void *buf, int flags);
+static void nvn_prog_ref(prog_shader_state_t *s);
 
 /* Last uniform buffer bound by any command buffer, per (stage, slot).  NVN
  * state is queue-scoped on hardware: a bind recorded on one command buffer is
@@ -268,6 +358,32 @@ static int nvn_global_ubo_get(int stage, int index, uint64_t *address, size_t *s
         ok = 1;
     }
     pthread_mutex_unlock(&g_global_ubo_lock);
+    return ok;
+}
+
+/* Same queue-scoped table for storage buffers.  The compute path needs it for
+ * the same reason: the engine binds the per-frame SSBO table on a state-only
+ * recording and the dispatch buffer carries only what it changed. */
+static nvn_global_ubo_t g_global_ssbo[6][16];
+static pthread_mutex_t g_global_ssbo_lock = PTHREAD_MUTEX_INITIALIZER;
+static void nvn_global_ssbo_set(int stage, int index, uint64_t address, size_t size) {
+    if (stage < 0 || stage >= 6 || index < 0 || index >= 16) return;
+    pthread_mutex_lock(&g_global_ssbo_lock);
+    g_global_ssbo[stage][index].address = address;
+    g_global_ssbo[stage][index].size = size;
+    g_global_ssbo[stage][index].valid = (address != 0 && size != 0);
+    pthread_mutex_unlock(&g_global_ssbo_lock);
+}
+static int nvn_global_ssbo_get(int stage, int index, uint64_t *address, size_t *size) {
+    int ok = 0;
+    if (stage < 0 || stage >= 6 || index < 0 || index >= 16) return 0;
+    pthread_mutex_lock(&g_global_ssbo_lock);
+    if (g_global_ssbo[stage][index].valid) {
+        *address = g_global_ssbo[stage][index].address;
+        *size = g_global_ssbo[stage][index].size;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&g_global_ssbo_lock);
     return ok;
 }
 
@@ -609,6 +725,31 @@ static int nvn_global_tex_get(int stage, int slot, uint64_t *handle, const tex_t
         ok = 1;
     }
     pthread_mutex_unlock(&g_global_tex_lock);
+    return ok;
+}
+
+/* Queue-scoped image binds, mirroring the texture table.  A compute dispatch
+ * recorded on a later command buffer still sees an image bound earlier, the
+ * same way NVN queue state behaves. */
+static nvn_global_tex_t g_global_img[6][16];
+static pthread_mutex_t g_global_img_lock = PTHREAD_MUTEX_INITIALIZER;
+static void nvn_global_img_set(int stage, int slot, uint64_t handle, const tex_t *tex) {
+    if (stage < 0 || stage >= 6 || slot < 0 || slot >= 16) return;
+    pthread_mutex_lock(&g_global_img_lock);
+    g_global_img[stage][slot].handle = handle;
+    g_global_img[stage][slot].tex = tex;
+    pthread_mutex_unlock(&g_global_img_lock);
+}
+static int nvn_global_img_get(int stage, int slot, uint64_t *handle, const tex_t **tex) {
+    int ok = 0;
+    if (stage < 0 || stage >= 6 || slot < 0 || slot >= 16) return 0;
+    pthread_mutex_lock(&g_global_img_lock);
+    if (g_global_img[stage][slot].tex) {
+        if (handle) *handle = g_global_img[stage][slot].handle;
+        if (tex) *tex = g_global_img[stage][slot].tex;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&g_global_img_lock);
     return ok;
 }
 
@@ -3243,6 +3384,7 @@ typedef struct {
     uint32_t first_cmd, ncmds;
     uint32_t draw_count;             /* vertices referenced by draws */
     uint32_t clear_count;            /* color-0 clear commands */
+    uint32_t gpu_count;              /* dispatch / texture transfer commands */
     uint32_t clear_mask;
     float clear_rgba[4];
     const void *color0_tex;
@@ -3273,6 +3415,11 @@ static void nvn_seg_fill(const cb_t *c, nvn_seg_t *s, uint32_t first, uint32_t e
         const nvn_cmd_t *cc = &c->cmds[i];
         if (cc->kind == NVN_CMD_DRAW) s->draw_count += cc->u.draw.count;
         else if (cc->kind == NVN_CMD_DRAW_INDEXED) s->draw_count += cc->u.draw_indexed.count;
+        else if (cc->kind == NVN_CMD_DISPATCH ||
+                 cc->kind == NVN_CMD_CLEAR_TEXTURE ||
+                 cc->kind == NVN_CMD_COPY_TEXTURE_TO_TEXTURE ||
+                 cc->kind == NVN_CMD_COPY_BUFFER_TO_TEXTURE ||
+                 cc->kind == NVN_CMD_COPY_TEXTURE_TO_BUFFER) s->gpu_count++;
         else if (cc->kind == NVN_CMD_CLEAR_COLOR && cc->u.clear.index == 0) {
             s->clear_count++;
             s->clear_mask = cc->u.clear.mask;
@@ -3420,7 +3567,8 @@ static void nvn_cb_state_event(cb_t *c) {
 }
 
 /* Descriptor events are recorded in command order so the backend can give
- * each draw its own descriptor epoch.  kind: 0 UBO, 1 SSBO, 2 texture. */
+ * each draw its own descriptor epoch.  kind: 0 UBO, 1 SSBO, 2 texture,
+ * 3 storage image. */
 static void nvn_cb_desc_event(cb_t *c, uint32_t stage, uint32_t kind, uint32_t slot,
                               uint64_t address, size_t size, uint64_t handle) {
     nvn_cmd_t *cmd = nvn_cb_cmd(c, NVN_CMD_BIND_DESC);
@@ -3436,7 +3584,7 @@ static void nvn_cb_desc_event(cb_t *c, uint32_t stage, uint32_t kind, uint32_t s
 static void nvn_cb_free_commands(cb_t *c) {
     if (!c) return;
     for (uint32_t i = 0; i < c->ncmds; i++)
-        if (c->cmds[i].kind == NVN_CMD_UPDATE_UBO) free(c->cmds[i].u.update.data);
+        nvn_cmd_payload_free(&c->cmds[i]);
     free(c->cmds);
     c->cmds = NULL;
     c->ncmds = c->cmds_cap = 0;
@@ -3578,19 +3726,81 @@ static pthread_mutex_t g_retired_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int nvn_cmd_clone(nvn_cmd_t *dst, const nvn_cmd_t *src) {
     *dst = *src;
-    if (src->kind != NVN_CMD_UPDATE_UBO) return 1;
-    dst->u.update.data = NULL;
-    if (!src->u.update.data || !src->u.update.size) return 1;
-    uint8_t *copy = malloc(src->u.update.size);
-    if (!copy) return 0;
-    memcpy(copy, src->u.update.data, src->u.update.size);
-    dst->u.update.data = copy;
-    return 1;
+    switch (src->kind) {
+    case NVN_CMD_UPDATE_UBO:
+        dst->u.update.data = NULL;
+        if (!src->u.update.data || !src->u.update.size) return 1;
+        {
+            uint8_t *copy = malloc(src->u.update.size);
+            if (!copy) return 0;
+            memcpy(copy, src->u.update.data, src->u.update.size);
+            dst->u.update.data = copy;
+        }
+        return 1;
+    case NVN_CMD_COPY_BUFFER_TO_TEXTURE:
+        dst->u.buf_to_tex.data = NULL;
+        dst->u.buf_to_tex.data_size = 0;
+        if (!src->u.buf_to_tex.data || !src->u.buf_to_tex.data_size) return 1;
+        {
+            uint8_t *copy = malloc(src->u.buf_to_tex.data_size);
+            if (!copy) return 0;
+            memcpy(copy, src->u.buf_to_tex.data, src->u.buf_to_tex.data_size);
+            dst->u.buf_to_tex.data = copy;
+            dst->u.buf_to_tex.data_size = src->u.buf_to_tex.data_size;
+        }
+        return 1;
+    case NVN_CMD_DISPATCH:
+        /* Each copy owns its descriptor snapshot and its own reference on the
+         * program state, exactly like a fresh recording. */
+        dst->u.dispatch.bind = NULL;
+        dst->u.dispatch.pstate = NULL;
+        if (src->u.dispatch.bind) {
+            nvn_dispatch_snap_t *b = malloc(sizeof *b);
+            if (!b) return 0;
+            memcpy(b, src->u.dispatch.bind, sizeof *b);
+            dst->u.dispatch.bind = b;
+        }
+        if (src->u.dispatch.pstate) {
+            nvn_prog_ref(src->u.dispatch.pstate);
+            dst->u.dispatch.pstate = src->u.dispatch.pstate;
+        }
+        return 1;
+    default:
+        return 1;
+    }
 }
+
+/* Release the heap payload of one recorded command.  Used by both the live
+ * command list and the retired deep copies. */
+static void nvn_cmd_payload_free(nvn_cmd_t *cmd) {
+    if (!cmd) return;
+    switch (cmd->kind) {
+    case NVN_CMD_UPDATE_UBO:
+        free(cmd->u.update.data);
+        cmd->u.update.data = NULL;
+        break;
+    case NVN_CMD_COPY_BUFFER_TO_TEXTURE:
+        free(cmd->u.buf_to_tex.data);
+        cmd->u.buf_to_tex.data = NULL;
+        cmd->u.buf_to_tex.data_size = 0;
+        break;
+    case NVN_CMD_DISPATCH:
+        free(cmd->u.dispatch.bind);
+        cmd->u.dispatch.bind = NULL;
+        if (cmd->u.dispatch.pstate) {
+            nvn_prog_release(cmd->u.dispatch.pstate);
+            cmd->u.dispatch.pstate = NULL;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 static void nvn_retired_clear_locked(nvn_retired_t *e) {
     if (!e) return;
     for (uint32_t i = 0; i < e->ncmds; i++)
-        if (e->cmds[i].kind == NVN_CMD_UPDATE_UBO) free(e->cmds[i].u.update.data);
+        nvn_cmd_payload_free(&e->cmds[i]);
     for (uint32_t i = 0; i < e->nseg; i++) {
         if (!e->seg) break;
         nvn_prog_release(e->seg[i].pstate);
@@ -3663,8 +3873,7 @@ static void nvn_cb_retire(cb_t *c) {
     if (n && !cmds) { pthread_mutex_unlock(&g_retired_lock); return; }
     for (uint32_t i = 0; i < n; i++) {
         if (!nvn_cmd_clone(&cmds[i], &c->cmds[i])) {
-            for (uint32_t k = 0; k < i; k++)
-                if (cmds[k].kind == NVN_CMD_UPDATE_UBO) free(cmds[k].u.update.data);
+            for (uint32_t k = 0; k < i; k++) nvn_cmd_payload_free(&cmds[k]);
             free(cmds);
             pthread_mutex_unlock(&g_retired_lock);
             return;
@@ -4749,6 +4958,11 @@ static void nvn_bind_state_merge(nvn_bind_state_t *d, const nvn_bind_state_t *s)
             d->tex[st][i] = s->tex[st][i];
             d->tex_mask[st][i / 32] |= 1u << (i % 32);
         }
+        for (int i = 0; i < 16; i++) {
+            if (!(s->img_mask[st] & (1u << i))) continue;
+            d->img[st][i] = s->img[st][i];
+            d->img_mask[st] |= 1u << i;
+        }
     }
     if (s->va_mask) { memcpy(d->va, s->va, sizeof d->va); d->va_mask = s->va_mask; }
     if (s->vs_mask) { memcpy(d->vs, s->vs, sizeof d->vs); d->vs_mask = s->vs_mask; }
@@ -5058,6 +5272,7 @@ static void nvnCommandBufferBindStorageBuffer(cb_t *c, int stage, int i, uint64_
     b->ssbo[stage][i].address = address;
     b->ssbo[stage][i].size = size;
     b->ssbo_mask[stage] |= 1u << i;
+    nvn_global_ssbo_set(stage, i, address, size);
     nvn_cb_desc_event(c, (uint32_t)stage, 1, (uint32_t)i, address, size, 0);
     if (nvn_trace())
         fprintf(stderr, "[totk-nvn] BindStorageBuffer stage=%d index=%d addr=%#llx size=%zu\n",
@@ -5074,6 +5289,7 @@ static void nvnCommandBufferBindStorageBuffers(cb_t *c, int stage, int first, in
         b->ssbo[stage][first + i].address = r[i * 2];
         b->ssbo[stage][first + i].size = (size_t)r[i * 2 + 1];
         b->ssbo_mask[stage] |= 1u << (first + i);
+        nvn_global_ssbo_set(stage, first + i, r[i * 2], (size_t)r[i * 2 + 1]);
         nvn_cb_desc_event(c, (uint32_t)stage, 1, (uint32_t)(first + i),
                           r[i * 2], (size_t)r[i * 2 + 1], 0);
     }
@@ -5186,20 +5402,30 @@ static void nvnCommandBufferBindTextures(cb_t *c, int stage, int first, int n, c
 static void nvnCommandBufferBindImage(cb_t *c, int stage, int i, uint64_t handle) {
     nvn_api("nvnCommandBufferBindImage");
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferBindImage", "invalid command buffer"); return; }
-    if (i < 0) { nvn_fail("nvnCommandBufferBindImage", "invalid binding"); return; }
+    if (stage < 0 || stage >= 6 || i < 0 || i >= 16) { nvn_fail("nvnCommandBufferBindImage", "invalid binding"); return; }
+    /* Same handle convention as BindTexture: the pool id lives in the low
+     * bits (nvnDeviceGetImageHandle returns the index). */
+    const tex_pool_t *pool = nvn_tex_pool_for(c);
+    const tex_t *img = (handle && pool)
+                     ? nvn_tex_pool_lookup(pool, (int)(handle & 0xfffff)) : NULL;
+    nvn_bind_state_t *b = nvn_cb_bind_state(c);
+    if (b) {
+        b->img[stage][i] = handle;
+        if (handle) b->img_mask[stage] |= 1u << i;
+        else b->img_mask[stage] &= ~(1u << i);
+        nvn_cb_desc_event(c, (uint32_t)stage, 3, (uint32_t)i, 0, 0, handle);
+    }
+    nvn_global_img_set(stage, i, handle, img);
     if (nvn_trace())
-        fprintf(stderr, "[totk-nvn] BindImage stage=%d index=%d handle=%#llx\n",
-                stage, i, (unsigned long long)handle);
+        fprintf(stderr, "[totk-nvn] BindImage stage=%d index=%d handle=%#llx img=%p\n",
+                stage, i, (unsigned long long)handle, (const void *)img);
 }
 static void nvnCommandBufferBindImages(cb_t *c, int stage, int first, int n, const uint64_t *handles) {
     nvn_api("nvnCommandBufferBindImages");
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferBindImages", "invalid command buffer"); return; }
-    if (first < 0 || n < 0 || (!handles && n)) { nvn_fail("nvnCommandBufferBindImages", "invalid handles"); return; }
-    if (nvn_trace()) {
-        for (int i = 0; i < n; i++)
-            fprintf(stderr, "[totk-nvn] BindImages stage=%d index=%d handle=%#llx\n",
-                    stage, first + i, (unsigned long long)handles[i]);
-    }
+    if (stage < 0 || stage >= 6 || first < 0 || n < 0 || first + n > 16 || (!handles && n)) { nvn_fail("nvnCommandBufferBindImages", "invalid handles"); return; }
+    for (int i = 0; i < n; i++)
+        nvnCommandBufferBindImage(c, stage, first + i, handles[i]);
 }
 
 /* Program, sync, event                                                */
@@ -5222,6 +5448,10 @@ struct prog_shader_state {
     uint64_t variant_sig;
     unsigned loaded;                 /* bit per stage with a loaded module */
     GfxReflectedPipeline *pipeline;  /* most recently created pipeline */
+    /* Stage-5 (compute) pipeline, built lazily from the cached SPIR-V. */
+    GfxComputePipeline *compute_pipeline;
+    GfxBindingSpec compute_specs[64];
+    uint32_t compute_nspecs;
     int pipeline_format;
     uint64_t layout_sig;             /* render-target layout in the cache key */
     GfxRenderTargetLayout pipeline_layout;
@@ -5289,6 +5519,11 @@ static void prog_pipe_clear(prog_shader_state_t *s) {
 }
 static void prog_stage_clear(prog_shader_state_t *s, unsigned stage) {
     if (!s || stage >= RUNTIME_SHADER_STAGES) return;
+    if (stage == 5 && s->compute_pipeline) {
+        gfx_backend_compute_pipeline_destroy(s->compute_pipeline);
+        s->compute_pipeline = NULL;
+        s->compute_nspecs = 0;
+    }
     free(s->spv[stage]);
     s->spv[stage] = NULL;
     s->spv_size[stage] = 0;
@@ -5444,6 +5679,14 @@ static void nvn_prog_release(prog_shader_state_t *s) {
     pthread_mutex_lock(&g_prog_lock);
     if (s->refs) s->refs--;
     if (!s->refs && s->orphan) prog_state_free_locked(s);
+    pthread_mutex_unlock(&g_prog_lock);
+}
+/* Retain a program state for a recorded dispatch.  Mirrors the segment path:
+ * a finalized guest program stays alive until the last reference is dropped. */
+static void nvn_prog_ref(prog_shader_state_t *s) {
+    if (!s) return;
+    pthread_mutex_lock(&g_prog_lock);
+    s->refs++;
     pthread_mutex_unlock(&g_prog_lock);
 }
 static void nvnProgramFinalize(prog_t *p) {
@@ -5616,10 +5859,17 @@ static uint32_t nvn_program_set_shaders(prog_t *p, int n, const void *shaders,
     }
 
     int ready = (s->loaded & ((1u << 0) | (1u << 1))) == ((1u << 0) | (1u << 1));
+    int compute_ready = (s->loaded & (1u << 5)) != 0;
     if (ready && nvn_trace())
         fprintf(stderr, "[totk-nvn] program=%p has cached vs=%s ps=%s state=%p loaded=%#x\n",
                 (void *)p, s->key[0], s->key[1], (void *)s, s->loaded);
+    if (compute_ready && nvn_trace())
+        fprintf(stderr, "[totk-nvn] program=%p has cached compute key=%s state=%p loaded=%#x\n",
+                (void *)p, s->key[5], (void *)s, s->loaded);
     pthread_mutex_unlock(&g_prog_lock);
+    /* A compute-only program (stage 5) never needs a graphics pipeline and must
+     * not warm one: its pipeline is created on the first dispatch.  `ready`
+     * still requires vs+ps, so a compute program never reaches this block. */
     if (ready) {
         /* Prime the reflected pipeline on the game/recording thread.  A first
          * vkCreateGraphicsPipelines issued on the submit thread for these real
@@ -6608,6 +6858,9 @@ static uint32_t nvn_translate_commands(const cb_t *cb, GfxCmd *out, uint32_t max
             n++;
             break;
         case NVN_CMD_BIND_DESC: {
+            /* kind 3 is a storage-image bind: it has no graphics-pipeline
+             * meaning, so it never enters the draw list. */
+            if (c->u.desc.kind == 3) break;
             out[n].kind = GFX_CMD_BIND_DESC;
             out[n].u.bind.stage = c->u.desc.stage;
             out[n].u.bind.kind = c->u.desc.kind;
@@ -7108,6 +7361,579 @@ static void nvn_trace_segment_inputs(const char *tag, cb_t *view,
         fprintf(stderr, "[totk-frame] %s   vb %d addr=%#llx size=%zu first=%08x %08x %08x %08x\n",
                 tag, vi, (unsigned long long)va, bs->vb[vi].size, w0, w1, w2, w3);
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Recorded GPU transfer / compute replay                              */
+
+typedef struct {
+    unsigned clear_ok, clear_fail;
+    unsigned copy_ok, copy_fail;
+    unsigned upload_ok, upload_fail;
+    unsigned download_ok, download_fail;
+    unsigned dispatch_ok, dispatch_fail;
+    unsigned rt_clear_ok, rt_unsupported;
+    unsigned unsupported;
+} nvn_gpu_stats_t;
+static nvn_gpu_stats_t g_gpu_stats;
+
+static int nvn_gpu_trace(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("TOTK_ANDROID_TRACE_GPU") != NULL;
+    return on;
+}
+
+/* Mip extent of a guest texture (block sizes are the backend's business). */
+static void nvn_level_extent(const tex_t *t, uint32_t level, uint32_t *w, uint32_t *h) {
+    uint32_t lw = t ? t->d.width : 0, lh = t ? t->d.height : 0;
+    for (uint32_t i = 0; i < level; i++) {
+        lw = lw > 1 ? lw >> 1 : 1;
+        lh = lh > 1 ? lh >> 1 : 1;
+    }
+    if (w) *w = lw;
+    if (h) *h = lh;
+}
+
+/* Resolve a recorded region against the destination level.  NVN treats a
+ * zero width/height as "to the edge of the level". */
+static void nvn_region_resolve(int32_t x, int32_t y, uint32_t *w, uint32_t *h,
+                               uint32_t lw, uint32_t lh) {
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (!*w) *w = lw > (uint32_t)x ? lw - (uint32_t)x : 0;
+    if (!*h) *h = lh > (uint32_t)y ? lh - (uint32_t)y : 0;
+    if (*w && (uint32_t)x + *w > lw) *w = lw > (uint32_t)x ? lw - (uint32_t)x : 0;
+    if (*h && (uint32_t)y + *h > lh) *h = lh > (uint32_t)y ? lh - (uint32_t)y : 0;
+}
+
+static size_t nvn_texel_bytes(const tex_t *t) {
+    int vkfmt = t ? gfx_backend_vk_format_for_nvn((uint32_t)t->d.format) : 0;
+    int bpp = vkfmt ? gfx_backend_vk_format_bpp(vkfmt) : 0;
+    return bpp > 0 ? (size_t)bpp : 0;
+}
+
+/* A destination that is also a host render target cannot be written through a
+ * detached sampled GfxTexture: the compositor samples the render target, not
+ * that copy.  Report it instead of silently writing to a throw-away image. */
+static int nvn_tex_is_rt(const tex_t *t, GfxOffscreenTarget **rt,
+                         GfxRenderTargetLayout *layout, uint32_t *rw, uint32_t *rh) {
+    tex_bridge_t *b = nvn_tex_bridge(t, 0);
+    if (!b || !b->rt_valid || !b->rt) return 0;
+    if (rt) *rt = b->rt;
+    if (layout) *layout = b->rt_layout;
+    if (rw) *rw = b->rt_width;
+    if (rh) *rh = b->rt_height;
+    return 1;
+}
+
+static void nvn_gpu_report(const char *what, const nvn_cmd_t *cmd, const char *why) {
+    g_gpu_stats.unsupported++;
+    static unsigned logged;
+    if (logged++ < 32 || nvn_gpu_trace())
+        fprintf(stderr, "[totk-nvn] %s cmd=%u: %s (not faked)\n", what,
+                cmd ? cmd->kind : 0u, why ? why : "unsupported");
+}
+
+static int nvn_exec_clear_texture(const nvn_cmd_t *cmd) {
+    const void *texp = cmd->u.tex_clear.tex;
+    const tex_t *t = nvn_tex_registry_find(texp);
+    if (!t) {
+        g_gpu_stats.clear_fail++;
+        fprintf(stderr, "[totk-nvn] ClearTexture: texture %p is not a live NVN texture\n", texp);
+        return 0;
+    }
+    uint32_t level = cmd->u.tex_clear.level, layer = cmd->u.tex_clear.layer;
+    uint32_t lw = 0, lh = 0;
+    nvn_level_extent(t, level, &lw, &lh);
+    uint32_t w = cmd->u.tex_clear.width, h = cmd->u.tex_clear.height;
+    int32_t x = cmd->u.tex_clear.x, y = cmd->u.tex_clear.y;
+    nvn_region_resolve(x, y, &w, &h, lw, lh);
+    if (!w || !h) {
+        g_gpu_stats.clear_fail++;
+        fprintf(stderr, "[totk-nvn] ClearTexture tex=%p level=%u: empty region %ux%u\n",
+                texp, level, w, h);
+        return 0;
+    }
+    const float *rgba = cmd->u.tex_clear.rgba;
+    if (cmd->u.tex_clear.integer &&
+        !(x == 0 && y == 0 && w >= lw && h >= lh)) {
+        /* The frozen clear API takes float rgba.  A whole-level clear is exact
+         * because VkClearColorValue is a union of the raw bits, but a
+         * sub-region integer clear would be converted numerically. */
+        g_gpu_stats.unsupported++;
+        fprintf(stderr, "[totk-nvn] ClearTexture(i/ui) tex=%p sub-region %d,%d %ux%u:"
+                        " the frozen API has no integer sub-region clear (not faked)\n",
+                texp, x, y, w, h);
+        return 0;
+    }
+    if (cmd->u.tex_clear.mask != 0xfu) {
+        static unsigned mask_logged;
+        if (mask_logged++ < 8)
+            fprintf(stderr, "[totk-nvn] ClearTexture tex=%p mask=%#x: the backend clears"
+                            " every channel (no per-channel clear mask in the frozen API)\n",
+                    texp, cmd->u.tex_clear.mask);
+    }
+    GfxOffscreenTarget *rt = NULL;
+    GfxRenderTargetLayout rtl;
+    uint32_t rw = 0, rh = 0;
+    if (nvn_tex_is_rt(t, &rt, &rtl, &rw, &rh)) {
+        int full = x == 0 && y == 0 && w >= lw && h >= lh && level == 0 && layer == 0;
+        if (!full) {
+            g_gpu_stats.rt_unsupported++;
+            fprintf(stderr, "[totk-nvn] ClearTexture tex=%p is a render target (%ux%u); a"
+                            " partial clear (%d,%d %ux%u level=%u layer=%u) needs an"
+                            " offscreen-region primitive the frozen API does not have\n",
+                    texp, rw, rh, x, y, w, h, level, layer);
+            return 0;
+        }
+        if (!gfx_backend_offscreen_clear(rt, rgba[0], rgba[1], rgba[2], rgba[3])) {
+            g_gpu_stats.clear_fail++;
+            fprintf(stderr, "[totk-nvn] ClearTexture: offscreen clear of rt=%p failed\n",
+                    (void *)rt);
+            return 0;
+        }
+        /* The sampled copy must be rebuilt from the render target. */
+        nvn_tex_set_rt(t, rt, &rtl, rw, rh);
+        g_gpu_stats.rt_clear_ok++;
+        g_gpu_stats.clear_ok++;
+        if (nvn_gpu_trace() || nvn_trace_frame())
+            fprintf(stderr, "[totk-nvn] ClearTexture rt=%p %ux%u rgba=%.3f,%.3f,%.3f,%.3f"
+                            " mask=%#x\n", (void *)rt, rw, rh, rgba[0], rgba[1], rgba[2],
+                    rgba[3], cmd->u.tex_clear.mask);
+        return 1;
+    }
+    GfxTexture *g = nvn_texture_gfx_ready(t);
+    if (!g) {
+        g_gpu_stats.clear_fail++;
+        fprintf(stderr, "[totk-nvn] ClearTexture tex=%p: no host texture"
+                        " (fmt=%#x %ux%u target=%d)\n", texp, t->d.format,
+                t->d.width, t->d.height, t->d.target);
+        return 0;
+    }
+    int ok = gfx_backend_texture_clear(g, level, layer, rgba, x, y, w, h);
+    if (ok) g_gpu_stats.clear_ok++; else g_gpu_stats.clear_fail++;
+    if (nvn_gpu_trace() || nvn_trace_frame())
+        fprintf(stderr, "[totk-nvn] ClearTexture tex=%p gfx=%p level=%u layer=%u"
+                        " %d,%d %ux%u rgba=%.3f,%.3f,%.3f,%.3f mask=%#x ok=%d\n",
+                texp, (void *)g, level, layer, x, y, w, h, rgba[0], rgba[1], rgba[2],
+                rgba[3], cmd->u.tex_clear.mask, ok);
+    return ok;
+}
+
+static int nvn_exec_copy_t2t(const nvn_cmd_t *cmd) {
+    const void *srcp = cmd->u.tex_copy.src, *dstp = cmd->u.tex_copy.dst;
+    const tex_t *src = nvn_tex_registry_find(srcp);
+    const tex_t *dst = nvn_tex_registry_find(dstp);
+    if (!src || !dst) {
+        g_gpu_stats.copy_fail++;
+        fprintf(stderr, "[totk-nvn] CopyTextureToTexture: src=%p(%s) dst=%p(%s) not live\n",
+                srcp, src ? "tex" : "?", dstp, dst ? "tex" : "?");
+        return 0;
+    }
+    GfxOffscreenTarget *drt = NULL;
+    if (nvn_tex_is_rt(dst, &drt, NULL, NULL, NULL)) {
+        g_gpu_stats.rt_unsupported++;
+        fprintf(stderr, "[totk-nvn] CopyTextureToTexture dst=%p is a render target (%p);"
+                        " copying into it needs an offscreen write primitive the frozen"
+                        " API does not have (source %p %#x %ux%u)\n", dstp, (void *)drt,
+                srcp, src->d.format, src->d.width, src->d.height);
+        return 0;
+    }
+    GfxTexture *sg = nvn_texture_gfx_ready(src);
+    GfxTexture *dg = nvn_texture_gfx_ready(dst);
+    if (!sg || !dg) {
+        g_gpu_stats.copy_fail++;
+        fprintf(stderr, "[totk-nvn] CopyTextureToTexture: host texture missing src=%p dst=%p\n",
+                (void *)sg, (void *)dg);
+        return 0;
+    }
+    uint32_t slw = 0, slh = 0, dlw = 0, dlh = 0;
+    nvn_level_extent(src, cmd->u.tex_copy.src_level, &slw, &slh);
+    nvn_level_extent(dst, cmd->u.tex_copy.dst_level, &dlw, &dlh);
+    uint32_t w = cmd->u.tex_copy.width, h = cmd->u.tex_copy.height;
+    if (!w) w = slw < dlw ? slw : dlw;
+    if (!h) h = slh < dlh ? slh : dlh;
+    uint32_t d = cmd->u.tex_copy.depth;
+    if (!d) d = 1;
+    int ok = gfx_backend_texture_copy(dg, cmd->u.tex_copy.dst_level, cmd->u.tex_copy.dst_layer,
+                                      cmd->u.tex_copy.dx, cmd->u.tex_copy.dy, cmd->u.tex_copy.dz,
+                                      sg, cmd->u.tex_copy.src_level, cmd->u.tex_copy.src_layer,
+                                      cmd->u.tex_copy.sx, cmd->u.tex_copy.sy, cmd->u.tex_copy.sz,
+                                      w, h, d);
+    if (ok) g_gpu_stats.copy_ok++; else g_gpu_stats.copy_fail++;
+    if (nvn_gpu_trace() || nvn_trace_frame())
+        fprintf(stderr, "[totk-nvn] CopyTextureToTexture src=%p(%#x %ux%u lv%u) dst=%p"
+                        "(%#x %ux%u lv%u) src=%d,%d,%d dst=%d,%d,%d %ux%ux%u ok=%d\n",
+                srcp, src->d.format, src->d.width, src->d.height, cmd->u.tex_copy.src_level,
+                dstp, dst->d.format, dst->d.width, dst->d.height, cmd->u.tex_copy.dst_level,
+                cmd->u.tex_copy.sx, cmd->u.tex_copy.sy, cmd->u.tex_copy.sz,
+                cmd->u.tex_copy.dx, cmd->u.tex_copy.dy, cmd->u.tex_copy.dz, w, h, d, ok);
+    return ok;
+}
+
+static int nvn_exec_copy_b2t(const nvn_cmd_t *cmd) {
+    const void *texp = cmd->u.buf_to_tex.tex;
+    const tex_t *t = nvn_tex_registry_find(texp);
+    if (!t) {
+        g_gpu_stats.upload_fail++;
+        fprintf(stderr, "[totk-nvn] CopyBufferToTexture: dst texture %p not live\n", texp);
+        return 0;
+    }
+    if (!cmd->u.buf_to_tex.data || !cmd->u.buf_to_tex.data_size) {
+        g_gpu_stats.upload_fail++;
+        fprintf(stderr, "[totk-nvn] CopyBufferToTexture: dst=%p has no recorded payload\n", texp);
+        return 0;
+    }
+    GfxOffscreenTarget *drt = NULL;
+    if (nvn_tex_is_rt(t, &drt, NULL, NULL, NULL)) {
+        g_gpu_stats.rt_unsupported++;
+        fprintf(stderr, "[totk-nvn] CopyBufferToTexture dst=%p is a render target (%p);"
+                        " the frozen API has no offscreen upload primitive\n",
+                texp, (void *)drt);
+        return 0;
+    }
+    GfxTexture *g = nvn_texture_gfx_ready(t);
+    if (!g) {
+        g_gpu_stats.upload_fail++;
+        fprintf(stderr, "[totk-nvn] CopyBufferToTexture dst=%p: no host texture\n", texp);
+        return 0;
+    }
+    uint32_t lw = 0, lh = 0;
+    nvn_level_extent(t, cmd->u.buf_to_tex.level, &lw, &lh);
+    uint32_t w = cmd->u.buf_to_tex.width, h = cmd->u.buf_to_tex.height;
+    int32_t x = cmd->u.buf_to_tex.x, y = cmd->u.buf_to_tex.y;
+    nvn_region_resolve(x, y, &w, &h, lw, lh);
+    size_t bpp = nvn_texel_bytes(t);
+    size_t need = (size_t)w * h * bpp;
+    if (!w || !h || !bpp || !need) {
+        g_gpu_stats.upload_fail++;
+        fprintf(stderr, "[totk-nvn] CopyBufferToTexture dst=%p: %ux%u bpp=%zu region invalid\n",
+                texp, w, h, bpp);
+        return 0;
+    }
+    size_t n = need < cmd->u.buf_to_tex.data_size ? need : cmd->u.buf_to_tex.data_size;
+    int ok = gfx_backend_texture_upload(g, cmd->u.buf_to_tex.level, cmd->u.buf_to_tex.layer,
+                                        x, y, w, h, cmd->u.buf_to_tex.data, n);
+    if (ok) g_gpu_stats.upload_ok++; else g_gpu_stats.upload_fail++;
+    if (nvn_gpu_trace() || nvn_trace_frame())
+        fprintf(stderr, "[totk-nvn] CopyBufferToTexture dst=%p(%#x %ux%u lv%u) %d,%d %ux%u"
+                        " bytes=%zu of %zu ok=%d\n", texp, t->d.format, t->d.width,
+                t->d.height, cmd->u.buf_to_tex.level, x, y, w, h, n,
+                cmd->u.buf_to_tex.data_size, ok);
+    return ok;
+}
+
+static int nvn_exec_copy_t2b(const nvn_cmd_t *cmd) {
+    const void *texp = cmd->u.tex_to_buf.tex;
+    const tex_t *t = nvn_tex_registry_find(texp);
+    if (!t || !cmd->u.tex_to_buf.address) {
+        g_gpu_stats.download_fail++;
+        fprintf(stderr, "[totk-nvn] CopyTextureToBuffer: tex=%p(%s) dst=%#llx invalid\n",
+                texp, t ? "tex" : "?", (unsigned long long)cmd->u.tex_to_buf.address);
+        return 0;
+    }
+    GfxTexture *g = nvn_texture_gfx_ready(t);
+    if (!g) {
+        g_gpu_stats.download_fail++;
+        fprintf(stderr, "[totk-nvn] CopyTextureToBuffer src=%p: no host texture\n", texp);
+        return 0;
+    }
+    uint32_t lw = 0, lh = 0;
+    nvn_level_extent(t, cmd->u.tex_to_buf.level, &lw, &lh);
+    uint32_t w = cmd->u.tex_to_buf.width, h = cmd->u.tex_to_buf.height;
+    int32_t x = cmd->u.tex_to_buf.x, y = cmd->u.tex_to_buf.y;
+    nvn_region_resolve(x, y, &w, &h, lw, lh);
+    size_t bpp = nvn_texel_bytes(t);
+    size_t need = (size_t)w * h * bpp;
+    if (!w || !h || !bpp || !need) {
+        g_gpu_stats.download_fail++;
+        fprintf(stderr, "[totk-nvn] CopyTextureToBuffer src=%p: %ux%u bpp=%zu region invalid\n",
+                texp, w, h, bpp);
+        return 0;
+    }
+    uint8_t *tmp = malloc(need);
+    if (!tmp) {
+        g_gpu_stats.download_fail++;
+        return 0;
+    }
+    int ok = gfx_backend_texture_download(g, cmd->u.tex_to_buf.level, cmd->u.tex_to_buf.layer,
+                                          x, y, w, h, tmp, need);
+    if (ok) {
+        size_t n = need < cmd->u.tex_to_buf.size ? need : cmd->u.tex_to_buf.size;
+        memcpy((void *)(uintptr_t)cmd->u.tex_to_buf.address, tmp, n);
+        g_gpu_stats.download_ok++;
+        if (nvn_gpu_trace() || nvn_trace_frame()) {
+            uint32_t nz = nvn_first_nonzero(tmp, n, 1u << 20);
+            fprintf(stderr, "[totk-nvn] CopyTextureToBuffer src=%p(%#x %ux%u lv%u) -> %#llx"
+                            " %d,%d %ux%u bytes=%zu first_nz=%s%u\n", texp, t->d.format,
+                    t->d.width, t->d.height, cmd->u.tex_to_buf.level,
+                    (unsigned long long)cmd->u.tex_to_buf.address, x, y, w, h, n,
+                    nz == UINT32_MAX ? "none " : "", nz == UINT32_MAX ? 0 : nz);
+        }
+    } else {
+        g_gpu_stats.download_fail++;
+        fprintf(stderr, "[totk-nvn] CopyTextureToBuffer src=%p: download failed\n", texp);
+    }
+    free(tmp);
+    return ok;
+}
+
+/* Build (or reuse) the compute pipeline of one program state.  Reflection uses
+ * the same .res.json/SPIR-V path as the graphics pipelines and all compute
+ * bindings live in descriptor set 0. */
+static GfxComputePipeline *nvn_compute_pipeline_get(prog_shader_state_t *s,
+                                                    GfxBindingSpec *out, uint32_t *nout) {
+    if (!s) return NULL;
+    GfxComputePipeline *cached = NULL;
+    uint32_t ncached = 0;
+    GfxBindingSpec specs[64];
+    uint32_t nspecs = 0;
+    pthread_mutex_lock(&g_prog_lock);
+    cached = s->compute_pipeline;
+    ncached = s->compute_nspecs;
+    if (cached && ncached) memcpy(specs, s->compute_specs, ncached * sizeof *specs);
+    uint8_t *spv = s->spv[5];
+    size_t spv_size = s->spv_size[5];
+    if (!cached && spv && spv_size) {
+        const char *res = s->res_path[5][0] ? s->res_path[5] : NULL;
+        const char *spv_path = s->spv_path[5][0] ? s->spv_path[5] : NULL;
+        nspecs = gfx_reflect_full(res, spv_path, 0, specs, 64);
+        /* The SPIR-V-only reflection in loader_android.c classifies a legacy
+         * BufferBlock SSBO (OpDecorate without a value word) as a uniform
+         * block.  The .res.json section is authoritative for "cbuf vs sbuf",
+         * so take the buffer kind from there when the two disagree. */
+        GfxBindingSpec json[64];
+        unsigned njson = gfx_reflect_full(res, NULL, 0, json, 64);
+        for (uint32_t i = 0; i < nspecs; i++) {
+            for (unsigned j = 0; j < njson; j++) {
+                if (json[j].binding != specs[i].binding) continue;
+                if ((json[j].kind == GFX_BIND_UBO || json[j].kind == GFX_BIND_SSBO) &&
+                    specs[i].kind != json[j].kind)
+                    specs[i].kind = json[j].kind;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_prog_lock);
+    if (cached) {
+        if (out && ncached) memcpy(out, specs, ncached * sizeof *out);
+        if (nout) *nout = ncached;
+        if (nvn_gpu_trace())
+            for (uint32_t i = 0; i < ncached; i++)
+                fprintf(stderr, "[totk-nvn] compute spec[%u] binding=%u kind=%d count=%u"
+                                " nvn_slot=%d cbuf=%d off=%d\n", i, specs[i].binding,
+                        (int)specs[i].kind, specs[i].count, specs[i].nvn_slot,
+                        specs[i].nvn_cbuf_slot, specs[i].nvn_cb_offset);
+        return cached;
+    }
+    if (!spv || !spv_size) return NULL;
+    GfxComputePipeline *cp = gfx_backend_compute_pipeline_create(spv, spv_size, specs, nspecs);
+    if (!cp) {
+        fprintf(stderr, "[totk-nvn] compute: pipeline creation failed (spv=%zu bindings=%u)\n",
+                spv_size, nspecs);
+        return NULL;
+    }
+    pthread_mutex_lock(&g_prog_lock);
+    if (s->compute_pipeline) {
+        /* Another thread won the race; keep the first one. */
+        gfx_backend_compute_pipeline_destroy(cp);
+        cp = s->compute_pipeline;
+        ncached = s->compute_nspecs;
+        if (out && ncached) memcpy(out, s->compute_specs, ncached * sizeof *out);
+        if (nout) *nout = ncached;
+    } else {
+        s->compute_pipeline = cp;
+        s->compute_nspecs = nspecs;
+        if (nspecs) memcpy(s->compute_specs, specs, nspecs * sizeof *specs);
+        if (out && nspecs) memcpy(out, specs, nspecs * sizeof *out);
+        if (nout) *nout = nspecs;
+    }
+    pthread_mutex_unlock(&g_prog_lock);
+    if (nvn_gpu_trace()) {
+        fprintf(stderr, "[totk-nvn] compute pipeline %p bindings=%u\n", (void *)cp, nspecs);
+        for (uint32_t i = 0; i < nspecs; i++)
+            fprintf(stderr, "[totk-nvn] compute spec[%u] binding=%u kind=%d count=%u"
+                            " nvn_slot=%d cbuf=%d off=%d\n", i, specs[i].binding,
+                    (int)specs[i].kind, specs[i].count, specs[i].nvn_slot,
+                    specs[i].nvn_cbuf_slot, specs[i].nvn_cb_offset);
+    }
+    return cp;
+}
+
+/* Map the NVN descriptor state of one dispatch onto the reflected SPIR-V
+ * bindings, then run it.  Every required binding must resolve; a missing one
+ * fails the dispatch instead of running it with a dummy resource. */
+static int nvn_exec_dispatch(const nvn_cmd_t *cmd) {
+    prog_shader_state_t *s = cmd->u.dispatch.pstate;
+    const nvn_dispatch_snap_t *ds = cmd->u.dispatch.bind;
+    const nvn_bind_state_t *b = ds ? &ds->state : NULL;
+    if (!s || !b) {
+        g_gpu_stats.dispatch_fail++;
+        fprintf(stderr, "[totk-nvn] DispatchCompute %ux%ux%u: no retained program/bind"
+                        " snapshot\n", cmd->u.dispatch.x, cmd->u.dispatch.y,
+                cmd->u.dispatch.z);
+        return 0;
+    }
+    GfxBindingSpec specs[64];
+    uint32_t nspecs = 0;
+    GfxComputePipeline *cp = nvn_compute_pipeline_get(s, specs, &nspecs);
+    if (!cp) {
+        g_gpu_stats.dispatch_fail++;
+        fprintf(stderr, "[totk-nvn] DispatchCompute %ux%ux%u: program=%p has no compute"
+                        " SPIR-V in the cache\n", cmd->u.dispatch.x, cmd->u.dispatch.y,
+                cmd->u.dispatch.z, cmd->u.dispatch.prog);
+        return 0;
+    }
+    int ok = 1;
+    unsigned bound_buffers = 0, bound_tex = 0;
+    for (uint32_t i = 0; i < nspecs && ok; i++) {
+        const GfxBindingSpec *sp = &specs[i];
+        if (sp->kind == GFX_BIND_UBO || sp->kind == GFX_BIND_SSBO) {
+            int slot = sp->nvn_slot;
+            if (slot < 0 || slot >= 16) {
+                fprintf(stderr, "[totk-nvn] compute binding %u (%s) has no NVN slot\n",
+                        sp->binding, sp->kind == GFX_BIND_UBO ? "ubo" : "ssbo");
+                ok = 0;
+                break;
+            }
+            const uint64_t addr = sp->kind == GFX_BIND_UBO
+                                ? b->ubo[5][slot].address : b->ssbo[5][slot].address;
+            const size_t size = sp->kind == GFX_BIND_UBO
+                              ? b->ubo[5][slot].size : b->ssbo[5][slot].size;
+            if (!addr || !size) {
+                fprintf(stderr, "[totk-nvn] compute binding %u (%s slot %d) not bound on the"
+                                " compute stage\n", sp->binding,
+                        sp->kind == GFX_BIND_UBO ? "ubo" : "ssbo", slot);
+                ok = 0;
+                break;
+            }
+            if (!gfx_backend_compute_bind_buffer(cp, sp->set, sp->binding,
+                                                 (const void *)(uintptr_t)addr, size)) {
+                fprintf(stderr, "[totk-nvn] compute bind buffer binding=%u slot=%d size=%zu"
+                                " failed\n", sp->binding, slot, size);
+                ok = 0;
+                break;
+            }
+            bound_buffers++;
+            if (nvn_gpu_trace())
+                fprintf(stderr, "[totk-nvn] compute bind %s binding=%u slot=%d addr=%#llx"
+                                " size=%zu\n", sp->kind == GFX_BIND_UBO ? "ubo" : "ssbo",
+                        sp->binding, slot, (unsigned long long)addr, size);
+        } else if (sp->kind == GFX_BIND_SAMPLED_IMAGE ||
+                   sp->kind == GFX_BIND_COMBINED_IMAGE_SAMPLER ||
+                   sp->kind == GFX_BIND_STORAGE_IMAGE) {
+            int slot = sp->nvn_slot;
+            const void *tp = NULL;
+            if (slot >= 0 && slot < 16) tp = ds->img_tex[slot];
+            if (!tp && slot >= 0 && slot < 128) tp = ds->tex_tex[slot];
+            if (!tp && slot >= 0 && slot < 16) {
+                /* Bound on an earlier command buffer: queue-scoped image state. */
+                uint64_t gh = 0;
+                const tex_t *gt = NULL;
+                if (nvn_global_img_get(5, slot, &gh, &gt) && gt) tp = gt;
+            }
+            if (!tp && slot >= 0 && slot < 128) {
+                uint64_t gh = 0;
+                const tex_t *gt = NULL;
+                if (nvn_global_tex_get(5, slot, &gh, &gt) && gt) tp = gt;
+            }
+            const tex_t *t = nvn_tex_registry_find(tp);            if (!t) {
+                fprintf(stderr, "[totk-nvn] compute binding %u (%s slot %d) has no texture\n",
+                        sp->binding, sp->kind == GFX_BIND_STORAGE_IMAGE ? "image" : "texture",
+                        slot);
+                ok = 0;
+                break;
+            }
+            GfxTexture *g = nvn_texture_gfx_ready(t);
+            if (!g) {
+                fprintf(stderr, "[totk-nvn] compute binding %u: texture %p has no host image\n",
+                        sp->binding, (const void *)t);
+                ok = 0;
+                break;
+            }
+            if (!gfx_backend_compute_bind_texture(cp, sp->set, sp->binding, g)) {
+                fprintf(stderr, "[totk-nvn] compute bind texture binding=%u slot=%d failed\n",
+                        sp->binding, slot);
+                ok = 0;
+                break;
+            }
+            bound_tex++;
+        } else {
+            fprintf(stderr, "[totk-nvn] compute binding %u kind=%d is not supported\n",
+                    sp->binding, (int)sp->kind);
+            ok = 0;
+        }
+    }
+    if (!ok) {
+        g_gpu_stats.dispatch_fail++;
+        return 0;
+    }
+    if (!gfx_backend_compute_dispatch(cp, cmd->u.dispatch.x, cmd->u.dispatch.y,
+                                      cmd->u.dispatch.z)) {
+        g_gpu_stats.dispatch_fail++;
+        fprintf(stderr, "[totk-nvn] DispatchCompute %ux%ux%u failed (bindings=%u buffers=%u"
+                        " textures=%u)\n", cmd->u.dispatch.x, cmd->u.dispatch.y,
+                cmd->u.dispatch.z, nspecs, bound_buffers, bound_tex);
+        return 0;
+    }
+    /* The guest owns buffer memory: publish SSBO results back so later draws
+     * (and the guest itself) observe what the shader wrote. */
+    for (uint32_t i = 0; i < nspecs; i++) {
+        const GfxBindingSpec *sp = &specs[i];
+        if (sp->kind != GFX_BIND_SSBO) continue;
+        int slot = sp->nvn_slot;
+        if (slot < 0 || slot >= 16) continue;
+        uint64_t addr = b->ssbo[5][slot].address;
+        size_t size = b->ssbo[5][slot].size;
+        if (!addr || !size) continue;
+        if (!gfx_backend_compute_read_buffer(cp, sp->set, sp->binding,
+                                             (void *)(uintptr_t)addr, size))
+            fprintf(stderr, "[totk-nvn] compute readback binding=%u slot=%d size=%zu failed\n",
+                    sp->binding, slot, size);
+    }
+    g_gpu_stats.dispatch_ok++;
+    if (nvn_gpu_trace() || nvn_trace_frame())
+        fprintf(stderr, "[totk-nvn] DispatchCompute %ux%ux%u program=%p bindings=%u"
+                        " buffers=%u textures=%u\n", cmd->u.dispatch.x, cmd->u.dispatch.y,
+                cmd->u.dispatch.z, cmd->u.dispatch.prog, nspecs, bound_buffers, bound_tex);
+    return 1;
+}
+
+/* Replay every recorded transfer/compute command of a command list in the
+ * order the guest recorded them.  Draws are translated separately, so this
+ * runs before the draw list is executed. */
+static void nvn_gpu_stats_log(const char *where) {
+    static unsigned calls;
+    if (!nvn_gpu_trace() && !nvn_trace_composite()) return;
+    if (calls++ % 256) return;
+    fprintf(stderr, "[totk-nvn] gpu stats %s: recorded clear=%u t2t=%u b2t=%u t2b=%u"
+                    " dispatch=%u blit=%u | replayed clear=%u/%u copy=%u/%u upload=%u/%u"
+                    " download=%u/%u dispatch=%u/%u rt-unsupported=%u unsupported=%u\n",
+            where ? where : "?", nvn_cb_clear_texture_calls, nvn_cb_copy_t2t_calls,
+            nvn_cb_copy_b2t, nvn_cb_copy_t2b_calls, nvn_cb_dispatch_calls, nvn_cb_blit_calls,
+            g_gpu_stats.clear_ok, g_gpu_stats.clear_fail,
+            g_gpu_stats.copy_ok, g_gpu_stats.copy_fail,
+            g_gpu_stats.upload_ok, g_gpu_stats.upload_fail,
+            g_gpu_stats.download_ok, g_gpu_stats.download_fail,
+            g_gpu_stats.dispatch_ok, g_gpu_stats.dispatch_fail,
+            g_gpu_stats.rt_unsupported, g_gpu_stats.unsupported);
+}
+
+static void nvn_exec_gpu_commands(const nvn_cmd_t *cmds, uint32_t ncmds,
+                                  const char *where) {
+    if (!cmds || !ncmds) return;
+    for (uint32_t i = 0; i < ncmds; i++) {
+        const nvn_cmd_t *c = &cmds[i];
+        switch (c->kind) {
+        case NVN_CMD_CLEAR_TEXTURE: nvn_exec_clear_texture(c); break;
+        case NVN_CMD_COPY_TEXTURE_TO_TEXTURE: nvn_exec_copy_t2t(c); break;
+        case NVN_CMD_COPY_BUFFER_TO_TEXTURE: nvn_exec_copy_b2t(c); break;
+        case NVN_CMD_COPY_TEXTURE_TO_BUFFER: nvn_exec_copy_t2b(c); break;
+        case NVN_CMD_DISPATCH: nvn_exec_dispatch(c); break;
+        default: break;
+        }
+    }
+    nvn_gpu_stats_log(where);
 }
 
 /* Render one retired offscreen segment from its immutable snapshot.  Each
@@ -7649,6 +8475,11 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             }
         }
         nvn_cb_apply_uniform_updates(cb);
+        /* Replay the recorded texture transfers and compute dispatches before
+         * the draw list runs, in the order the guest recorded them.  This also
+         * covers command buffers with no render target (pure compute/upload
+         * work), which the target check below skips. */
+        nvn_exec_gpu_commands(cb->cmds, cb->ncmds, "submit");
         if (nvn_trace_first() && nvn_submit_trace++ < 4096) {
             const nvn_bind_state_t *sb = cb->bind_state;
             fprintf(stderr, "[totk-nvn] Submit#%u handle=%#llx cb=%p prog=%p draw=%d"
@@ -7719,6 +8550,9 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             have_layout = layout.color_count > 0 && rw && rh;
         }
         if (!has_window && !have_layout) {
+            /* A command buffer that only uploads, clears or dispatches compute
+             * work is valid NVN: its GPU commands were replayed above. */
+            if (!cb->draw_count) continue;
             nvn_fail("nvnQueueSubmitCommands", "command buffer has no target");
             continue;
         }
@@ -8394,7 +9228,7 @@ static void nvn_probe_pair_free(nvn_probe_pair_t *pair) {
 static int nvn_probe_install_stage(prog_t *p, unsigned stage, const uint8_t *spv,
                                    size_t size, const char *res,
                                    const RuntimeShaderIdentity *id) {
-    if (!p || stage > 1 || !spv || !size || !id) return 0;
+    if (!p || stage >= RUNTIME_SHADER_STAGES || !spv || !size || !id) return 0;
     pthread_mutex_lock(&g_prog_lock);
     prog_shader_state_t *s = prog_state_find(p);
     if (!s) {
@@ -9060,6 +9894,397 @@ int runtime_nvn_state_selftest(const char *screenshot, int frames) {
     nvnWindowFinalize(&w);
     fprintf(stderr, "[totk-nvn] state selftest %s\n", ok ? "PASS" : "FAIL");
     return ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* Lane 2 probes: NVN texture copy/clear recording+replay and compute  */
+
+/* 32x32 RGBA8 NVN texture with no guest storage; the host image is created
+ * directly from linear pixels so the probe never depends on block-linear
+ * deswizzling. */
+static int nvn_probe_make_texture(tex_t *t, uint32_t w, uint32_t h, uint32_t format,
+                                  const uint8_t *pixels) {
+    tex_builder_t tb;
+    memset(&tb, 0, sizeof tb);
+    nvnTextureBuilderSetDefaults(&tb);
+    tb.d.target = NVN_TARGET_2D;
+    tb.d.format = (int)format;
+    tb.d.width = w;
+    tb.d.height = h;
+    tb.d.depth = 1;
+    tb.d.levels = 1;
+    tb.d.samples = 1;
+    if (!nvnTextureInitialize(t, &tb)) return 0;
+    if (pixels) {
+        if (!runtime_nvn_texture_upload_rgba8(t, pixels, w, h)) return 0;
+    }
+    return 1;
+}
+
+static void nvn_probe_fill(uint8_t *p, uint32_t w, uint32_t h, uint32_t seed) {
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w; x++) {
+            uint8_t *q = p + ((size_t)y * w + x) * 4;
+            q[0] = (uint8_t)(seed + x * 3u + y * 5u);
+            q[1] = (uint8_t)(seed * 3u + x * 7u + y * 11u);
+            q[2] = (uint8_t)(seed * 5u + x * 13u + y * 17u);
+            q[3] = (uint8_t)(0x80u + (x + y) % 0x7fu);
+        }
+}
+
+int nvn_copy_probe(const char *work_dir) {
+    const uint32_t W = 32, H = 32;
+    const size_t BYTES = (size_t)W * H * 4;
+    fprintf(stderr, "[totk-nvn] copy probe begin work=%s\n", work_dir ? work_dir : "(null)");
+    int ok = 1;
+
+    nvn_dev_t d;
+    dev_builder_t db;
+    memset(&d, 0, sizeof d);
+    memset(&db, 0, sizeof db);
+    if (!nvnDeviceInitialize(&d, &db)) {
+        fprintf(stderr, "[totk-nvn] copy probe FAIL: device\n");
+        return 1;
+    }
+    queue_t q;
+    queue_builder_t qb;
+    memset(&q, 0, sizeof q);
+    memset(&qb, 0, sizeof qb);
+    qb.dev = &d; qb.flags = 1; qb.cmd_sz = 0x10000; qb.ctl_sz = 0x1000; qb.mem_sz = 0x2000;
+    if (!nvnQueueInitialize(&q, &qb)) {
+        fprintf(stderr, "[totk-nvn] copy probe FAIL: queue\n");
+        return 1;
+    }
+    /* Guest-visible buffer storage for the upload/download round trip. */
+    static uint8_t pool_mem[0x20000] __attribute__((aligned(4096)));
+    pool_t pool;
+    pool_builder_t pb;
+    memset(&pool, 0, sizeof pool);
+    memset(&pb, 0, sizeof pb);
+    nvnMemoryPoolBuilderSetDefaults(&pb);
+    nvnMemoryPoolBuilderSetDevice(&pb, &d);
+    nvnMemoryPoolBuilderSetStorage(&pb, pool_mem, sizeof pool_mem);
+    if (!nvnMemoryPoolInitialize(&pool, &pb)) {
+        fprintf(stderr, "[totk-nvn] copy probe FAIL: memory pool\n");
+        return 1;
+    }
+    buf_t buf_src, buf_dst;
+    buf_builder_t bb;
+    memset(&buf_src, 0, sizeof buf_src);
+    memset(&buf_dst, 0, sizeof buf_dst);
+    memset(&bb, 0, sizeof bb);
+    nvnBufferBuilderSetDefaults(&bb);
+    nvnBufferBuilderSetDevice(&bb, &d);
+    nvnBufferBuilderSetStorage(&bb, &pool, 0, BYTES);
+    if (!nvnBufferInitialize(&buf_src, &bb)) {
+        fprintf(stderr, "[totk-nvn] copy probe FAIL: source buffer\n");
+        return 1;
+    }
+    memset(&bb, 0, sizeof bb);
+    nvnBufferBuilderSetDefaults(&bb);
+    nvnBufferBuilderSetDevice(&bb, &d);
+    nvnBufferBuilderSetStorage(&bb, &pool, (ptrdiff_t)BYTES, BYTES);
+    if (!nvnBufferInitialize(&buf_dst, &bb)) {
+        fprintf(stderr, "[totk-nvn] copy probe FAIL: destination buffer\n");
+        return 1;
+    }
+    uint8_t *pat_a = malloc(BYTES), *pat_b = malloc(BYTES), *pat_q = malloc(16 * 16 * 4);
+    uint8_t *got = malloc(BYTES);
+    if (!pat_a || !pat_b || !pat_q || !got) {
+        fprintf(stderr, "[totk-nvn] copy probe FAIL: allocation\n");
+        return 1;
+    }
+    nvn_probe_fill(pat_a, W, H, 0x20);
+    nvn_probe_fill(pat_b, W, H, 0x60);
+    /* A buffer->texture copy consumes a tightly packed region: 16x16 texels. */
+    nvn_probe_fill(pat_q, 16, 16, 0xa0);
+
+    tex_t tex_a, tex_b;
+    memset(&tex_a, 0, sizeof tex_a);
+    memset(&tex_b, 0, sizeof tex_b);
+    if (!nvn_probe_make_texture(&tex_a, W, H, 0x25, pat_a) ||
+        !nvn_probe_make_texture(&tex_b, W, H, 0x25, pat_b)) {
+        fprintf(stderr, "[totk-nvn] copy probe FAIL: texture creation\n");
+        ok = 0;
+    }
+
+    cb_t cb;
+    memset(&cb, 0, sizeof cb);
+    if (!nvnCommandBufferInitialize(&cb, &d)) {
+        fprintf(stderr, "[totk-nvn] copy probe FAIL: command buffer\n");
+        ok = 0;
+    }
+
+    /* Source buffer holds the tightly packed Q pattern for CopyBufferToTexture. */
+    memcpy(pool_mem, pat_q, 16 * 16 * 4);
+    uint8_t view[16];
+    memset(view, 0, sizeof view);
+
+    if (ok) {
+        const float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+        int32_t clear_reg[6] = { 0, 0, 0, 8, 8, 1 };
+        int32_t src_reg[6] = { 8, 8, 0, 16, 16, 1 };
+        int32_t dst_reg[6] = { 16, 16, 0, 16, 16, 1 };
+        int32_t b2t_reg[6] = { 0, 16, 0, 16, 16, 1 };
+        int32_t t2b_reg[6] = { 0, 0, 0, (int32_t)W, (int32_t)H, 1 };
+        nvnCommandBufferBeginRecording(&cb);
+        nvn_trace_clear_texture(&cb, &tex_b, view, (void *)clear_reg, (void *)red, 0xf);
+        nvn_trace_copy_t2t(&cb, &tex_a, view, src_reg, &tex_b, view, dst_reg, 0);
+        nvn_trace_copy_b2t(&cb, &buf_src, &tex_b, view, (void *)b2t_reg, 0);
+        nvn_trace_copy_t2b(&cb, &tex_b, view, t2b_reg, &buf_dst, 0);
+        uint64_t h = nvnCommandBufferEndRecording(&cb);
+        nvnQueueSubmitCommands(&q, 1, &h);
+    }
+
+    if (ok) {
+        const uint8_t *out = (const uint8_t *)nvnBufferMap(&buf_dst);
+        if (!out) {
+            fprintf(stderr, "[totk-nvn] copy probe FAIL: destination buffer not mapped\n");
+            ok = 0;
+        } else {
+            for (uint32_t y = 0; y < H && ok; y++) {
+                for (uint32_t x = 0; x < W && ok; x++) {
+                    const uint8_t *want;
+                    if (x < 8 && y < 8) {
+                        static const uint8_t redpx[4] = { 255, 0, 0, 255 };
+                        want = redpx;
+                    } else if (x >= 16 && y >= 16) {
+                        want = pat_a + ((size_t)(y - 16 + 8) * W + (x - 16 + 8)) * 4;
+                    } else if (y >= 16 && x < 16) {
+                        want = pat_q + ((size_t)(y - 16) * 16 + x) * 4;
+                    } else {
+                        want = pat_b + ((size_t)y * W + x) * 4;
+                    }
+                    const uint8_t *have = out + ((size_t)y * W + x) * 4;
+                    if (memcmp(have, want, 4)) {
+                        fprintf(stderr, "[totk-nvn] copy probe FAIL: [%u,%u] got="
+                                        "%02x%02x%02x%02x want=%02x%02x%02x%02x\n",
+                                x, y, have[0], have[1], have[2], have[3],
+                                want[0], want[1], want[2], want[3]);
+                        ok = 0;
+                    }
+                }
+            }
+            if (ok) {
+                fprintf(stderr, "[totk-nvn] copy probe: %ux%u every byte matches"
+                                " (clear + t2t + b2t + t2b)\n", W, H);
+                memcpy(got, out, BYTES);
+            }
+        }
+    }
+
+    fprintf(stderr, "[totk-nvn] copy probe stats: clear=%u/%u copy=%u/%u upload=%u/%u"
+                    " download=%u/%u unsupported=%u rt=%u\n",
+            g_gpu_stats.clear_ok, g_gpu_stats.clear_fail,
+            g_gpu_stats.copy_ok, g_gpu_stats.copy_fail,
+            g_gpu_stats.upload_ok, g_gpu_stats.upload_fail,
+            g_gpu_stats.download_ok, g_gpu_stats.download_fail,
+            g_gpu_stats.unsupported, g_gpu_stats.rt_unsupported);
+    if (ok && work_dir && *work_dir) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof path, "%s/copy-probe-out.bin", work_dir);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(got, 1, BYTES, f);
+            fclose(f);
+            fprintf(stderr, "[totk-nvn] copy probe wrote %s\n", path);
+        }
+    }
+
+    nvnCommandBufferFinalize(&cb);
+    nvnTextureFinalize(&tex_a);
+    nvnTextureFinalize(&tex_b);
+    nvnBufferFinalize(&buf_src);
+    nvnBufferFinalize(&buf_dst);
+    nvnMemoryPoolFinalize(&pool);
+    nvnQueueFinalize(&q);
+    nvnDeviceFinalize(&d);
+    free(pat_a); free(pat_b); free(pat_q); free(got);
+    fprintf(stderr, "[totk-nvn] copy probe %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+/* Synthetic compute program: the repository's compute_probe.comp, bound to a
+ * UBO, an SSBO and a sampled texture, dispatched through the NVN command
+ * buffer.  The SSBO is read back from guest memory and checked byte-exactly. */
+int nvn_compute_probe(const char *work_dir) {
+    fprintf(stderr, "[totk-nvn] compute probe begin work=%s\n", work_dir ? work_dir : "(null)");
+    int ok = 1;
+    nvn_dev_t d;
+    dev_builder_t db;
+    memset(&d, 0, sizeof d);
+    memset(&db, 0, sizeof db);
+    if (!nvnDeviceInitialize(&d, &db)) {
+        fprintf(stderr, "[totk-nvn] compute probe FAIL: device\n");
+        return 1;
+    }
+    queue_t q;
+    queue_builder_t qb;
+    memset(&q, 0, sizeof q);
+    memset(&qb, 0, sizeof qb);
+    qb.dev = &d; qb.flags = 1; qb.cmd_sz = 0x10000; qb.ctl_sz = 0x1000; qb.mem_sz = 0x2000;
+    if (!nvnQueueInitialize(&q, &qb)) {
+        fprintf(stderr, "[totk-nvn] compute probe FAIL: queue\n");
+        return 1;
+    }
+
+    /* Synthetic stage-5 NVN shader identity + cache entry holding the
+     * repository's compute SPIR-V and its reflection JSON. */
+    static const char res_json[] =
+        "{\"cbufs\":[{\"binding\":0,\"slot\":0}],"
+        "\"sbufs\":[{\"binding\":1,\"slot\":0}],"
+        "\"textures\":[{\"binding\":2,\"slot\":0,\"type\":0}],\"images\":[]}";
+    uint8_t *control = calloc(1, 0x880);
+    uint8_t *code = calloc(1, 0x100);
+    if (!control || !code) {
+        fprintf(stderr, "[totk-nvn] compute probe FAIL: allocation\n");
+        return 1;
+    }
+    uint32_t declared = 0x880, c1 = 0, length = 0x100, stage = 5;
+    memcpy(control + 0x20, &declared, sizeof declared);
+    memcpy(control + 0x700, &c1, sizeof c1);
+    memcpy(control + 0x704, &length, sizeof length);
+    memcpy(control + 0x714, &stage, sizeof stage);
+    memset(code, 0x5a, length);
+    RuntimeShaderIdentity id;
+    if (!runtime_shader_identity(control, code, &id) || id.stage != 5) {
+        fprintf(stderr, "[totk-nvn] compute probe FAIL: synthetic identity\n");
+        free(control); free(code);
+        return 1;
+    }
+    if (!runtime_shader_cache_store(runtime_shader_cache_root(), &id,
+                                    (const uint8_t *)compute_probe_comp_spv,
+                                    compute_probe_comp_spv_size, res_json)) {
+        fprintf(stderr, "[totk-nvn] compute probe FAIL: cache store\n");
+        free(control); free(code);
+        return 1;
+    }
+
+    prog_t p;
+    memset(&p, 0, sizeof p);
+    if (!nvnProgramInitialize(&p, &d) ||
+        !nvn_probe_install_stage(&p, 5, (const uint8_t *)compute_probe_comp_spv,
+                                 compute_probe_comp_spv_size, res_json, &id)) {
+        fprintf(stderr, "[totk-nvn] compute probe FAIL: program install\n");
+        free(control); free(code);
+        return 1;
+    }
+    p.nstage = 1;
+
+    /* Guest buffers: params (UBO), output (SSBO), plus a small texture. */
+    static uint8_t pool_mem[0x20000] __attribute__((aligned(4096)));
+    pool_t pool;
+    pool_builder_t pb;
+    memset(&pool, 0, sizeof pool);
+    memset(&pb, 0, sizeof pb);
+    nvnMemoryPoolBuilderSetDefaults(&pb);
+    nvnMemoryPoolBuilderSetDevice(&pb, &d);
+    nvnMemoryPoolBuilderSetStorage(&pb, pool_mem, sizeof pool_mem);
+    if (!nvnMemoryPoolInitialize(&pool, &pb)) {
+        fprintf(stderr, "[totk-nvn] compute probe FAIL: memory pool\n");
+        return 1;
+    }
+    typedef struct { uint32_t width, height, seed, pad; float scale[4]; } probe_params_t;
+    probe_params_t *params = (probe_params_t *)pool_mem;
+    uint32_t *out = (uint32_t *)(pool_mem + 0x1000);
+    memset(out, 0, 8 * 8 * 4);
+    params->width = 8;
+    params->height = 8;
+    params->seed = 0x12345678u;
+    params->pad = 0;
+    params->scale[0] = params->scale[1] = params->scale[2] = params->scale[3] = 1.0f;
+
+    buf_t buf_ubo, buf_ssbo;
+    buf_builder_t bb;
+    memset(&bb, 0, sizeof bb);
+    nvnBufferBuilderSetDefaults(&bb);
+    nvnBufferBuilderSetDevice(&bb, &d);
+    nvnBufferBuilderSetStorage(&bb, &pool, 0, sizeof *params);
+    if (!nvnBufferInitialize(&buf_ubo, &bb)) {
+        fprintf(stderr, "[totk-nvn] compute probe FAIL: ubo buffer\n");
+        return 1;
+    }
+    memset(&bb, 0, sizeof bb);
+    nvnBufferBuilderSetDefaults(&bb);
+    nvnBufferBuilderSetDevice(&bb, &d);
+    nvnBufferBuilderSetStorage(&bb, &pool, 0x1000, 8 * 8 * 4);
+    if (!nvnBufferInitialize(&buf_ssbo, &bb)) {
+        fprintf(stderr, "[totk-nvn] compute probe FAIL: ssbo buffer\n");
+        return 1;
+    }
+
+    uint8_t texels[4 * 4 * 4];
+    for (uint32_t y = 0; y < 4; y++)
+        for (uint32_t x = 0; x < 4; x++) {
+            uint8_t *px = texels + ((size_t)y * 4 + x) * 4;
+            px[0] = (uint8_t)((x + y * 4u) * 16u);
+            px[1] = (uint8_t)(x * 32u);
+            px[2] = (uint8_t)(y * 64u);
+            px[3] = 255;
+        }
+    tex_t tex;
+    memset(&tex, 0, sizeof tex);
+    if (!nvn_probe_make_texture(&tex, 4, 4, 0x25, texels)) {
+        fprintf(stderr, "[totk-nvn] compute probe FAIL: texture\n");
+        return 1;
+    }
+
+    tex_pool_t tp;
+    memset(&tp, 0, sizeof tp);
+    if (!nvnTexturePoolInitialize(&tp, &pool, 0, 2)) {
+        fprintf(stderr, "[totk-nvn] compute probe FAIL: texture pool\n");
+        return 1;
+    }
+    /* Pool index 1: handle 0 means "unbind" in NVN, so the probe binds 1. */
+    nvnTexturePoolRegisterTexture(&tp, 1, &tex, NULL);
+
+    cb_t cb;
+    memset(&cb, 0, sizeof cb);
+    if (!nvnCommandBufferInitialize(&cb, &d)) {
+        fprintf(stderr, "[totk-nvn] compute probe FAIL: command buffer\n");
+        return 1;
+    }
+    nvnCommandBufferSetTexturePool(&cb, &tp);
+
+    nvnCommandBufferBeginRecording(&cb);
+    nvnCommandBufferBindProgram(&cb, &p, -1);
+    nvnCommandBufferBindUniformBuffer(&cb, 5, 0,
+                                      (uint64_t)(uintptr_t)params, sizeof *params);
+    nvnCommandBufferBindStorageBuffer(&cb, 5, 0, (uint64_t)(uintptr_t)out, 8 * 8 * 4);
+    nvnCommandBufferBindImage(&cb, 5, 0, 1);   /* pool index 1, no sampler */
+    nvn_trace_dispatch_compute(&cb, 1, 1, 1);
+    uint64_t h = nvnCommandBufferEndRecording(&cb);
+    nvnQueueSubmitCommands(&q, 1, &h);
+
+    for (uint32_t y = 0; y < 8 && ok; y++)
+        for (uint32_t x = 0; x < 8 && ok; x++) {
+            uint32_t texv = texels[(((y & 3u) * 4u) + (x & 3u)) * 4u];
+            uint32_t want = (x + 1u) * 3u + (y + 1u) * 5u + params->seed + texv * 7u;
+            uint32_t have = out[y * 8 + x];
+            if (want != have) {
+                fprintf(stderr, "[totk-nvn] compute probe FAIL: ssbo[%u,%u] got=%08x"
+                                " want=%08x\n", x, y, have, want);
+                ok = 0;
+            }
+        }
+    if (ok)
+        fprintf(stderr, "[totk-nvn] compute probe: SSBO 8x8 exact match\n");
+    fprintf(stderr, "[totk-nvn] compute probe stats: dispatch=%u/%u unsupported=%u\n",
+            g_gpu_stats.dispatch_ok, g_gpu_stats.dispatch_fail, g_gpu_stats.unsupported);
+
+    nvnCommandBufferFinalize(&cb);
+    nvn_tex_pool_forget(&tp);
+    nvnTextureFinalize(&tex);
+    nvnBufferFinalize(&buf_ubo);
+    nvnBufferFinalize(&buf_ssbo);
+    nvnMemoryPoolFinalize(&pool);
+    nvnProgramFinalize(&p);
+    nvnQueueFinalize(&q);
+    nvnDeviceFinalize(&d);
+    free(control);
+    free(code);
+    fprintf(stderr, "[totk-nvn] compute probe %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
 }
 
 int runtime_nvn_frame_selftest(const char *screenshot, int frames) {
@@ -9873,12 +11098,92 @@ static void nvn_zero_call(const char *name) {
     if (n < sizeof seen / sizeof seen[0]) snprintf(seen[n++], sizeof seen[0], "%s", name);
     if (nvn_trace_frame()) fprintf(stderr, "[totk-frame] call %s (unimplemented no-op)\n", name);
 }
-static void nvn_trace_dispatch_compute(void *c, int x, int y, int z) {
-    (void)c; nvn_cb_dispatch_calls++;
+/* NVNtextureView (16 bytes): flag byte 0 selects which fields are present. */
+static void nvn_view_level_layer(const void *view, uint32_t *level, uint32_t *layer) {
+    const uint8_t *v = view;
+    *level = 0;
+    *layer = 0;
+    if (!v) return;
+    if (v[0] & 1) *level = v[1];
+    if (v[0] & 2) *layer = (uint32_t)v[4] | ((uint32_t)v[5] << 8);
+}
+
+/* nvnCommandBufferDispatchCompute records the program and the descriptor
+ * snapshot; the SPIR-V is loaded and the pipeline created at submit time. */
+static void nvn_trace_dispatch_compute(void *cv, int x, int y, int z) {
+    cb_t *c = cv;
+    nvn_api("nvnCommandBufferDispatchCompute");
+    nvn_cb_dispatch_calls++;
     if (nvn_trace_composite())
         fprintf(stderr, "[totk-frame] composite dispatch compute %dx%dx%d\n", x, y, z);
-    nvn_zero_call("nvnCommandBufferDispatchCompute");
-    if (nvn_trace_frame()) fprintf(stderr, "[totk-frame] dispatch compute %dx%dx%d\n", x, y, z);
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) {
+        nvn_fail("nvnCommandBufferDispatchCompute", "invalid command buffer");
+        return;
+    }
+    if (x < 0 || y < 0 || z < 0) {
+        nvn_fail("nvnCommandBufferDispatchCompute", "invalid group count");
+        return;
+    }
+    if (!x || !y || !z) return;   /* NVN: an empty dispatch records nothing */
+    nvn_cmd_t *cmd = nvn_cb_cmd(c, NVN_CMD_DISPATCH);
+    if (!cmd) return;
+    cmd->u.dispatch.x = (uint32_t)x;
+    cmd->u.dispatch.y = (uint32_t)y;
+    cmd->u.dispatch.z = (uint32_t)z;
+    cmd->u.dispatch.prog = c->prog;
+    nvn_bind_state_t *b = nvn_cb_bind_state(c);
+    if (b) {
+        nvn_dispatch_snap_t *snap = calloc(1, sizeof *snap);
+        if (!snap) {
+            nvn_fail("nvnCommandBufferDispatchCompute", "out of memory for bind snapshot");
+            c->ncmds--;
+            return;
+        }
+        snap->state = *b;
+        /* Fill stage-5 slots the dispatch buffer did not rebind from the
+         * queue-scoped tables, exactly like the graphics path inherits UBOs. */
+        for (int slot = 0; slot < 16; slot++) {
+            uint64_t ga = 0;
+            size_t gn = 0;
+            if (!(snap->state.ubo_mask[5] & (1u << slot)) &&
+                nvn_global_ubo_get(5, slot, &ga, &gn) && ga && gn) {
+                snap->state.ubo[5][slot].address = ga;
+                snap->state.ubo[5][slot].size = gn;
+                snap->state.ubo_mask[5] |= 1u << slot;
+            }
+            if (!(snap->state.ssbo_mask[5] & (1u << slot)) &&
+                nvn_global_ssbo_get(5, slot, &ga, &gn) && ga && gn) {
+                snap->state.ssbo[5][slot].address = ga;
+                snap->state.ssbo[5][slot].size = gn;
+                snap->state.ssbo_mask[5] |= 1u << slot;
+            }
+        }
+        const tex_pool_t *pool = nvn_tex_pool_for(c);
+        if (pool) {
+            for (int slot = 0; slot < 16; slot++)
+                if (snap->state.img_mask[5] & (1u << slot))
+                    snap->img_tex[slot] =
+                        nvn_tex_pool_lookup(pool, (int)(snap->state.img[5][slot] & 0xfffff));
+            for (int slot = 0; slot < 128; slot++)
+                if (snap->state.tex_mask[5][slot / 32] & (1u << (slot % 32)))
+                    snap->tex_tex[slot] =
+                        nvn_tex_pool_lookup(pool, (int)(snap->state.tex[5][slot] & 0xfffff));
+        }
+        cmd->u.dispatch.bind = snap;
+    }
+    prog_t *p = c->prog;
+    if (p && p->magic == NVN_MAGIC('P', 'R', 'O', 'G')) {
+        pthread_mutex_lock(&g_prog_lock);
+        prog_shader_state_t *s = prog_state_find(p);
+        if (s) {
+            s->refs++;
+            cmd->u.dispatch.pstate = s;
+        }
+        pthread_mutex_unlock(&g_prog_lock);
+    }
+    if (nvn_trace_frame())
+        fprintf(stderr, "[totk-frame] dispatch compute %dx%dx%d cb=%p prog=%p bind=%p\n",
+                x, y, z, (void *)c, (void *)p, (void *)cmd->u.dispatch.bind);
 }
 static void nvn_trace_dispatch_indirect(void *c, void *a) {
     (void)c; (void)a; nvn_zero_call("nvnCommandBufferDispatchComputeIndirect");
@@ -9919,23 +11224,128 @@ static void nvn_trace_draw_texture(void *c, uint64_t h, const void *src, const v
                 *(const float *)&d[2], *(const float *)&d[3]);
     nvn_zero_call("nvnCommandBufferDrawTexture");
 }
-static void nvn_trace_clear_texture(void *c, void *t, void *v, void *r, void *color, int mask) {
-    (void)c; (void)t; (void)v; (void)r; (void)color; (void)mask;
+/* nvnCommandBufferClearTexture: record the texture object, the view's
+ * level/layer, the texel region, the colour and the channel mask.
+ * `integer` marks the ClearTexturei/ui forms, whose colour is raw int/uint
+ * bits (VkClearColorValue is a union, so a whole-level clear is exact). */
+static void nvn_cb_clear_texture(cb_t *c, void *t, void *v, void *r,
+                                 const float rgba[4], int mask, int integer,
+                                 const char *what) {
+    nvn_api(what);
     nvn_cb_clear_texture_calls++;
     if (nvn_trace_composite())
         fprintf(stderr, "[totk-frame] composite clear texture t=%p mask=%d\n", t, mask);
-    nvn_zero_call("nvnCommandBufferClearTexture");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) {
+        nvn_fail(what, "invalid command buffer");
+        return;
+    }
+    if (!nvn_tex_registry_find(t)) {
+        nvn_fail(what, "invalid destination texture");
+        return;
+    }
+    const int32_t *reg = r;
+    nvn_cmd_t *cmd = nvn_cb_cmd(c, NVN_CMD_CLEAR_TEXTURE);
+    if (!cmd) return;
+    cmd->u.tex_clear.tex = t;
+    nvn_view_level_layer(v, &cmd->u.tex_clear.level, &cmd->u.tex_clear.layer);
+    cmd->u.tex_clear.x = reg ? reg[0] : 0;
+    cmd->u.tex_clear.y = reg ? reg[1] : 0;
+    cmd->u.tex_clear.width = reg ? (uint32_t)(reg[3] > 0 ? reg[3] : 0) : 0;
+    cmd->u.tex_clear.height = reg ? (uint32_t)(reg[4] > 0 ? reg[4] : 0) : 0;
+    if (rgba) memcpy(cmd->u.tex_clear.rgba, rgba, sizeof cmd->u.tex_clear.rgba);
+    cmd->u.tex_clear.mask = (uint32_t)mask;
+    cmd->u.tex_clear.integer = (uint32_t)integer;
+    if (nvn_trace_frame())
+        fprintf(stderr, "[totk-frame] clear-texture cb=%p tex=%p region=%d,%d %ux%u"
+                        " rgba=%.3f,%.3f,%.3f,%.3f mask=%#x int=%d\n", (void *)c, t,
+                cmd->u.tex_clear.x, cmd->u.tex_clear.y, cmd->u.tex_clear.width,
+                cmd->u.tex_clear.height, cmd->u.tex_clear.rgba[0],
+                cmd->u.tex_clear.rgba[1], cmd->u.tex_clear.rgba[2],
+                cmd->u.tex_clear.rgba[3], cmd->u.tex_clear.mask, integer);
 }
-static void nvn_trace_copy_b2t(void *c, void *buf, void *t, void *v, void *r, int flags) {
-    (void)c; (void)buf; (void)t; (void)v; (void)r; (void)flags;
+
+static void nvn_trace_clear_texture(void *cv, void *t, void *v, void *r, void *color, int mask) {
+    nvn_cb_clear_texture(cv, t, v, r, (const float *)color, mask, 0,
+                         "nvnCommandBufferClearTexture");
+}
+/* Integer clear forms: the colour is int32/uint32[4]; keep the raw bits. */
+static void nvn_trace_clear_texturei(void *cv, void *t, void *v, void *r,
+                                     void *color, int mask) {
+    float rgba[4] = { 0, 0, 0, 0 };
+    if (color) memcpy(rgba, color, sizeof rgba);
+    nvn_cb_clear_texture(cv, t, v, r, rgba, mask, 1, "nvnCommandBufferClearTexturei");
+}
+static void nvn_trace_clear_textureui(void *cv, void *t, void *v, void *r,
+                                      void *color, int mask) {
+    float rgba[4] = { 0, 0, 0, 0 };
+    if (color) memcpy(rgba, color, sizeof rgba);
+    nvn_cb_clear_texture(cv, t, v, r, rgba, mask, 1, "nvnCommandBufferClearTextureui");
+}
+
+/* nvnCommandBufferCopyBufferToTexture: the guest buffer can be recycled before
+ * submit, so take a private copy of exactly the bytes the copy will consume. */
+static void nvn_trace_copy_b2t(void *cv, void *buf, void *t, void *v, void *r, int flags) {
+    cb_t *c = cv;
+    nvn_api("nvnCommandBufferCopyBufferToTexture");
     nvn_cb_copy_b2t++;
     if (nvn_trace_composite())
         fprintf(stderr, "[totk-frame] composite copy buffer->texture buf=%p t=%p\n", buf, t);
-    nvn_zero_call("nvnCommandBufferCopyBufferToTexture");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) {
+        nvn_fail("nvnCommandBufferCopyBufferToTexture", "invalid command buffer");
+        return;
+    }
+    const tex_t *tex = nvn_tex_registry_find(t);
+    const buf_t *src = buf;
+    if (!tex) {
+        nvn_fail("nvnCommandBufferCopyBufferToTexture", "invalid destination texture");
+        return;
+    }
+    if (!src || src->magic != NVN_MAGIC('B', 'U', 'F', 0) || !src->pool || !src->pool->mem) {
+        nvn_fail("nvnCommandBufferCopyBufferToTexture", "invalid source buffer");
+        return;
+    }
+    uint64_t address = (uint64_t)(uintptr_t)(src->pool->mem + src->off);
+    const int32_t *reg = r;
+    nvn_cmd_t *cmd = nvn_cb_cmd(c, NVN_CMD_COPY_BUFFER_TO_TEXTURE);
+    if (!cmd) return;
+    cmd->u.buf_to_tex.tex = t;
+    nvn_view_level_layer(v, &cmd->u.buf_to_tex.level, &cmd->u.buf_to_tex.layer);
+    cmd->u.buf_to_tex.x = reg ? reg[0] : 0;
+    cmd->u.buf_to_tex.y = reg ? reg[1] : 0;
+    cmd->u.buf_to_tex.width = reg ? (uint32_t)(reg[3] > 0 ? reg[3] : 0) : 0;
+    cmd->u.buf_to_tex.height = reg ? (uint32_t)(reg[4] > 0 ? reg[4] : 0) : 0;
+    cmd->u.buf_to_tex.address = address;
+    cmd->u.buf_to_tex.size = (size_t)src->size;
+    cmd->u.buf_to_tex.flags = (uint32_t)flags;
+    uint32_t lw = 0, lh = 0;
+    nvn_level_extent(tex, cmd->u.buf_to_tex.level, &lw, &lh);
+    uint32_t w = cmd->u.buf_to_tex.width, h = cmd->u.buf_to_tex.height;
+    nvn_region_resolve(cmd->u.buf_to_tex.x, cmd->u.buf_to_tex.y, &w, &h, lw, lh);
+    size_t need = (size_t)w * h * nvn_texel_bytes(tex);
+    if (need && need > (256u << 20)) need = 0;
+    if (need > (size_t)src->size) need = (size_t)src->size;
+    if (need) {
+        uint8_t *copy = malloc(need);
+        if (!copy) {
+            nvn_fail("nvnCommandBufferCopyBufferToTexture", "out of memory for payload copy");
+            c->ncmds--;
+            return;
+        }
+        memcpy(copy, (const void *)(uintptr_t)address, need);
+        cmd->u.buf_to_tex.data = copy;
+        cmd->u.buf_to_tex.data_size = need;
+    }
+    if (nvn_trace_frame())
+        fprintf(stderr, "[totk-frame] copy-b2t cb=%p dst=%p(%#x %ux%u) region=%d,%d %ux%u"
+                        " buf=%#llx size=%zu copied=%zu\n", (void *)c, t, tex->d.format,
+                tex->d.width, tex->d.height, cmd->u.buf_to_tex.x, cmd->u.buf_to_tex.y,
+                w, h, (unsigned long long)address, (size_t)src->size, need);
 }
-static void nvn_trace_copy_t2t(void *c, const void *src, const void *sv, const void *sr,
+
+static void nvn_trace_copy_t2t(void *cv, const void *src, const void *sv, const void *sr,
                                const void *dst, const void *dv, const void *dr, int flags) {
-    (void)c; (void)sv; (void)dv; (void)flags;
+    cb_t *c = cv;
+    nvn_api("nvnCommandBufferCopyTextureToTexture");
     nvn_cb_copy_t2t_calls++;
     if (nvn_trace_composite()) {
         const tex_t *s = nvn_tex_registry_find(src);
@@ -9948,21 +11358,96 @@ static void nvn_trace_copy_t2t(void *c, const void *src, const void *sv, const v
                 r ? r[0] : 0, r ? r[1] : 0, r ? r[2] : 0,
                 r ? r[3] : 0, r ? r[4] : 0, r ? r[5] : 0);
     }
-    nvn_zero_call("nvnCommandBufferCopyTextureToTexture");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) {
+        nvn_fail("nvnCommandBufferCopyTextureToTexture", "invalid command buffer");
+        return;
+    }
+    if (!nvn_tex_registry_find(src) || !nvn_tex_registry_find(dst)) {
+        nvn_fail("nvnCommandBufferCopyTextureToTexture", "invalid source/destination texture");
+        return;
+    }
+    const int32_t *sreg = sr, *dreg = dr;
+    nvn_cmd_t *cmd = nvn_cb_cmd(c, NVN_CMD_COPY_TEXTURE_TO_TEXTURE);
+    if (!cmd) return;
+    cmd->u.tex_copy.src = (void *)src;
+    cmd->u.tex_copy.dst = (void *)dst;
+    nvn_view_level_layer(sv, &cmd->u.tex_copy.src_level, &cmd->u.tex_copy.src_layer);
+    nvn_view_level_layer(dv, &cmd->u.tex_copy.dst_level, &cmd->u.tex_copy.dst_layer);
+    cmd->u.tex_copy.sx = sreg ? sreg[0] : 0;
+    cmd->u.tex_copy.sy = sreg ? sreg[1] : 0;
+    cmd->u.tex_copy.sz = sreg ? sreg[2] : 0;
+    cmd->u.tex_copy.dx = dreg ? dreg[0] : 0;
+    cmd->u.tex_copy.dy = dreg ? dreg[1] : 0;
+    cmd->u.tex_copy.dz = dreg ? dreg[2] : 0;
+    cmd->u.tex_copy.width = sreg ? (uint32_t)(sreg[3] > 0 ? sreg[3] : 0) : 0;
+    cmd->u.tex_copy.height = sreg ? (uint32_t)(sreg[4] > 0 ? sreg[4] : 0) : 0;
+    cmd->u.tex_copy.depth = sreg ? (uint32_t)(sreg[5] > 0 ? sreg[5] : 0) : 0;
+    cmd->u.tex_copy.flags = (uint32_t)flags;
+    if (nvn_trace_frame())
+        fprintf(stderr, "[totk-frame] copy-t2t cb=%p src=%p dst=%p src=%d,%d,%d dst=%d,%d,%d"
+                        " %ux%ux%u flags=%#x\n", (void *)c, src, dst,
+                cmd->u.tex_copy.sx, cmd->u.tex_copy.sy, cmd->u.tex_copy.sz,
+                cmd->u.tex_copy.dx, cmd->u.tex_copy.dy, cmd->u.tex_copy.dz,
+                cmd->u.tex_copy.width, cmd->u.tex_copy.height, cmd->u.tex_copy.depth,
+                cmd->u.tex_copy.flags);
 }
-static void nvn_trace_blit(void *c, ...) {
-    (void)c;
+
+/* nvnCommandBufferBlit has no exact mapping on the frozen API: its rectangle
+ * lists and filter semantics are not a vkCmdCopyImage.  Keep it an explicit
+ * unsupported report instead of pretending it ran. */
+static void nvn_trace_blit(void *cv, ...) {
+    cb_t *c = cv;
+    nvn_api("nvnCommandBufferBlit");
     nvn_cb_blit_calls++;
-    if (nvn_trace_composite())
-        fprintf(stderr, "[totk-frame] composite blit called\n");
-    nvn_zero_call("nvnCommandBufferBlit");
+    nvn_gpu_report("Blit", NULL, "no exact copy semantics on the frozen API");
+    static unsigned logged;
+    if (logged++ < 16 || nvn_trace_frame())
+        fprintf(stderr, "[totk-nvn] Blit cb=%p is unsupported (no exact copy semantics;"
+                        " not faked) count=%u\n", cv, nvn_cb_blit_calls);
+    if (c && c->magic != NVN_MAGIC('C', 'M', 'D', 'B'))
+        nvn_fail("nvnCommandBufferBlit", "invalid command buffer");
 }
-static void nvn_trace_copy_t2b(void *c, void *t, void *v, void *r, void *buf, int flags) {
-    (void)c; (void)t; (void)v; (void)r; (void)buf; (void)flags;
+
+/* nvnCommandBufferCopyTextureToBuffer: the guest buffer is the destination, so
+ * it is written when the command runs (the download result is current then). */
+static void nvn_trace_copy_t2b(void *cv, void *t, void *v, void *r, void *buf, int flags) {
+    cb_t *c = cv;
+    nvn_api("nvnCommandBufferCopyTextureToBuffer");
     nvn_cb_copy_t2b_calls++;
     if (nvn_trace_composite())
         fprintf(stderr, "[totk-frame] composite copy texture->buffer t=%p buf=%p\n", t, buf);
-    nvn_zero_call("nvnCommandBufferCopyTextureToBuffer");
+    if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) {
+        nvn_fail("nvnCommandBufferCopyTextureToBuffer", "invalid command buffer");
+        return;
+    }
+    const tex_t *tex = nvn_tex_registry_find(t);
+    const buf_t *dst = buf;
+    if (!tex) {
+        nvn_fail("nvnCommandBufferCopyTextureToBuffer", "invalid source texture");
+        return;
+    }
+    if (!dst || dst->magic != NVN_MAGIC('B', 'U', 'F', 0) || !dst->pool || !dst->pool->mem) {
+        nvn_fail("nvnCommandBufferCopyTextureToBuffer", "invalid destination buffer");
+        return;
+    }
+    const int32_t *reg = r;
+    nvn_cmd_t *cmd = nvn_cb_cmd(c, NVN_CMD_COPY_TEXTURE_TO_BUFFER);
+    if (!cmd) return;
+    cmd->u.tex_to_buf.tex = t;
+    nvn_view_level_layer(v, &cmd->u.tex_to_buf.level, &cmd->u.tex_to_buf.layer);
+    cmd->u.tex_to_buf.x = reg ? reg[0] : 0;
+    cmd->u.tex_to_buf.y = reg ? reg[1] : 0;
+    cmd->u.tex_to_buf.width = reg ? (uint32_t)(reg[3] > 0 ? reg[3] : 0) : 0;
+    cmd->u.tex_to_buf.height = reg ? (uint32_t)(reg[4] > 0 ? reg[4] : 0) : 0;
+    cmd->u.tex_to_buf.address = (uint64_t)(uintptr_t)(dst->pool->mem + dst->off);
+    cmd->u.tex_to_buf.size = (size_t)dst->size;
+    cmd->u.tex_to_buf.flags = (uint32_t)flags;
+    if (nvn_trace_frame())
+        fprintf(stderr, "[totk-frame] copy-t2b cb=%p src=%p(%#x %ux%u) region=%d,%d %ux%u"
+                        " dst=%#llx size=%zu\n", (void *)c, t, tex->d.format, tex->d.width,
+                tex->d.height, cmd->u.tex_to_buf.x, cmd->u.tex_to_buf.y,
+                cmd->u.tex_to_buf.width, cmd->u.tex_to_buf.height,
+                (unsigned long long)cmd->u.tex_to_buf.address, (size_t)dst->size);
 }
 static void nvn_trace_cb_fence(void *c, void *sync, int condition, int flags) {
     (void)c; (void)sync; (void)condition; (void)flags;
@@ -10143,7 +11628,8 @@ static const nvn_entry nvn_entries[] = {
     NVN_E(nvn_trace_dispatch_compute), NVN_E(nvn_trace_dispatch_indirect),
     NVN_E(nvn_trace_draw_instanced), NVN_E(nvn_trace_draw_indirect),
     NVN_E(nvn_trace_draw_arrays_indirect), NVN_E(nvn_trace_draw_texture),
-    NVN_E(nvn_trace_clear_texture), NVN_E(nvn_trace_copy_b2t),
+    NVN_E(nvn_trace_clear_texture), NVN_E(nvn_trace_clear_texturei),
+    NVN_E(nvn_trace_clear_textureui), NVN_E(nvn_trace_copy_b2t),
     NVN_E(nvn_trace_copy_t2b), NVN_E(nvn_trace_barrier),
     NVN_E(nvn_trace_cb_fence), NVN_E(nvn_trace_cb_wait_sync),
     NVN_E(nvn_trace_cb_signal_event), NVN_E(nvn_trace_cb_wait_event),
@@ -10173,6 +11659,7 @@ static const nvn_entry nvn_entries[] = {
     NVN_E(nvnCommandBufferBindImages),
     NVN_E(nvn_trace_dispatch_compute), NVN_E(nvn_trace_dispatch_indirect),
     NVN_E(nvn_trace_draw_texture), NVN_E(nvn_trace_clear_texture),
+    NVN_E(nvn_trace_clear_texturei), NVN_E(nvn_trace_clear_textureui),
     NVN_E(nvn_trace_copy_b2t), NVN_E(nvn_trace_copy_t2b), NVN_E(nvn_trace_copy_t2t),
     NVN_E(nvn_trace_blit),
     NVN_E(nvnBlendStateSetDefaults), NVN_E(nvnBlendStateSetBlendTarget),
