@@ -850,8 +850,19 @@ guest object.  The host now uses the guest layout for the first 0x18 bytes,
 keeps magic/gen in the tail, and finalize leaves the guest object untouched
 (macOS does the same).  The crash moved from draw #32 to #1200/#300, but the
 same list-bucket walk still appears when an engine texture-pool node is torn
-down, so this is not yet a complete fix.  The guest TLS crash
-(`sdk+0x131818`) also still appears on some new threads.
+down, so this is not yet a complete fix.
+
+The per-thread TLS/TLR was also carved out of the guest stack; a later guest
+unmap of that stack made `sdk+0x126efc`/`sdk+0x131818` fault on TLR+0x100.
+It now lives in a dedicated 16 KiB host `mmap` per thread (TPIDR_EL0/TPIDRRO
+values still point at it), and the TLS crash no longer appears.  A run then
+reached draw #600 and hit the remaining list walk at `main+0x79a9a4`.
+
+Crash register/chain instrumentation shows the list at object+0x48 has 7
+nodes and a traversal enters a node whose `next` is zero.  The engine object is
+`0x33e62a1c0`; both list sentinels are `x0+0x48` and `x0+0x60`, counts are at
++0x58/+0x70.  This is an engine texture-pool bucket, not an NVN pool
+registration argument.
 
 ## 10. Next
 
