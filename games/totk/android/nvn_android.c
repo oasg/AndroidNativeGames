@@ -8920,6 +8920,85 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
                     ok ? "ok" : "failed");
         }
     }
+    /* Same evidence for the large (window-sized) scene segments: the window
+     * presents these targets, so a black scene has to be explained here. */
+    if (nvn_trace_composite() && lw >= 1024) {
+        static unsigned big_dumps;
+        if (big_dumps < 8) {
+            big_dumps++;
+            uint32_t dcmd = 0, icmd = 0, prim = 0, cnt = 0, itype = 0;
+            int vp[4] = { 0, 0, 0, 0 }, sc[4] = { 0, 0, 0, 0 };
+            for (uint32_t ci = 0; ci < sg->ncmds; ci++) {
+                const nvn_cmd_t *cc = &e->cmds[sg->first_cmd + ci];
+                if (cc->kind == NVN_CMD_DRAW) {
+                    dcmd++; prim = cc->u.draw.primitive; cnt += cc->u.draw.count;
+                } else if (cc->kind == NVN_CMD_DRAW_INDEXED) {
+                    icmd++; prim = cc->u.draw_indexed.primitive;
+                    cnt += cc->u.draw_indexed.count; itype = cc->u.draw_indexed.index_type;
+                } else if (cc->kind == NVN_CMD_SET_VIEWPORT) {
+                    vp[0] = cc->u.rect.x; vp[1] = cc->u.rect.y;
+                    vp[2] = cc->u.rect.width; vp[3] = cc->u.rect.height;
+                } else if (cc->kind == NVN_CMD_SET_SCISSOR) {
+                    sc[0] = cc->u.rect.x; sc[1] = cc->u.rect.y;
+                    sc[2] = cc->u.rect.width; sc[3] = cc->u.rect.height;
+                }
+            }
+            const tex_t *ot = nvn_tex_registry_find(sg->color0_tex);
+            fprintf(stderr, "[totk-scene-seg] seg=%u target=%p fmt=%#x %ux%u prog=%p rp=%p"
+                            " warm=%d draws=%u dcmd=%u icmd=%u prim=%u cnt=%u itype=%u"
+                            " vp=%d,%d %dx%d sc=%d,%d %dx%d texmask=%#x/%#x"
+                            " vb=%#llx/%zu\n", seg_index, sg->color0_tex,
+                    ot ? ot->d.format : 0, lw, lh, (void *)p, (void *)rp, sg->warm,
+                    sg->draw_count, dcmd, icmd, prim, cnt, itype, vp[0], vp[1], vp[2], vp[3],
+                    sc[0], sc[1], sc[2], sc[3], bs->tex_mask[0][0], bs->tex_mask[1][0],
+                    (unsigned long long)bs->vb[0].address, bs->vb[0].size);
+            const tex_pool_t *tp2 = nvn_tex_pool_for(&view);
+            for (int st = 0; st < 2; st++)
+                for (int sl = 0; sl < 128; sl++) {
+                    if (!(bs->tex_mask[st][sl / 32] & (1u << (sl % 32)))) continue;
+                    uint64_t hh = bs->tex[st][sl];
+                    const tex_t *tt = tp2 ? nvn_tex_pool_lookup(tp2,
+                                            (int)(hh & 0xfffff)) : NULL;
+                    if (!tt) {
+                        uint64_t gh = 0;
+                        const tex_t *gt = NULL;
+                        if (nvn_global_tex_get(st, sl, &gh, &gt) && gh == hh) tt = gt;
+                    }
+                    size_t ms = tt ? (tt->L.size ? (size_t)tt->L.size
+                                                 : (size_t)tt->d.width * tt->d.height * 4) : 0;
+                    uint32_t nz = tt ? nvn_first_nonzero(tt->mem, ms, 1u << 20) : UINT32_MAX;
+                    fprintf(stderr, "[totk-scene-seg]   tex st=%d slot=%d h=%#llx tex=%p"
+                                    " fmt=%#x %ux%u first_nz=%s%u gfx=%p\n", st, sl,
+                            (unsigned long long)hh, (const void *)tt,
+                            tt ? (uint32_t)tt->d.format : 0, tt ? tt->d.width : 0,
+                            tt ? tt->d.height : 0,
+                            nz == UINT32_MAX ? "none " : "", nz == UINT32_MAX ? 0 : nz,
+                            tt ? (void *)nvn_texture_gfx(tt) : NULL);
+                }
+            for (int i = 0; i < 16; i++) {
+                if (!g_ubo_dec[0][i].valid) continue;
+                const uint32_t *w = (const uint32_t *)(uintptr_t)g_ubo_dec[0][i].addr;
+                size_t nw = g_ubo_dec[0][i].size / 4;
+                fprintf(stderr, "[totk-scene-seg]   c%d<=%s idx%d(%#llx,%zu)", i,
+                        g_ubo_dec[0][i].src ? g_ubo_dec[0][i].src : "?",
+                        g_ubo_dec[0][i].nvn, (unsigned long long)g_ubo_dec[0][i].addr,
+                        g_ubo_dec[0][i].size);
+                if (w && nw >= 20) {
+                    fprintf(stderr, " rows1..4=%08x,%08x,%08x,%08x | %08x,%08x,%08x,%08x"
+                                    " | %08x,%08x,%08x,%08x | %08x,%08x,%08x,%08x",
+                            w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11],
+                            w[12], w[13], w[14], w[15], w[16], w[17], w[18], w[19]);
+                }
+                fputc('\n', stderr);
+            }
+            size_t rn = 0;
+            const uint8_t *rpix = gfx_backend_offscreen_pixels(rt, &rn);
+            uint32_t rnz = nvn_first_nonzero(rpix, rn, 1u << 20);
+            fprintf(stderr, "[totk-scene-seg] result seg=%u %ux%u drew=%d bytes=%zu"
+                            " first_nz=%s%u\n", seg_index, lw, lh, drew, rn,
+                    rnz == UINT32_MAX ? "none " : "", rnz == UINT32_MAX ? 0 : rnz);
+        }
+    }
     /* Lane 2: the exact 360x69 output of each of the first UI segments, so the
      * first writer in the chain can be identified (not just the 50th).  The
      * raw RGBA8 readback also reports alpha coverage and the RGB colour count:
