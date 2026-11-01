@@ -9663,6 +9663,18 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             uint32_t nowned = 0;
             uint32_t nstreams = nvn_build_vertex_streams(bs, streams, 24, owned, 16,
                                                          &nowned, (uint32_t)cb->draw_count);
+            /* Diagnostic only: the same blend-off test for the window pass. */
+            if (window_pass && getenv("TOTK_ANDROID_UI_NO_BLEND")) {
+                for (uint32_t ci = 0; ci < count; ci++) {
+                    if (translated[ci].kind == GFX_CMD_DRAW)
+                        translated[ci].u.draw.state.blend_enable = 0;
+                    else if (translated[ci].kind == GFX_CMD_DRAW_INDEXED)
+                        translated[ci].u.draw_indexed.state.blend_enable = 0;
+                }
+                static unsigned wnb;
+                if (wnb++ < 4)
+                    fprintf(stderr, "[totk-frame] window-pass blend disabled (diagnostic)\n");
+            }
             if (window_pass)
                 drew = runtime_native_window_execute_reflected_ex(w->native, reflected,
                                                                   translated, count,
@@ -9672,6 +9684,24 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                 static unsigned wp_logged;
                 if (wp_logged++ < 6) {
                     nvn_dump_vertex_stream("window", &input, bs, 4);
+                    for (uint32_t ci = 0; ci < count && ci < 16; ci++) {
+                        const GfxCmd *dg = &translated[ci];
+                        const GfxPipelineState *st = NULL;
+                        if (dg->kind == GFX_CMD_DRAW) st = &dg->u.draw.state;
+                        else if (dg->kind == GFX_CMD_DRAW_INDEXED) st = &dg->u.draw_indexed.state;
+                        if (!st) continue;
+                        fprintf(stderr, "[totk-frame] window-pass   blend en=%u src_rgb=%u"
+                                        " dst_rgb=%u src_a=%u dst_a=%u eq_rgb=%u eq_a=%u"
+                                        " chmask=%#x | nvn packed=%llu\n",
+                                st->blend_enable, st->blend_src_rgb, st->blend_dst_rgb,
+                                st->blend_src_a, st->blend_dst_a, st->blend_eq_rgb,
+                                st->blend_eq_a, st->color_write_mask,
+                                (unsigned long long)bs->rs.blend.src_rgb |
+                                    ((unsigned long long)bs->rs.blend.dst_rgb << 7) |
+                                    ((unsigned long long)bs->rs.blend.src_a << 14) |
+                                    ((unsigned long long)bs->rs.blend.dst_a << 21));
+                        break;
+                    }
                     fprintf(stderr, "[totk-frame] window-pass cb=%p rp=%p count=%u draws=%d"
                                     " streams=%u clear=%d texmask=%#x/%#x va=%#x vb=%#x"
                                     " vb0=%#llx/%zu\n", (void *)cb, (void *)reflected, count,
