@@ -9442,6 +9442,31 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                                                     clear, &has_clear);
             nvn_remap_texture_bind_cmds(translated, count, reflected);
             nvn_bind_state_t bend = bs ? *bs : (nvn_bind_state_t){0};
+            /* NVN uniform-buffer binds are queue-scoped, and this cb's draws can
+             * predate a rebind that the engine intended for the whole
+             * recording (same class as the UI consumer fix).  For the window
+             * pass, take the recording's final stage-0 UBO state. */
+            if (window_pass && cb->bind_state) {
+                const nvn_bind_state_t *fin = cb->bind_state;
+                for (int i = 0; i < 16; i++) {
+                    if (!(fin->ubo_mask[0] & (1u << i))) continue;
+                    if (!fin->ubo[0][i].address || !fin->ubo[0][i].size) continue;
+                    if (bend.ubo[0][i].address == fin->ubo[0][i].address &&
+                        bend.ubo[0][i].size == fin->ubo[0][i].size) continue;
+                    if (nvn_trace_composite()) {
+                        static unsigned wl;
+                        if (wl++ < 8)
+                            fprintf(stderr, "[totk-frame] window ubo override idx=%d"
+                                            " snap=(%#llx,%zu) -> final=(%#llx,%zu)\n", i,
+                                    (unsigned long long)bend.ubo[0][i].address,
+                                    bend.ubo[0][i].size,
+                                    (unsigned long long)fin->ubo[0][i].address,
+                                    fin->ubo[0][i].size);
+                    }
+                    bend.ubo[0][i] = fin->ubo[0][i];
+                    bend.ubo_mask[0] |= 1u << i;
+                }
+            }
             nvn_inherit_ubo_slots(&bend, reflected);
             nvn_apply_bind_state(p, reflected, &bend, cb);
             GfxVertexStream streams[24];
@@ -9479,6 +9504,25 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                                             "%.3f,%.3f,%.3f mask=%#x\n", g->u.clear.rgba[0],
                                     g->u.clear.rgba[1], g->u.clear.rgba[2], g->u.clear.rgba[3],
                                     g->u.clear.mask);
+                    }
+                    for (int i = 0; i < 16; i++) {
+                        if (!g_ubo_dec[0][i].valid) continue;
+                        const uint32_t *w = (const uint32_t *)(uintptr_t)g_ubo_dec[0][i].addr;
+                        size_t nw = g_ubo_dec[0][i].size / 4;
+                        fprintf(stderr, "[totk-frame] window-pass   c%d<=idx%d(%#llx,%zu)",
+                                i, g_ubo_dec[0][i].nvn,
+                                (unsigned long long)g_ubo_dec[0][i].addr,
+                                g_ubo_dec[0][i].size);
+                        if (w && nw >= 16) {
+                            static const int rows[7] = { 1, 2, 3, 4, 5, 6, 33 };
+                            for (int r = 0; r < 7; r++) {
+                                int base = rows[r] * 4;
+                                if ((size_t)base + 4 > nw) continue;
+                                fprintf(stderr, " %d=%08x,%08x,%08x,%08x", rows[r],
+                                        w[base], w[base + 1], w[base + 2], w[base + 3]);
+                            }
+                        }
+                        fputc('\n', stderr);
                     }
                 }
             }
