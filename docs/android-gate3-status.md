@@ -200,7 +200,8 @@ GfxOffscreenTarget *t = w->present_target ? w->present_target : w->gfx_target;
 
 The app shell is isolated in
 `/Users/oasis/.local/share/opencode/worktree/9bf67f/app-tls` (branch
-`app/tls-shell`, commit `d93d565`). The TLS blocker is solved:
+`app/tls-shell`, now `3270628` after merging main's renderer fixes). The TLS
+blocker is solved:
 
 - APK builds/installs; the three guest images are packed as
   `lib<name>_patched.so` so the loader can `mmap(PROT_EXEC)` them from
@@ -225,6 +226,8 @@ The app shell is isolated in
   127 s; the owner is a host frame in `libc.so+0xa6020` while holding the core
   lock (`guest=0`), with waiters at `sdk+0xde1888` (later
   `nn::os::TryPeekLightMessageQueue+0x80`).
+- The branch now merges main's renderer fixes (`3270628`) and the APK was
+  rebuilt with them; it includes the TLS fix plus the text/atlas/present fixes.
 
 ### Device recovery needed (human unlock)
 
