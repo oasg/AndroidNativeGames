@@ -90,8 +90,11 @@ The 91 % "unsubmitted" buffers are the engine's normal small buffers replayed
 through `CallCommands`; every one has `mask_candidate=0`.
 
 A temporary `tex-write` probe (patch: `/tmp/gate3-texwrite-trace.patch`) shows
-what the 51 `nvnTextureWriteTexels` calls actually write: only 4x1/4x4 RGBA8
-(`first_nz=3/none`), never the 2048x4096 or 780x60 masks.
+what `nvnTextureWriteTexels` actually writes. In the gate34 state the counter is
+51; in a 300 s run it reaches 93. The targets are small: 4x1/4x4 RGBA8, 16x16
+RGBA8, 128x32 R8 and 32x32 R8 mips. **No write targets the 2048x4096 or 780x60
+masks.** The text pass `8a20741c` runs and samples the 2048x4096 mask, but its
+`gfx` is a zero upload (`rt=0`, `dirty=0`).
 
 ### 4.5 The font pipeline is present, but not producing
 
@@ -117,42 +120,85 @@ No `rt 400x225 fmt=0x3f` or `rt 64x64 fmt=0x3f` scene step runs. This is the
 most promising host-side lead: L2 added a scaled deep-backlog drain after the
 Phive report, but that phase has not been re-run with the new drain.
 
+A 300 s re-run with the input moved after boot
+(`150:A:400,180:PLUS:400,210:A:400,240:A:400,270:PLUS:400`) reached the same
+state and reproduced it exactly:
+
+```text
+[totk-frame] segs  2 cmd=[30,128) draws=8427 tex=... fmt=0x3f 400x225 ... queued=1 nui=0
+[totk-frame] segs 699 cmd=[5776,5871) draws=8427 tex=... fmt=0x3f 64x64 ... queued=1 nui=0
+```
+
+No `rt 400x225/64x64 fmt=0x3f` executed; the `seg2-400x225-*` PPM is 1 colour
+black, and the window PPM is the host clear `(13,20,31)/(13,20,30)`. The
+2048x4096 font atlas is still zero at every bind, so even a drained batch would
+draw black text until the atlas producer runs.
+
 ## 5. App shell (parallel work)
 
-The uncommitted Android app shell is isolated in
+The app shell is isolated in
 `/Users/oasis/.local/share/opencode/worktree/9bf67f/app-tls` (branch
-`app/tls-shell`), with an independent subagent working on it.
+`app/tls-shell`, commit `d93d565`). The TLS blocker is solved:
 
 - APK builds/installs; the three guest images are packed as
   `lib<name>_patched.so` so the loader can `mmap(PROT_EXEC)` them from
   `/data/app/.../lib/arm64` (external FUSE denies executable mappings).
-- The real Surface attaches at 1440x3200 / 3200x1440.
-- Blocker: a dlopened shared library uses global-dynamic TLS, so
-  `tpidr_el0 + fixed offset` differs per thread (`per-thread TLS offset
-  changed`). `-ftls-model=initial-exec` makes Android's `dlopen` reject the
-  library. The current experiment stores `HostContext`/`GuestSlots` in two
-  `pthread_key_t` slots (`TP + key*8`), with a TCB-slot verification.
-- The same TLS experiment must not reach the CLI: a CLI built with it crashed
-  at boot (`sig=11`, `guest thread handle=0`). The CLI path must stay on the
-  committed loader, or the key-slot path must be guarded by
-  `TOTK_ANDROID_LIBRARY`.
+- Bionic `pthread_key_create` returns `0x80000000 | n`, stores the value in a
+  16-byte record, and the TLS-slot base is thread/layout dependent. The fix
+  scans the thread's TLS mapping (from `/proc/self/maps`) for the pointers just
+  stored, rejecting the 64-byte-aligned `__thread` copies, and verifies the same
+  offsets on every later thread.
+- Measured: `tls tp=... host_key=-2147483627 off=0x198 ... guest_key=-2147483626
+  off=0x1a8 ...`; boot reaches `mapped all`, constructors, `ENTER nnMain`, save
+  mount (zero-UID adoption picks `f9cd…`), `vi host native window 1920x1080`,
+  and 808 presents.
+- CLI probes PASS with the same fix (`probe-vulkan`, `probe-nvn-state`,
+  `probe-nvn-copy`, `boot-sdk` loader-ready).
+- The real Surface only received 3 presents: the display was OFF and the MIUI
+  keyguard owned focus (`surfaceDestroyed` at 22:02:42), so the renderer stayed
+  offscreen. This is environmental, not a code path: `input keyevent` is denied
+  on this ROM, `/dev/input` is SELinux-denied, and MIUI denies `showWhenLocked`
+  to `com.totk.android`.
+- Next blocker after TLS: an HLE lock/futex deadlock. Both cores were held for
+  127 s; the owner is a host frame in `libc.so+0xa6020` while holding the core
+  lock (`guest=0`), with waiters at `sdk+0xde1888` (later
+  `nn::os::TryPeekLightMessageQueue+0x80`).
+
+### Device recovery needed (human unlock)
+
+A reboot to escape the display-off/keyguard loop left the device in Direct Boot
+with a lock credential. Activities no longer resolve, `adb install` is blocked,
+and a failed reinstall removed `com.totk.android`; the 6.6 GB app external data
+was removed with it. CLI data under `/data/local/tmp/totk-android` is intact.
+
+1. Unlock the phone once (PIN/pattern/fingerprint).
+2. `adb install -r --no-incremental \
+   /Users/oasis/.local/share/opencode/worktree/9bf67f/app-tls/games/totk/android/app/build/totk-android.apk`
+3. Re-create `/sdcard/Android/data/com.totk.android/files/{game,romfs,profile,shader-cache}`
+   (the 6.6 GB romfs copy was deleted).
+4. `adb shell svc power stayon true` after unlocking, then launch with
+   `--es account_uid f9cdd55b6d4c70efc1c8e47378dad985`.
 
 ## 6. Remaining options
 
-1. **Verify the 8,427-draw drain** (recommended host-side lead). Use the
-   Phive-timed sequence after boot (~100-150 s) and the current main build:
-   `25:A:400,40:PLUS:400,55:A:400,70:A:400,90:PLUS:400,120:A:400,150:A:400`,
-   ~300 s. Check `[totk-frame] segs ... draws=8427 ... queued=` and
-   `rt 400x225/64x64 fmt=0x3f`, then capture those targets' PPMs.
-2. **Title/save state machine / asset trigger.** The masks are not a missing
-   host command in the reached states; the title flow (EventFlow/Phive/save
-   metadata) must advance before the UI producer runs. Compare a 1.0.0 save and
-   a new-game flow; the 1.4.3 update `CaveBounding` assets are still absent.
-3. **Font atlas path.** If a future state starts text rendering, trace the
-   `nn::font` rasterizer's output path (storage image/BindImage, Dispatch,
-   Copy, or CPU writes) before implementing any producer.
-4. **Accept the boundary.** Keep the CLI/offscreen evidence and the host fixes;
-   document Gate 3 as blocked by the guest title/UI state, not the renderer.
+1. **Font atlas producer (the root blocker for text/UI).** The 2048x4096 R8
+   mask is sampled by the text pass but never written by any recorded CPU/RT/
+   copy/dispatch/image path. The `nn::font` rasterizer is either gated behind
+   the title/text state or uses an API the recording does not show. Find that
+   path before touching the queue or the blend state; without it the text draws
+   are black even if they execute.
+2. **8,427-draw drain (necessary but not sufficient).** The 300 s late-input
+   run still shows `queued=1` for the 400x225/64x64 `0x3f` batches, and the
+   400x225 PPM is black. Re-test the drain only after (1) is fixed, otherwise a
+   drained batch still samples a zero atlas.
+3. **App-shell HLE deadlock.** With TLS solved, the app boots to `nnMain` +
+   save mount + a 1920x1080 window, then deadlocks holding a core lock in
+   `libc.so+0xa6020` with waiters at `sdk+0xde1888`. This needs the device
+   unlocked first; then instrument the HLE lock/futex owner and the
+   `TryPeekLightMessageQueue` waiter.
+4. **Accept the boundary.** The host fixes, the app TLS fix, and this report are
+   preserved; Gate 3 is recorded as blocked by the guest title/UI state and the
+   font atlas producer, not by the renderer or present path.
 
 ## 7. Reproduce
 
