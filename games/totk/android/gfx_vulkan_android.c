@@ -3202,6 +3202,71 @@ void gfx_backend_texture_destroy(GfxTexture *t) {
     free(t);
 }
 
+/* Repository-owned BC4 sampled-draw probe shaders.  GLSL source:
+ *   games/totk/android/shaders/bc4_probe.vert
+ *   games/totk/android/shaders/bc4_probe.frag
+ *
+ * Regenerate with the NDK glslc:
+ *   /opt/homebrew/share/android-ndk/shader-tools/darwin-x86_64/glslc \
+ *       --target-env=vulkan1.0 -O -fshader-stage=vert \
+ *       games/totk/android/shaders/bc4_probe.vert -o /tmp/bc4_probe.vert.spv
+ *   /opt/homebrew/share/android-ndk/shader-tools/darwin-x86_64/glslc \
+ *       --target-env=vulkan1.0 -O -fshader-stage=frag \
+ *       games/totk/android/shaders/bc4_probe.frag -o /tmp/bc4_probe.frag.spv
+ * then emit little-endian uint32_t words in the same style as triangle_spv.h.
+ */
+static const uint32_t bc4_probe_vert_spv[] __attribute__((aligned(4))) = {
+    0x07230203u, 0x00010000u, 0x000d000au, 0x0000002fu, 0x00000000u, 0x00020011u, 0x00000001u, 0x0006000bu,
+    0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0x00000000u, 0x0003000eu, 0x00000000u, 0x00000001u,
+    0x0008000fu, 0x00000000u, 0x00000004u, 0x6e69616du, 0x00000000u, 0x0000000cu, 0x00000018u, 0x00000020u,
+    0x00040047u, 0x0000000cu, 0x0000000bu, 0x0000002au, 0x00040047u, 0x00000018u, 0x0000001eu, 0x00000000u,
+    0x00050048u, 0x0000001eu, 0x00000000u, 0x0000000bu, 0x00000000u, 0x00050048u, 0x0000001eu, 0x00000001u,
+    0x0000000bu, 0x00000001u, 0x00050048u, 0x0000001eu, 0x00000002u, 0x0000000bu, 0x00000003u, 0x00050048u,
+    0x0000001eu, 0x00000003u, 0x0000000bu, 0x00000004u, 0x00030047u, 0x0000001eu, 0x00000002u, 0x00020013u,
+    0x00000002u, 0x00030021u, 0x00000003u, 0x00000002u, 0x00030016u, 0x00000006u, 0x00000020u, 0x00040017u,
+    0x00000007u, 0x00000006u, 0x00000002u, 0x00040015u, 0x0000000au, 0x00000020u, 0x00000001u, 0x00040020u,
+    0x0000000bu, 0x00000001u, 0x0000000au, 0x0004003bu, 0x0000000bu, 0x0000000cu, 0x00000001u, 0x0004002bu,
+    0x0000000au, 0x0000000eu, 0x00000001u, 0x0004002bu, 0x0000000au, 0x00000010u, 0x00000002u, 0x00040020u,
+    0x00000017u, 0x00000003u, 0x00000007u, 0x0004003bu, 0x00000017u, 0x00000018u, 0x00000003u, 0x00040017u,
+    0x0000001au, 0x00000006u, 0x00000004u, 0x00040015u, 0x0000001bu, 0x00000020u, 0x00000000u, 0x0004002bu,
+    0x0000001bu, 0x0000001cu, 0x00000001u, 0x0004001cu, 0x0000001du, 0x00000006u, 0x0000001cu, 0x0006001eu,
+    0x0000001eu, 0x0000001au, 0x00000006u, 0x0000001du, 0x0000001du, 0x00040020u, 0x0000001fu, 0x00000003u,
+    0x0000001eu, 0x0004003bu, 0x0000001fu, 0x00000020u, 0x00000003u, 0x0004002bu, 0x0000000au, 0x00000021u,
+    0x00000000u, 0x0004002bu, 0x00000006u, 0x00000023u, 0x40000000u, 0x0004002bu, 0x00000006u, 0x00000025u,
+    0x3f800000u, 0x0004002bu, 0x00000006u, 0x00000028u, 0x00000000u, 0x00040020u, 0x0000002cu, 0x00000003u,
+    0x0000001au, 0x0005002cu, 0x00000007u, 0x0000002eu, 0x00000025u, 0x00000025u, 0x00050036u, 0x00000002u,
+    0x00000004u, 0x00000000u, 0x00000003u, 0x000200f8u, 0x00000005u, 0x0004003du, 0x0000000au, 0x0000000du,
+    0x0000000cu, 0x000500c4u, 0x0000000au, 0x0000000fu, 0x0000000du, 0x0000000eu, 0x000500c7u, 0x0000000au,
+    0x00000011u, 0x0000000fu, 0x00000010u, 0x0004006fu, 0x00000006u, 0x00000012u, 0x00000011u, 0x000500c7u,
+    0x0000000au, 0x00000014u, 0x0000000du, 0x00000010u, 0x0004006fu, 0x00000006u, 0x00000015u, 0x00000014u,
+    0x00050050u, 0x00000007u, 0x00000016u, 0x00000012u, 0x00000015u, 0x0003003eu, 0x00000018u, 0x00000016u,
+    0x0005008eu, 0x00000007u, 0x00000024u, 0x00000016u, 0x00000023u, 0x00050083u, 0x00000007u, 0x00000027u,
+    0x00000024u, 0x0000002eu, 0x00050051u, 0x00000006u, 0x00000029u, 0x00000027u, 0x00000000u, 0x00050051u,
+    0x00000006u, 0x0000002au, 0x00000027u, 0x00000001u, 0x00070050u, 0x0000001au, 0x0000002bu, 0x00000029u,
+    0x0000002au, 0x00000028u, 0x00000025u, 0x00050041u, 0x0000002cu, 0x0000002du, 0x00000020u, 0x00000021u,
+    0x0003003eu, 0x0000002du, 0x0000002bu, 0x000100fdu, 0x00010038u,
+};
+static const size_t bc4_probe_vert_spv_size = sizeof bc4_probe_vert_spv;
+
+static const uint32_t bc4_probe_frag_spv[] __attribute__((aligned(4))) = {
+    0x07230203u, 0x00010000u, 0x000d000au, 0x00000014u, 0x00000000u, 0x00020011u, 0x00000001u, 0x0006000bu,
+    0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0x00000000u, 0x0003000eu, 0x00000000u, 0x00000001u,
+    0x0007000fu, 0x00000004u, 0x00000004u, 0x6e69616du, 0x00000000u, 0x00000009u, 0x00000011u, 0x00030010u,
+    0x00000004u, 0x00000007u, 0x00040047u, 0x00000009u, 0x0000001eu, 0x00000000u, 0x00040047u, 0x0000000du,
+    0x00000022u, 0x00000000u, 0x00040047u, 0x0000000du, 0x00000021u, 0x00000000u, 0x00040047u, 0x00000011u,
+    0x0000001eu, 0x00000000u, 0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u, 0x00000002u, 0x00030016u,
+    0x00000006u, 0x00000020u, 0x00040017u, 0x00000007u, 0x00000006u, 0x00000004u, 0x00040020u, 0x00000008u,
+    0x00000003u, 0x00000007u, 0x0004003bu, 0x00000008u, 0x00000009u, 0x00000003u, 0x00090019u, 0x0000000au,
+    0x00000006u, 0x00000001u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000001u, 0x00000000u, 0x0003001bu,
+    0x0000000bu, 0x0000000au, 0x00040020u, 0x0000000cu, 0x00000000u, 0x0000000bu, 0x0004003bu, 0x0000000cu,
+    0x0000000du, 0x00000000u, 0x00040017u, 0x0000000fu, 0x00000006u, 0x00000002u, 0x00040020u, 0x00000010u,
+    0x00000001u, 0x0000000fu, 0x0004003bu, 0x00000010u, 0x00000011u, 0x00000001u, 0x00050036u, 0x00000002u,
+    0x00000004u, 0x00000000u, 0x00000003u, 0x000200f8u, 0x00000005u, 0x0004003du, 0x0000000bu, 0x0000000eu,
+    0x0000000du, 0x0004003du, 0x0000000fu, 0x00000012u, 0x00000011u, 0x00050057u, 0x00000007u, 0x00000013u,
+    0x0000000eu, 0x00000012u, 0x0003003eu, 0x00000009u, 0x00000013u, 0x000100fdu, 0x00010038u,
+};
+static const size_t bc4_probe_frag_spv_size = sizeof bc4_probe_frag_spv;
+
 struct GfxTexturedPipeline {
     VkShaderModule vs, ps;
     VkDescriptorSetLayout dsl;
@@ -3216,7 +3281,9 @@ struct GfxTexturedPipeline {
     VkImageView fb_view;
 };
 
-GfxTexturedPipeline *gfx_backend_textured_pipeline_create(int vk_format) {
+static GfxTexturedPipeline *textured_pipeline_create_impl(const uint8_t *vs, size_t vs_size,
+                                                          const uint8_t *ps, size_t ps_size,
+                                                          int vk_format) {
     pthread_mutex_lock(&g_lock);
     if (!vk_init_locked()) { pthread_mutex_unlock(&g_lock); return NULL; }
     VkFormat fmt = (VkFormat)vk_format;
@@ -3224,10 +3291,8 @@ GfxTexturedPipeline *gfx_backend_textured_pipeline_create(int vk_format) {
     GfxTexturedPipeline *p = calloc(1, sizeof *p);
     if (!p) { pthread_mutex_unlock(&g_lock); return NULL; }
     p->format = fmt;
-    if (!vk_shader_module((const uint8_t *)triangle_tex_vert_spv, triangle_tex_vert_spv_size,
-                          "vkCreateShaderModule(tex vs)", &p->vs) ||
-        !vk_shader_module((const uint8_t *)triangle_tex_frag_spv, triangle_tex_frag_spv_size,
-                          "vkCreateShaderModule(tex ps)", &p->ps))
+    if (!vk_shader_module(vs, vs_size, "vkCreateShaderModule(tex vs)", &p->vs) ||
+        !vk_shader_module(ps, ps_size, "vkCreateShaderModule(tex ps)", &p->ps))
         goto fail;
     VkDescriptorSetLayoutBinding b = {
         .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -3238,10 +3303,10 @@ GfxTexturedPipeline *gfx_backend_textured_pipeline_create(int vk_format) {
         .bindingCount = 1, .pBindings = &b,
     };
     if (!vk_ok(vkCreateDescriptorSetLayout(g.dev, &dlci, NULL, &p->dsl), "vkCreateDescriptorSetLayout(tex)")) goto fail;
-    VkDescriptorPoolSize ps = { .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1 };
+    VkDescriptorPoolSize pool_size = { .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1 };
     VkDescriptorPoolCreateInfo dpci = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps,
+        .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &pool_size,
     };
     if (!vk_ok(vkCreateDescriptorPool(g.dev, &dpci, NULL, &p->dpool), "vkCreateDescriptorPool(tex)")) goto fail;
     VkDescriptorSetAllocateInfo dsai = {
@@ -3328,6 +3393,20 @@ fail:
     gfx_backend_textured_pipeline_destroy(p);
     pthread_mutex_unlock(&g_lock);
     return NULL;
+}
+
+GfxTexturedPipeline *gfx_backend_textured_pipeline_create(int vk_format) {
+    return textured_pipeline_create_impl((const uint8_t *)triangle_tex_vert_spv,
+                                         triangle_tex_vert_spv_size,
+                                         (const uint8_t *)triangle_tex_frag_spv,
+                                         triangle_tex_frag_spv_size, vk_format);
+}
+
+static GfxTexturedPipeline *textured_pipeline_create_bc4(int vk_format) {
+    return textured_pipeline_create_impl((const uint8_t *)bc4_probe_vert_spv,
+                                         bc4_probe_vert_spv_size,
+                                         (const uint8_t *)bc4_probe_frag_spv,
+                                         bc4_probe_frag_spv_size, vk_format);
 }
 
 void gfx_backend_textured_pipeline_destroy(GfxTexturedPipeline *p) {
@@ -7343,6 +7422,97 @@ static void vk_decode_b10g11r11(uint32_t v, float out[3]) {
     out[2] = vk_decode_ufloat10((v >> 22) & 0x3ffu);
 }
 
+static void bc4_probe_constant_block(uint8_t *b, uint8_t v) {
+    b[0] = v;
+    b[1] = v;
+    memset(b + 2, 0, 6);
+}
+
+static void bc4_probe_half_block(uint8_t *b, uint8_t lo, uint8_t hi) {
+    b[0] = lo;
+    b[1] = hi;
+    memset(b + 2, 0, 6);
+    for (unsigned i = 8; i < 16; i++) {
+        unsigned bit = i * 3;
+        b[2 + bit / 8] |= (uint8_t)(1u << (bit % 8));
+    }
+}
+
+static int bc4_probe_expect(GfxOffscreenTarget *t, uint32_t x, uint32_t y,
+                            uint8_t r, const char *what) {
+    uint8_t px[4] = { 0, 0, 0, 0 };
+    if (!gfx_backend_offscreen_read_pixel(t, x, y, px)) {
+        vk_log("ERROR BC4 sample %s: read pixel (%u,%u) failed", what, x, y);
+        return 0;
+    }
+    if (px[0] != r || px[1] != 0 || px[2] != 0 || px[3] != 255) {
+        vk_log("ERROR BC4 sample %s at (%u,%u): got=%02x%02x%02x%02x "
+               "want=%02x0000ff", what, x, y, px[0], px[1], px[2], px[3], r);
+        return 0;
+    }
+    return 1;
+}
+
+/* Draw a fullscreen triangle that samples a known BC4 texture.  Vulkan's
+ * block-compressed view semantics require sample == (R, 0, 0, 1); a channel
+ * swap or a zero return here would explain the zero UI chain. */
+static int bc4_sample_selftest_size(uint32_t size) {
+    uint32_t grid = size / 4;
+    if (!grid) return 0;
+    size_t bytes = (size_t)grid * grid * 8;
+    uint8_t *blocks = calloc(1, bytes);
+    if (!blocks) return 0;
+    for (uint32_t by = 0; by < grid; by++) {
+        for (uint32_t bx = 0; bx < grid; bx++) {
+            uint8_t *b = blocks + ((size_t)by * grid + bx) * 8;
+            bc4_probe_constant_block(b, bx < grid / 2 ? 64 : 192);
+        }
+    }
+    uint32_t sbx = grid / 2, sby = grid / 2;
+    bc4_probe_half_block(blocks + ((size_t)sby * grid + sbx) * 8, 0, 255);
+
+    GfxTextureDesc d = {
+        .target = GFX_TEXTURE_2D,
+        .vk_format = VK_FORMAT_BC4_UNORM_BLOCK,
+        .width = size, .height = size, .depth = 1,
+        .mip_levels = 1, .array_layers = 1, .samples = 1,
+    };
+    GfxTextureSubresource sub = { 0, 0, blocks, bytes };
+    GfxTexture *tex = gfx_backend_texture_create_desc(&d, &sub, 1);
+    GfxOffscreenTarget *t = tex ? gfx_backend_offscreen_create(size, size, 0x25) : NULL;
+    GfxTexturedPipeline *p = t ? textured_pipeline_create_bc4(VK_FORMAT_R8G8B8A8_UNORM) : NULL;
+    int ok = 0;
+    if (p && gfx_backend_textured_draw(p, tex, t, 0.0f, 1.0f, 0.0f, 1.0f)) {
+        uint32_t left_x = size / 8, mid_y = size / 2;
+        uint32_t right_x = size - size / 8;
+        uint32_t sx = sbx * 4 + 1, sy = sby * 4;
+        ok = bc4_probe_expect(t, left_x, mid_y, 64, "left half") &&
+             bc4_probe_expect(t, right_x, mid_y, 192, "right half") &&
+             bc4_probe_expect(t, sx, sy, 0, "index 0") &&
+             bc4_probe_expect(t, sx, sy + 2, 255, "index 1");
+        if (ok)
+            vk_log("BC4 sample %ux%u PASS: (R,0,0,1) left=64 right=192 "
+                   "index0=0 index1=255", size, size);
+    } else {
+        vk_log("ERROR BC4 sample %ux%u: pipeline or draw failed", size, size);
+    }
+    if (p) gfx_backend_textured_pipeline_destroy(p);
+    if (t) gfx_backend_offscreen_destroy(t);
+    if (tex) gfx_backend_texture_destroy(tex);
+    free(blocks);
+    return ok;
+}
+
+static int gfx_backend_bc4_sample_selftest(void) {
+    if (!gfx_backend_vulkan_init()) return 0;
+    int ok64 = bc4_sample_selftest_size(64);
+    int ok96 = bc4_sample_selftest_size(96);
+    vk_log("BC4 sampled draw %s (64x64 %s, 96x96 %s)",
+           ok64 && ok96 ? "PASS" : "FAIL", ok64 ? "PASS" : "FAIL",
+           ok96 ? "PASS" : "FAIL");
+    return ok64 && ok96;
+}
+
 int gfx_backend_copy_probe(const char *work_dir) {
     vk_log("copy probe begin work=%s", work_dir ? work_dir : "(null)");
     if (!gfx_backend_vulkan_init()) {
@@ -7471,6 +7641,11 @@ int gfx_backend_copy_probe(const char *work_dir) {
         }
         if (bt) gfx_backend_texture_destroy(bt);
         free(zero);
+    }
+
+    if (ok && !gfx_backend_bc4_sample_selftest()) {
+        vk_log("copy probe FAIL: BC4 sampled draw");
+        ok = 0;
     }
 
     /* Format-mismatch blit, only when the device advertises both sides. */
