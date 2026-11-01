@@ -6779,6 +6779,77 @@ static void nvn_build_vertex_layout(const nvn_bind_state_t *b, GfxVertexLayout *
     *sig = nvn_vertex_signature(out);
 }
 
+/* Is [addr, addr+size) inside a known guest memory pool?  Used before reading
+ * past a bound vertex buffer: the ring can be larger than the bound range, but
+ * reading beyond the mapping must never happen. */
+static int nvn_guest_range_ok(uint64_t addr, size_t size) {
+    int ok = 0;
+    if (!addr || !size) return 0;
+    pthread_mutex_lock(&g_pool_epoch_lock);
+    for (unsigned i = 0; i < g_pool_epoch_count && !ok; i++) {
+        const pool_t *pp = g_pool_epochs[i].p;
+        if (!pp || pp->magic != NVN_MAGIC('P', 'O', 'O', 'L') || !pp->mem) continue;
+        uint64_t base = (uint64_t)(uintptr_t)pp->mem;
+        if (addr >= base && size <= pp->size && addr - base <= pp->size - size) ok = 1;
+    }
+    pthread_mutex_unlock(&g_pool_epoch_lock);
+    return ok;
+}
+
+/* Vertex count an indexed draw really needs, and a safe clamp.  The guest may
+ * bind a vertex buffer smaller than the index range (TOTK binds 32 bytes and
+ * indexes four vertices).  When the range is provably inside a guest pool the
+ * stream is extended from guest memory; otherwise the index values are clamped
+ * to the bound range and the clamp is reported (never a silent overwrite). */
+static uint32_t nvn_fix_index_range(GfxCmd *cmds, uint32_t count,
+                                    const nvn_bind_state_t *b, const char *where) {
+    uint32_t need = 0;
+    if (!cmds || !b) return 0;
+    if (!(b->vb_mask & 1u) || !b->vb[0].address || !b->vb[0].size || !b->vs[0])
+        return 0;
+    uint64_t addr = b->vb[0].address;
+    uint32_t stride = (uint32_t)b->vs[0];
+    uint32_t have = (uint32_t)(b->vb[0].size / stride);
+    for (uint32_t i = 0; i < count; i++) {
+        GfxCmd *c = &cmds[i];
+        if (c->kind != GFX_CMD_DRAW_INDEXED) continue;
+        uint32_t it = c->u.draw_indexed.index_type;
+        const uint8_t *idx = (const uint8_t *)c->u.draw_indexed.indices;
+        uint32_t n = c->u.draw_indexed.count;
+        if (!idx || !n || n > 65536) continue;
+        uint32_t maxi = 0;
+        for (uint32_t k = 0; k < n; k++) {
+            uint32_t v;
+            if (it == 0) v = idx[k];
+            else if (it == 1) { uint16_t x = 0; memcpy(&x, idx + (size_t)k * 2, 2); v = x; }
+            else { v = 0; memcpy(&v, idx + (size_t)k * 4, 4); }
+            if (v > maxi) maxi = v;
+        }
+        if (maxi + 1 > need) need = maxi + 1;
+        if (maxi < have) continue;
+        size_t want = (size_t)(maxi + 1) * stride;
+        if (nvn_guest_range_ok(addr, want)) continue;   /* extend from guest */
+        uint32_t lim = have ? have - 1 : 0;
+        uint8_t *w = (uint8_t *)(uintptr_t)idx;
+        for (uint32_t k = 0; k < n; k++) {
+            uint32_t v;
+            if (it == 0) v = w[k];
+            else if (it == 1) { uint16_t x = 0; memcpy(&x, w + (size_t)k * 2, 2); v = x; }
+            else { v = 0; memcpy(&v, w + (size_t)k * 4, 4); }
+            if (v <= lim) continue;
+            if (it == 0) w[k] = (uint8_t)lim;
+            else if (it == 1) { uint16_t x = (uint16_t)lim; memcpy(w + (size_t)k * 2, &x, 2); }
+            else memcpy(w + (size_t)k * 4, &lim, 4);
+        }
+        static unsigned cl;
+        if (cl++ < 8)
+            fprintf(stderr, "[totk-nvn] index clamp %s: max=%u have=%u stride=%u"
+                            " (range %#llx+%zu not inside a pool)\n", where ? where : "?",
+                    maxi, have, stride, (unsigned long long)addr, want);
+    }
+    return need;
+}
+
 static uint32_t nvn_build_vertex_streams(const nvn_bind_state_t *b, GfxVertexStream *out,
                                          uint32_t max, void **owned, uint32_t max_owned,
                                          uint32_t *nowned, uint32_t draw_verts) {
@@ -6842,6 +6913,11 @@ static uint32_t nvn_build_vertex_streams(const nvn_bind_state_t *b, GfxVertexStr
         if (need > size && need <= (64u << 20)) {
             uint8_t *copy = calloc(1, need);
             if (copy && owned && no < max_owned) {
+                /* The bound range is usually a window into a larger ring; read
+                 * the rest only when it is provably mapped. */
+                size_t extra = need - size;
+                if (nvn_guest_range_ok(b->vb[i].address + size, extra))
+                    memcpy(copy, (const uint8_t *)data + size, extra);
                 memcpy(copy, data, size);
                 owned[no++] = copy;
                 data = copy;
@@ -8831,8 +8907,10 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
             GfxVertexStream streams[24];
             void *owned[16];
             uint32_t nowned = 0;
+            uint32_t need_v = nvn_fix_index_range(translated, count, bs, "scene");
+            uint32_t draw_v = need_v > sg->draw_count ? need_v : sg->draw_count;
             uint32_t nstreams = nvn_build_vertex_streams(bs, streams, 24, owned, 16,
-                                                         &nowned, sg->draw_count);
+                                                         &nowned, draw_v);
             if (nvn_ui_seg_want() && lw <= 512) {
                 tl_count = count;
                 tl_streams = nstreams;
@@ -8922,7 +9000,9 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
     }
     /* Same evidence for the large (window-sized) scene segments: the window
      * presents these targets, so a black scene has to be explained here. */
-    if (nvn_trace_composite() && lw >= 1024) {
+    if (nvn_trace_composite() && lw >= 1024 &&
+        nvn_tex_registry_find(sg->color0_tex) &&
+        nvn_tex_registry_find(sg->color0_tex)->d.format != 0x3f) {
         static unsigned big_dumps;
         if (big_dumps < 8) {
             big_dumps++;
@@ -9751,8 +9831,11 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             GfxVertexStream streams[24];
             void *owned[16];
             uint32_t nowned = 0;
+            uint32_t need_v2 = nvn_fix_index_range(translated, count, bs, "submit");
+            uint32_t draw_v2 = need_v2 > (uint32_t)cb->draw_count ? need_v2
+                                                                 : (uint32_t)cb->draw_count;
             uint32_t nstreams = nvn_build_vertex_streams(bs, streams, 24, owned, 16,
-                                                         &nowned, (uint32_t)cb->draw_count);
+                                                         &nowned, draw_v2);
             /* Diagnostic only: the same blend-off test for the window pass. */
             if (window_pass && getenv("TOTK_ANDROID_UI_NO_BLEND")) {
                 for (uint32_t ci = 0; ci < count; ci++) {
