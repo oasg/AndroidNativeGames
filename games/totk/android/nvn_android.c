@@ -76,6 +76,7 @@ static unsigned nvn_cb_copy_t2b_calls, nvn_cb_dispatch_calls;
 static unsigned nvn_cb_copy_t2t_calls, nvn_cb_blit_calls;
 static void nvn_pool_forget(const void *pool);
 static int nvn_ui_seg_want(void);
+static void nvn_cbacct_log(const char *why);
 static void nvn_pipe_ubo_set(GfxReflectedPipeline *rp,
                              const GfxBindingSpec *vss, uint32_t nvs,
                              const GfxBindingSpec *pss, uint32_t nps);
@@ -1471,6 +1472,9 @@ static void nvnQueuePresentTexture(queue_t *q, win_t *w, int index) { nvn_api("n
         fprintf(stderr, "[totk-nvn] present #%u window=%p index=%d (host backend)\n",
                 total, (void *)w, index);
     if ((total % 60) == 0) nvn_frame_report_orphans();
+    if ((total % 600) == 0 && (nvn_trace_composite() ||
+                               getenv("TOTK_ANDROID_TRACE_CBACCT")))
+        nvn_cbacct_log("present");
     nvn_gpu_pending_work = 1;
     if (w->native && !runtime_native_window_present(w->native))
         nvn_fail("nvnQueuePresentTexture", "native window present failed");
@@ -3251,6 +3255,71 @@ static void nvn_orphan_add(const cb_t *c, const cb_meta_t *m) {
                 (void *)c, (unsigned long long)c->handle, m ? m->record_thread : 0,
                 m ? m->record_commands : c->ncmds, c->draw_count, m ? (unsigned long long)m->record_lr : 0);
 }
+/* --- Command-buffer accounting (Lane 4 gate34) ----------------------
+ * Distinguishes "the producer command was never recorded" from "it was
+ * recorded on a buffer that never reached submit". */
+typedef struct {
+    unsigned recorded, finalized, submitted, retired, call_cmds, unsubmitted;
+    unsigned with_draws, with_gpu, with_mask_target;
+    unsigned peak_inflight;
+} nvn_cbacct_t;
+static nvn_cbacct_t g_cbacct;
+static pthread_mutex_t g_cbacct_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Does this recording contain anything that could produce a mask? */
+static int nvn_cb_mask_candidate(const cb_t *c, unsigned *kinds) {
+    int found = 0;
+    if (kinds) *kinds = 0;
+    if (!c) return 0;
+    for (uint32_t i = 0; i < c->ncmds; i++) {
+        const nvn_cmd_t *cc = &c->cmds[i];
+        if (cc->kind == NVN_CMD_COPY_BUFFER_TO_TEXTURE ||
+            cc->kind == NVN_CMD_CLEAR_TEXTURE ||
+            cc->kind == NVN_CMD_COPY_TEXTURE_TO_TEXTURE ||
+            cc->kind == NVN_CMD_DISPATCH) {
+            found = 1;
+            if (kinds) *kinds |= 1u << (cc->kind & 15);
+        } else if (cc->kind == NVN_CMD_SET_RENDER_TARGETS) {
+            for (uint32_t k = 0; k < cc->u.targets.count; k++) {
+                const tex_t *t = nvn_tex_registry_find(cc->u.targets.tex[k]);
+                if (t && t->d.format == 0x1 &&
+                    ((t->d.width == 2048 && t->d.height == 4096) ||
+                     (t->d.width == 780 && t->d.height == 60))) {
+                    found = 1;
+                    if (kinds) *kinds |= 1u << 15;
+                }
+            }
+        }
+    }
+    return found;
+}
+static void nvn_cbacct_log(const char *why) {
+    nvn_cbacct_t a;
+    pthread_mutex_lock(&g_cbacct_lock);
+    a = g_cbacct;
+    pthread_mutex_unlock(&g_cbacct_lock);
+    fprintf(stderr, "[totk-cbacct] %s recorded=%u finalized=%u submitted=%u retired=%u"
+                    " call_cmds=%u unsubmitted=%u peak_inflight=%u | draws_buf=%u gpu_buf=%u"
+                    " mask_buf=%u\n", why ? why : "?", a.recorded, a.finalized, a.submitted,
+            a.retired, a.call_cmds, a.unsubmitted, a.peak_inflight, a.with_draws,
+            a.with_gpu, a.with_mask_target);
+}
+static void nvn_cbacct_bump(int which) {
+    pthread_mutex_lock(&g_cbacct_lock);
+    switch (which) {
+    case 0: g_cbacct.recorded++; if (g_cbacct.recorded > g_cbacct.peak_inflight)
+                g_cbacct.peak_inflight = g_cbacct.recorded; break;
+    case 1: g_cbacct.finalized++; break;
+    case 2: g_cbacct.submitted++; break;
+    case 3: g_cbacct.retired++; break;
+    case 4: g_cbacct.call_cmds++; break;
+    case 5: g_cbacct.with_draws++; break;
+    case 6: g_cbacct.unsubmitted++; break;
+    case 7: g_cbacct.with_mask_target++; break;
+    default: break;
+    }
+    pthread_mutex_unlock(&g_cbacct_lock);
+}
 static int nvn_orphan_seen(uint64_t handle) {
     for (unsigned i = 0; i < g_orphan_count; i++)
         if (g_orphans[i].handle == handle) return 1;
@@ -4222,6 +4291,7 @@ static void nvn_cb_retire(cb_t *c) {
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) return;
     if (!c->handle || (!c->ncmds && !c->draw_count)) return;
     nvn_warm_scene(c);   /* create the scene pipeline on the recording thread */
+    nvn_cbacct_bump(3);
     /* Snapshot per-segment pipelines while the guest program is live.  The
      * queue may render these after the guest finalizes/reuses the program. */
     nvn_seg_t *prepared = NULL;
@@ -4517,6 +4587,21 @@ static void nvnCommandBufferFinalize(cb_t *c) {
                     (void *)c, (unsigned long long)c->handle, runtime_thread_current_handle(),
                     c->ncmds, c->draw_count);
     }
+    {
+        cb_meta_t *m = nvn_cb_meta(c, 0);
+        unsigned kinds = 0;
+        int cand = nvn_cb_mask_candidate(c, &kinds);
+        if (!m || !m->submit_count) {
+            nvn_cbacct_bump(6);
+            if (cand || nvn_trace_composite() ||
+                getenv("TOTK_ANDROID_TRACE_CBACCT"))
+                fprintf(stderr, "[totk-cbacct] NEVER-SUBMITTED cb=%p handle=%#llx"
+                                " thread=%#x cmds=%u draws=%d mask_candidate=%d kinds=%#x\n",
+                        (void *)c, (unsigned long long)c->handle,
+                        m ? m->record_thread : runtime_thread_current_handle(),
+                        c->ncmds, c->draw_count, cand, kinds);
+        }
+    }
     nvn_cb_retire(c);
     nvn_cb_untrack(c);
     nvn_cb_target_forget(c);
@@ -4599,6 +4684,19 @@ static uint64_t nvnCommandBufferEndRecording(cb_t *c) {
     c->recording = 0;
     uint64_t h = 0x100000000ull | (c->serial & 0xffffffffull);
     c->handle = h;
+    {
+        unsigned kinds = 0;
+        int cand = nvn_cb_mask_candidate(c, &kinds);
+        nvn_cbacct_bump(0);
+        nvn_cbacct_bump(1);
+        if (c->draw_count) nvn_cbacct_bump(5);
+        if (cand) nvn_cbacct_bump(7);
+        if (cand && (nvn_trace_composite() || getenv("TOTK_ANDROID_TRACE_CBACCT")))
+            fprintf(stderr, "[totk-cbacct] mask-candidate cb=%p handle=%#llx thread=%#x"
+                            " cmds=%u draws=%d kinds=%#x\n", (void *)c,
+                    (unsigned long long)h, runtime_thread_current_handle(), c->ncmds,
+                    c->draw_count, kinds);
+    }
     {
         static int on = -1;
         if (on < 0) on = getenv("TOTK_ANDROID_TRACE_CB_FLOW") != NULL;
@@ -5462,6 +5560,7 @@ static int nvn_cb_merge_retired(cb_t *dst, uint64_t handle, const char *what) {
 }
 static void nvnCommandBufferCallCommands(cb_t *c, int n, const uint64_t *handles) {
     nvn_api("nvnCommandBufferCallCommands");
+    nvn_cbacct_bump(4);
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferCallCommands", "invalid command buffer"); return; }
     if (n < 0 || (!handles && n)) { nvn_fail("nvnCommandBufferCallCommands", "null handle array"); return; }
     {
@@ -9494,6 +9593,8 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             if (cand->handle == cmds[i]) { cb = cand; break; }
         }
         if (!cb || (!cb->draw_count && !cb->ncmds)) continue;
+        nvn_cbacct_bump(2);
+        { cb_meta_t *mm = nvn_cb_meta(cb, 1); if (mm) mm->submit_count++; }
         {
             static int on = -1;
             if (on < 0) on = getenv("TOTK_ANDROID_TRACE_SUBMIT_CB") != NULL;
