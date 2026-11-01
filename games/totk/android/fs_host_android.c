@@ -79,9 +79,49 @@ static File files[NFILES];
 static Dir dirs[NDIRS];
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static char profile[1024], save_root[1024];
+/* The one account save root this host exposes.  A zero guest Uid (what TOTK
+ * passes to MountSaveData at boot) maps to this UID when it is configured. */
+static uint64_t save_uid[2];
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 
 static void need(int c, const char *m) { if (!c) runtime_fail(m); }
+
+static int uid_is_zero(const uint64_t *u) { return !u || (!u[0] && !u[1]); }
+static void uid_string(const uint64_t *u, char *out, size_t cap) {
+    if (!u) { snprintf(out, cap, "none"); return; }
+    snprintf(out, cap, "%016llx%016llx", (unsigned long long)u[1], (unsigned long long)u[0]);
+}
+/* Without TOTK_ANDROID_ACCOUNT_UID the account service reports Uid{0,0}.  If
+ * the profile already holds exactly one non-zero save/<uid> directory (the
+ * imported save), adopt it instead of creating/using save/0000….
+ * Returns 1 = adopted, 0 = none, -1 = several (do not guess). */
+static int find_single_save_uid(const char *save_dir, uint64_t out[2]) {
+    DIR *d = opendir(save_dir);
+    if (!d) return 0;
+    int n = 0; uint64_t found[2] = {0, 0};
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        const char *s = e->d_name;
+        if (strlen(s) != 32) continue;
+        uint64_t hi = 0, lo = 0; int ok = 1;
+        for (int i = 0; i < 32; i++) {
+            char c = s[i]; int v;
+            if (c >= '0' && c <= '9') v = c - '0';
+            else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+            else { ok = 0; break; }
+            if (i < 16) hi = (hi << 4) | (uint64_t)v;
+            else lo = (lo << 4) | (uint64_t)v;
+        }
+        if (!ok || (!hi && !lo)) continue;   /* not a UID name, or the legacy zero dir */
+        char p[1200]; struct stat st;
+        snprintf(p, sizeof p, "%s/%s", save_dir, s);
+        if (stat(p, &st) || !S_ISDIR(st.st_mode)) continue;
+        n++; found[1] = hi; found[0] = lo;    /* the name prints uid[1] first */
+    }
+    closedir(d);
+    if (n == 1) { out[0] = found[0]; out[1] = found[1]; return 1; }
+    return n > 1 ? -1 : 0;
+}
 
 /* Save in progress: a save-data file open for writing, or save data changed in the last 3 s and not committed yet (TOTK
    writes a slot's files back to back and then commits; between the files nothing is open for a moment). */
@@ -113,6 +153,19 @@ static void init(void) {
     uint64_t uid[2]; runtime_account_uid(uid);
     char p[1100]; make_dir(profile);
     snprintf(p, sizeof p, "%s/save", profile); make_dir(p);
+    if (uid_is_zero(uid)) {
+        uint64_t found[2];
+        int one = find_single_save_uid(p, found);
+        if (one == 1) {
+            uid[0] = found[0]; uid[1] = found[1];
+            char u[40]; uid_string(uid, u, sizeof u);
+            fprintf(stderr, "[totk] save mount: no account UID configured; adopting the single save/%s\n", u);
+        } else if (one < 0) {
+            fprintf(stderr, "[totk] save mount: several save/<uid> directories and no account UID; "
+                            "keeping the zero-UID save (set TOTK_ANDROID_ACCOUNT_UID)\n");
+        }
+    }
+    save_uid[0] = uid[0]; save_uid[1] = uid[1];
     need(snprintf(save_root, sizeof save_root, "%s/save/%016llx%016llx", profile, (unsigned long long)uid[1], (unsigned long long)uid[0]) < (int)sizeof save_root, "save path");
     make_dir(save_root);                                   /* launcher-style EnsureSaveData */
     snprintf(p, sizeof p, "%s/temp", profile); remove_tree(p); make_dir(p);
@@ -164,14 +217,49 @@ static unsigned save_change_path(const char *path, char *out, size_t cap) {
 static unsigned errno_result(void) { return errno == ENOENT || errno == ENOTDIR ? R_PATH_NOT_FOUND : errno == EEXIST ? R_ALREADY_EXISTS : errno == ENOTEMPTY ? R_NOT_EMPTY : R_INVALID_ARGUMENT; }
 
 /* ---------- storage mounts ---------- */
+/* TOTK mounts save data with Uid{0,0} at boot (it never asks the account
+ * service for the user first).  A zero Uid is mapped to the one configured
+ * account root above; a non-zero Uid must still match it exactly.  Both are
+ * logged so a rejected mount can never be silent again. */
 static unsigned mount_save(const char *name, const uint64_t *uid) {
-    ready(); uint64_t me[2]; runtime_account_uid(me);
-    if (!uid || uid[0] != me[0] || uid[1] != me[1]) return R_TARGET_NOT_FOUND;
-    return mount_add(name, M_SAVE, save_root);
+    ready();
+    char req[40], mapped[40];
+    uid_string(uid, req, sizeof req);
+    uid_string(save_uid, mapped, sizeof mapped);
+    if (uid_is_zero(uid)) {
+        fprintf(stderr, "[totk] fs MountSaveData '%s': guest uid=%s (zero) -> mapped uid=%s%s\n",
+                name ? name : "?", req, mapped,
+                uid_is_zero(save_uid) ? " (no account configured: legacy zero-UID save)" : "");
+        return mount_add(name, M_SAVE, save_root);
+    }
+    if (uid && uid[0] == save_uid[0] && uid[1] == save_uid[1])
+        return mount_add(name, M_SAVE, save_root);
+    fprintf(stderr, "[totk] fs MountSaveData '%s': guest uid=%s does not match configured uid=%s: "
+                    "rejected (save: paths will fail)\n", name ? name : "?", req, mapped);
+    return R_TARGET_NOT_FOUND;
 }
 static unsigned char save_exists(uint64_t application, const uint64_t *uid) {
-    ready(); uint64_t me[2]; runtime_account_uid(me);
-    return application == TOTK_APPLICATION_ID && uid && uid[0] == me[0] && uid[1] == me[1];
+    ready();
+    char req[40], mapped[40];
+    uid_string(uid, req, sizeof req);
+    uid_string(save_uid, mapped, sizeof mapped);
+    if (application != TOTK_APPLICATION_ID) {
+        fprintf(stderr, "[totk] fs IsSaveDataExisting app=%016llx uid=%s: not this title -> false\n",
+                (unsigned long long)application, req);
+        return 0;
+    }
+    if (!uid_is_zero(uid) && (!uid || uid[0] != save_uid[0] || uid[1] != save_uid[1])) {
+        fprintf(stderr, "[totk] fs IsSaveDataExisting uid=%s != configured uid=%s -> false\n", req, mapped);
+        return 0;
+    }
+    struct stat st;
+    if (stat(save_root, &st) || !S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "[totk] fs IsSaveDataExisting uid=%s mapped to %s: root missing -> false\n", req, save_root);
+        return 0;
+    }
+    if (uid_is_zero(uid))
+        fprintf(stderr, "[totk] fs IsSaveDataExisting uid=%s (zero) -> mapped uid=%s: true\n", req, mapped);
+    return 1;
 }
 /* Other titles' save data (e.g. data-link bonuses) is not present on this host. */
 static unsigned mount_save_ro(const char *name, uint64_t application, const uint64_t *uid) {
