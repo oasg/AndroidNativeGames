@@ -36,6 +36,7 @@
 typedef uint32_t NvnBool;
 typedef void *NvnNativeWindow;
 extern int runtime_native_window_present(void *p);
+extern void runtime_native_window_set_present_target(void *p, void *target);
 extern void runtime_native_window_destroy(void *p);
 extern void *runtime_native_window_create(uint32_t width, uint32_t height,
                                           uint32_t format, uint64_t layer_id);
@@ -4002,6 +4003,11 @@ static int nvn_is_empty_target(const void *tex) {
     pthread_mutex_unlock(&g_empty_lock);
     return found;
 }
+/* Last large (window-sized) offscreen scene target rendered by a queued scene
+ * segment.  The window composite samples only the fade overlay, so the window
+ * pass presents this target instead of the overlay-only window image. */
+static GfxOffscreenTarget *g_last_scene_rt;
+static uint32_t g_last_scene_w, g_last_scene_h;
 static pthread_mutex_t g_prog_lock;
 static void nvn_warm_scene(cb_t *c);
 static void nvn_seg_prepare(nvn_seg_t *segs, uint32_t nseg, cb_t *c);
@@ -8869,6 +8875,11 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
     /* Associate only after the segment actually drew: a queued segment whose
      * pipeline was missing must not become the compositor's sample source. */
     if (drew && ctex) nvn_tex_set_rt(ctex, rt, &layout, lw, lh);
+    if (drew && lw >= 1024 && lh >= 1024) {
+        g_last_scene_rt = rt;
+        g_last_scene_w = lw;
+        g_last_scene_h = lh;
+    }
     if (nvn_trace_frame() && lw <= 512) {
         static unsigned ui_log;
         if (ui_log++ < 4)
@@ -9680,6 +9691,29 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                                                                   translated, count,
                                                                   has_clear ? clear : NULL,
                                                                   streams, nstreams);
+            if (window_pass && has_window && g_last_scene_rt) {
+                /* The window composite samples the fade overlay only; the frame
+                 * content is the scene target rendered by the scene segments.
+                 * Present that real target rather than the overlay. */
+                runtime_native_window_set_present_target(w->native, g_last_scene_rt);
+                if (nvn_trace_composite()) {
+                    static unsigned sl;
+                    if (sl++ < 8)
+                        fprintf(stderr, "[totk-frame] window presents scene rt=%p %ux%u"
+                                        " (overlay dropped)\n", (void *)g_last_scene_rt,
+                                g_last_scene_w, g_last_scene_h);
+                }
+                const char *pp = getenv("TOTK_ANDROID_PRESENT_PPM");
+                if (pp && *pp) {
+                    static int dumped;
+                    if (!dumped) {
+                        dumped = 1;
+                        int ok = gfx_backend_offscreen_write_ppm_index(g_last_scene_rt, 0, pp);
+                        fprintf(stderr, "[totk-frame] present ppm -> %s (%s)\n", pp,
+                                ok ? "ok" : "failed");
+                    }
+                }
+            }
             if (window_pass && nvn_trace_composite()) {
                 static unsigned wp_logged;
                 if (wp_logged++ < 6) {
@@ -9776,6 +9810,30 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                 if (has_window) nvn_window_mirror_target(w, rt);
                 const tex_t *ctex = nvn_tex_registry_find(rt_owner);
                 if (ctex) nvn_tex_set_rt(ctex, rt, &layout, rw, rh);
+                /* The engine renders the scene into an offscreen target and its
+                 * window composite samples only the fade overlay, so the scene
+                 * never reaches the surface.  Present the pass that actually
+                 * holds the frame content (no invented pixels). */
+                if (has_window && rt && rw >= 1024 && rh >= 1024) {
+                    runtime_native_window_set_present_target(w->native, rt);
+                    if (nvn_trace_composite()) {
+                        static unsigned pl;
+                        if (pl++ < 8)
+                            fprintf(stderr, "[totk-frame] present-target rt=%p %ux%u"
+                                            " fmt=%#x (offscreen pass)\n", (void *)rt,
+                                    rw, rh, layout.color_formats[0]);
+                    }
+                    const char *pp = getenv("TOTK_ANDROID_PRESENT_PPM");
+                    if (pp && *pp) {
+                        static int dumped;
+                        if (!dumped) {
+                            dumped = 1;
+                            int ok = gfx_backend_offscreen_write_ppm_index(rt, 0, pp);
+                            fprintf(stderr, "[totk-frame] present ppm -> %s (%s)\n", pp,
+                                    ok ? "ok" : "failed");
+                        }
+                    }
+                }
             }
         } else if (has_window && has_program && ph.textured &&
                    ph.gfx_textured_pipeline && ph.gfx_texture) {
