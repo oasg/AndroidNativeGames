@@ -73,6 +73,7 @@ static unsigned nvn_cb_draw_texture_calls, nvn_cb_clear_texture_calls;
 static unsigned nvn_cb_copy_t2b_calls, nvn_cb_dispatch_calls;
 static unsigned nvn_cb_copy_t2t_calls, nvn_cb_blit_calls;
 static void nvn_pool_forget(const void *pool);
+static int nvn_ui_seg_want(void);
 static void nvn_pipe_ubo_set(GfxReflectedPipeline *rp,
                              const GfxBindingSpec *vss, uint32_t nvs,
                              const GfxBindingSpec *pss, uint32_t nps);
@@ -779,6 +780,9 @@ typedef struct {
     uint32_t rt_width, rt_height;
     uint64_t rt_frame, rt_uploaded;   /* render generation / uploaded generation */
     int rt_valid;
+    /* The guest wrote texels through the CPU path since the host copy was
+     * uploaded; the cached GfxTexture is stale until it is rebuilt. */
+    int gfx_dirty;
 } tex_bridge_t;
 static tex_bridge_t *g_tex_bridges;
 static unsigned g_tex_bridge_count, g_tex_bridge_cap;
@@ -2221,6 +2225,23 @@ static void nvn_upload_trace_result(int on, const tex_t *t, const char *what,
 static GfxTexture *nvn_texture_gfx_ready_locked(const tex_t *t) {
     if (!t || t->magic != NVN_MAGIC('T', 'E', 'X', 0)) return NULL;
     tex_bridge_t *b = nvn_tex_bridge(t, 0);
+    /* The guest wrote texels since the host copy was uploaded: drop the stale
+     * CPU-uploaded image so the normal path below re-uploads the new bytes.
+     * This does not touch the render-target association; if the texture is an
+     * RT the RT readback path below rebuilds it anyway. */
+    if (b && b->gfx_dirty) {
+        b->gfx_dirty = 0;
+        if (b->gfx) {
+            gfx_backend_texture_destroy((GfxTexture *)b->gfx);
+            b->gfx = NULL;
+            b->rt_uploaded = 0;
+            static unsigned dirty_logged;
+            if (dirty_logged++ < 8)
+                fprintf(stderr, "[totk-nvn] tex-rewrite tex=%p %#x %ux%u: cached host"
+                                " copy dropped (guest wrote texels)\n", (const void *)t,
+                        t->d.format, t->d.width, t->d.height);
+        }
+    }
     int utr = nvn_trace_inputs() && nvn_upload_traces < 512 &&
               t->d.width <= 1024 && t->d.height <= 1024;
     if (utr) {
@@ -2398,8 +2419,9 @@ static uint64_t nvnTextureGetTextureAddress(const tex_t *t) {
     return t->mem ? (uint64_t)(uintptr_t)t->mem : 0;
 }
 static void nvnTextureGetSparseTileLayout(const tex_t *t, void *out) { (void)t; if (out) memset(out, 0, 0x28); }
-static void nvnTextureFlushTexels(const tex_t *t, const void *v, const void *r) { (void)t; (void)v; (void)r; }
-static void nvnTextureInvalidateTexels(const tex_t *t, const void *v, const void *r) { (void)t; (void)v; (void)r; }
+static void nvn_texture_mark_dirty(const tex_t *t);
+static void nvnTextureFlushTexels(const tex_t *t, const void *v, const void *r) { (void)v; (void)r; nvn_texture_mark_dirty(t); }
+static void nvnTextureInvalidateTexels(const tex_t *t, const void *v, const void *r) { (void)v; (void)r; nvn_texture_mark_dirty(t); }
 static void *nvnTextureGetMemoryPool(const tex_t *t) { return t ? t->pool : NULL; }
 static int64_t nvnTextureGetMemoryOffset(const tex_t *t) { return t ? t->off : 0; }
 static int nvnTextureGetRawStorageClass(const tex_t *t) { (void)t; return 1; }
@@ -2408,6 +2430,15 @@ static uint64_t nvnTextureGetDebugID(const tex_t *t) { return t ? (uint64_t)(uin
 static uint32_t nvnTextureCompare(const tex_t *a, const tex_t *b) {
     if (!a || !b) return 0;
     return !memcmp(&a->d, &b->d, sizeof a->d) && a->mem == b->mem;
+}
+
+/* Mark the host copy of a guest texture stale after a CPU-side texel write. */
+static void nvn_texture_mark_dirty(const tex_t *t) {
+    if (!t) return;
+    pthread_mutex_lock(&g_tex_bridge_lock);
+    tex_bridge_t *b = nvn_tex_bridge(t, 1);
+    if (b) b->gfx_dirty = 1;
+    pthread_mutex_unlock(&g_tex_bridge_lock);
 }
 
 /* A CPU-side texel copy is enough for this host: nothing consumes the GPU
@@ -2435,6 +2466,22 @@ static void nvn_tex_copy(const tex_t *t, const void *view, const int *region,
                 memcpy(t->mem + off + (size_t)zz * img + (size_t)yy * row,
                        (const uint8_t *)src + (size_t)zz * img + (size_t)yy * row,
                        rb < (size_t)row ? rb : (size_t)row);
+        /* The guest just changed the texels.  Mark the host copy stale; it is
+         * rebuilt from these bytes on the next bind (destroying it here would
+         * race with a concurrent bind, so the flag is the hand-off). */
+        nvn_texture_mark_dirty(t);
+        if (nvn_ui_seg_want()) {
+            size_t ms = t->L.size ? (size_t)t->L.size
+                                  : (size_t)t->d.width * t->d.height;
+            uint32_t nz = nvn_first_nonzero(t->mem, ms, 1u << 20);
+            static unsigned wl;
+            if (wl++ < 24)
+                fprintf(stderr, "[totk-ui-seg] tex-write tex=%p %#x %ux%u tgt=%d off=%llu"
+                                " bytes=%zu first_nz=%s%u\n", (const void *)t,
+                        t->d.format, t->d.width, t->d.height, t->d.target,
+                        (unsigned long long)off, (size_t)rb * (size_t)h,
+                        nz == UINT32_MAX ? "none " : "", nz == UINT32_MAX ? 0 : nz);
+        }
     } else {
         if ((size_t)(img * d) > avail) d = (int)(avail / (size_t)(img ? img : 1));
         for (int zz = 0; zz < d; zz++)
