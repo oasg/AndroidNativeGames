@@ -69,6 +69,7 @@ static int nvn_trace_inputs(void);
 static int nvn_trace_composite(void);
 static int nvn_trace_save_ui(void);
 static uint32_t nvn_first_nonzero(const uint8_t *p, size_t n, size_t cap);
+static int nvn_guest_range_ok(uint64_t addr, size_t size);
 /* Evidence counters for the title/UI input trace. */
 static unsigned nvn_tex_writes, nvn_buf_maps, nvn_cb_copy_b2b, nvn_cb_copy_b2t;
 static unsigned nvn_cb_draw_texture_calls, nvn_cb_clear_texture_calls;
@@ -237,7 +238,14 @@ typedef struct {
         } targets;
         struct { uint32_t stage, kind, slot; uint64_t address; size_t size; uint64_t handle; } desc;
         struct { nvn_render_state_t rs; } state;
-        struct { uint32_t primitive, first, count, instances, base_instance; } draw;
+        struct { uint32_t primitive, first, count, instances, base_instance;
+                 /* Private copy of each bound vertex stream taken at record
+                  * time.  The guest recycles its vertex ring before a queued
+                  * segment replays, so the address alone is not enough. */
+                 uint8_t *vb_data[4];
+                 size_t vb_size[4];
+                 uint8_t vb_stream[4];
+                 uint32_t vb_count; } draw;
         struct {
             uint32_t primitive, count, index_type, base_vertex;
             uint64_t indices;
@@ -246,6 +254,11 @@ typedef struct {
              * and the index range is not protected by the vertex/UBO copies. */
             uint8_t *index_data;
             size_t index_size;
+            /* Same per-draw vertex-stream snapshots as NVN_CMD_DRAW. */
+            uint8_t *vb_data[4];
+            size_t vb_size[4];
+            uint8_t vb_stream[4];
+            uint32_t vb_count;
         } draw_indexed;
         /* Copy of nvnCommandBufferUpdateUniformBuffer's payload; written to
          * dst at submit time, in recorded order (NVN semantics). */
@@ -335,6 +348,12 @@ typedef struct nvn_dispatch_snap {
 } nvn_dispatch_snap_t;
 
 static void nvn_cmd_payload_free(nvn_cmd_t *cmd);
+static int nvn_vb_snap_reserve(size_t n);
+static void nvn_vb_snap_release(size_t n);
+static uint32_t nvn_cb_index_vertex_count(const nvn_cmd_t *cmd);
+static void nvn_cb_snapshot_vertex_buffers(nvn_cmd_t *cmd, const nvn_bind_state_t *b,
+                                           uint32_t need_verts);
+static void nvn_cb_snapshot_free(nvn_cmd_t *cmd);
 
 /* Recorded GPU transfer/compute entry points (defined with the proc-address
  * shims at the end of the file) and the program-state refcount helper. */
@@ -788,6 +807,12 @@ typedef struct {
     /* The guest wrote texels through the CPU path since the host copy was
      * uploaded; the cached GfxTexture is stale until it is rebuilt. */
     int gfx_dirty;
+    /* Direct guest writes (font atlas / glyph cache) bypass every NVN texel
+     * API.  A sampled checksum over the guest storage detects those writes so
+     * the cached host copy can be rebuilt. */
+    uint64_t mem_sum;
+    size_t mem_sum_size;
+    int mem_sum_valid;
 } tex_bridge_t;
 static tex_bridge_t *g_tex_bridges;
 static unsigned g_tex_bridge_count, g_tex_bridge_cap;
@@ -2300,6 +2325,25 @@ static void nvn_upload_trace_result(int on, const tex_t *t, const char *what,
             what, (const void *)t, (void *)g, g_tex_bridge_count, g_tex_bridge_cap);
 }
 
+/* The font atlas is written by the guest through plain memory, not through
+ * nvnTextureWriteTexels/FlushTexels.  Sample its storage and keep a checksum
+ * in the bridge so a change can invalidate the cached host image. */
+static int nvn_tex_is_direct_mask(const tex_t *t) {
+    return t && (t->d.format == 0x1 || t->d.format == 0x3d) &&
+           ((t->d.width == 2048 && t->d.height == 4096) ||
+            (t->d.width == 780 && t->d.height == 60));
+}
+static uint64_t nvn_tex_mem_sum(const tex_t *t) {
+    if (!t || !t->mem) return 0;
+    size_t n = t->L.size ? (size_t)t->L.size
+                         : (size_t)t->d.width * t->d.height;
+    size_t stride = n > (1u << 20) ? 256 : 16;
+    uint64_t sum = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; i += stride)
+        sum = (sum ^ t->mem[i]) * 1099511628211ULL;
+    return sum;
+}
+
 /* First bind uploads the guest block-linear texture.  The macOS runtime does
  * the equivalent on texture creation; the Android path keeps the guest storage
  * as the source of truth and uploads lazily.  A texture that is also a scene
@@ -2309,6 +2353,28 @@ static GfxTexture *nvn_texture_gfx_ready_locked(const tex_t *t) {
     if (!t || t->magic != NVN_MAGIC('T', 'E', 'X', 0)) return NULL;
     tex_bridge_t *b = nvn_tex_bridge(t, 0);
     nvn_mask_trace(t, "bind");
+    /* Direct guest writes to the atlas/glyph cache are invisible to the NVN
+     * texel API; checksum the storage and rebuild the host copy on change.
+     * The atlas is 8 MiB and binds happen every frame, so sample it on a
+     * fraction of the binds: a delayed rebuild still lands in the same frame. */
+    if (b && nvn_tex_is_direct_mask(t)) {
+        static unsigned sum_tick;
+        int due = !b->mem_sum_valid || ((sum_tick++ & 7) == 0);
+        if (due) {
+            uint64_t s = nvn_tex_mem_sum(t);
+            if (b->mem_sum_valid && s != b->mem_sum) {
+                b->gfx_dirty = 1;
+                static unsigned reloads;
+                if (reloads++ < 16)
+                    fprintf(stderr, "[totk-nvn] mask reload tex=%p %ux%u sum=%016llx\n",
+                            (const void *)t, t->d.width, t->d.height,
+                            (unsigned long long)s);
+            }
+            b->mem_sum = s;
+            b->mem_sum_size = t->L.size;
+        }
+        b->mem_sum_valid = 1;
+    }
     /* The guest wrote texels since the host copy was uploaded: drop the stale
      * CPU-uploaded image so the normal path below re-uploads the new bytes.
      * This does not touch the render-target association; if the texture is an
@@ -2559,7 +2625,7 @@ static void nvn_dump_vertex_stream(const char *tag, const GfxVertexLayout *l,
 static unsigned g_mask_binds, g_mask_rt, g_mask_writes;
 static void nvn_mask_trace(const tex_t *t, const char *what) {
     if (!t) return;
-    int mask = (t->d.format == 0x1 &&
+    int mask = ((t->d.format == 0x1 || t->d.format == 0x3d) &&
                 ((t->d.width == 2048 && t->d.height == 4096) ||
                  (t->d.width == 780 && t->d.height == 60)));
     if (!mask) return;
@@ -3165,6 +3231,7 @@ typedef struct {
 } cb_t;
 
 _Static_assert(sizeof(cb_t) <= NVN_COMMAND_BUFFER_SIZE, "command buffer object too large");
+static void nvn_cb_trace_record_vb(cb_t *c, const char *what, uint32_t count);
 
 /* Texture/sampler pools are queue state: the engine may set the pool on one
  * command buffer and bind texture handles on another.  Remember the last pool
@@ -4139,13 +4206,43 @@ static int nvn_cmd_clone(nvn_cmd_t *dst, const nvn_cmd_t *src) {
             dst->u.buf_to_tex.data_size = src->u.buf_to_tex.data_size;
         }
         return 1;
+    case NVN_CMD_DRAW:
+        memset(dst->u.draw.vb_data, 0, sizeof dst->u.draw.vb_data);
+        memset(dst->u.draw.vb_size, 0, sizeof dst->u.draw.vb_size);
+        dst->u.draw.vb_count = 0;
+        for (uint32_t k = 0; k < src->u.draw.vb_count && k < 4; k++) {
+            if (!src->u.draw.vb_data[k] || !src->u.draw.vb_size[k]) continue;
+            if (!nvn_vb_snap_reserve(src->u.draw.vb_size[k])) continue;
+            uint8_t *copy = malloc(src->u.draw.vb_size[k]);
+            if (!copy) { nvn_vb_snap_release(src->u.draw.vb_size[k]); continue; }
+            memcpy(copy, src->u.draw.vb_data[k], src->u.draw.vb_size[k]);
+            dst->u.draw.vb_data[k] = copy;
+            dst->u.draw.vb_size[k] = src->u.draw.vb_size[k];
+            dst->u.draw.vb_stream[k] = src->u.draw.vb_stream[k];
+            dst->u.draw.vb_count = k + 1;
+        }
+        return 1;
     case NVN_CMD_DRAW_INDEXED:
         dst->u.draw_indexed.index_data = NULL;
         dst->u.draw_indexed.index_size = 0;
+        memset(dst->u.draw_indexed.vb_data, 0, sizeof dst->u.draw_indexed.vb_data);
+        memset(dst->u.draw_indexed.vb_size, 0, sizeof dst->u.draw_indexed.vb_size);
+        dst->u.draw_indexed.vb_count = 0;
+        for (uint32_t k = 0; k < src->u.draw_indexed.vb_count && k < 4; k++) {
+            if (!src->u.draw_indexed.vb_data[k] || !src->u.draw_indexed.vb_size[k]) continue;
+            if (!nvn_vb_snap_reserve(src->u.draw_indexed.vb_size[k])) continue;
+            uint8_t *copy = malloc(src->u.draw_indexed.vb_size[k]);
+            if (!copy) { nvn_vb_snap_release(src->u.draw_indexed.vb_size[k]); continue; }
+            memcpy(copy, src->u.draw_indexed.vb_data[k], src->u.draw_indexed.vb_size[k]);
+            dst->u.draw_indexed.vb_data[k] = copy;
+            dst->u.draw_indexed.vb_size[k] = src->u.draw_indexed.vb_size[k];
+            dst->u.draw_indexed.vb_stream[k] = src->u.draw_indexed.vb_stream[k];
+            dst->u.draw_indexed.vb_count = k + 1;
+        }
         if (!src->u.draw_indexed.index_data || !src->u.draw_indexed.index_size) return 1;
         {
             uint8_t *copy = malloc(src->u.draw_indexed.index_size);
-            if (!copy) return 0;
+            if (!copy) { nvn_cb_snapshot_free(dst); return 0; }
             memcpy(copy, src->u.draw_indexed.index_data, src->u.draw_indexed.index_size);
             dst->u.draw_indexed.index_data = copy;
             dst->u.draw_indexed.index_size = src->u.draw_indexed.index_size;
@@ -4186,7 +4283,11 @@ static void nvn_cmd_payload_free(nvn_cmd_t *cmd) {
         cmd->u.buf_to_tex.data = NULL;
         cmd->u.buf_to_tex.data_size = 0;
         break;
+    case NVN_CMD_DRAW:
+        nvn_cb_snapshot_free(cmd);
+        break;
     case NVN_CMD_DRAW_INDEXED:
+        nvn_cb_snapshot_free(cmd);
         free(cmd->u.draw_indexed.index_data);
         cmd->u.draw_indexed.index_data = NULL;
         cmd->u.draw_indexed.index_size = 0;
@@ -4868,11 +4969,14 @@ static void nvnCommandBufferDrawArrays(cb_t *c, int mode, int first, int count) 
         cmd->u.draw.count = (uint32_t)count;
         cmd->u.draw.instances = 1;
         cmd->u.draw.base_instance = 0;
+        nvn_cb_snapshot_vertex_buffers(cmd, c->bind_state,
+                                       (uint32_t)first + (uint32_t)count);
     }
     c->draw_first = first;
     c->draw_count += count;
     nvn_cb_draw_snapshot(c);
     nvn_frame_draw_trace(c, "arrays", count);
+    nvn_cb_trace_record_vb(c, "arrays", (uint32_t)count);
     if (nvn_trace() || (nvn_trace_first() && nvn_draw_trace++ < 32))
         fprintf(stderr, "[totk-nvn] CommandBufferDrawArrays cb=%p rec=%u mode=%d first=%d count=%d"
                         " va_mask=%#x vs_mask=%#x\n", (void *)c, c->recording, mode, first, count,
@@ -4897,11 +5001,14 @@ static void nvnCommandBufferDrawArraysInstanced(cb_t *c, int mode, int first, in
         cmd->u.draw.count = (uint32_t)count;
         cmd->u.draw.instances = (uint32_t)instances;
         cmd->u.draw.base_instance = (uint32_t)base_instance;
+        nvn_cb_snapshot_vertex_buffers(cmd, c->bind_state,
+                                       (uint32_t)first + (uint32_t)count);
     }
     c->draw_first = first;
     c->draw_count += count;
     nvn_cb_draw_snapshot(c);
     nvn_frame_draw_trace(c, "arrays", count);
+    nvn_cb_trace_record_vb(c, "arrays-inst", (uint32_t)count);
     if (nvn_trace() || (nvn_trace_first() && nvn_draw_trace++ < 32))
         fprintf(stderr, "[totk-nvn] DrawArraysInstanced cb=%p rec=%u mode=%d first=%d count=%d base=%d instances=%d\n",
                 (void *)c, c->recording, mode, first, count, base_instance, instances);
@@ -5632,7 +5739,7 @@ static void nvnCommandBufferSetPrimitiveRestart(cb_t *c, uint32_t enable, int in
  * address alone is not enough for a deferred draw. */
 static void nvn_cb_snapshot_indices(nvn_cmd_t *cmd, int type, int count, uint64_t index) {
     if (!cmd || !index || count <= 0) return;
-    size_t isz = type == 0 ? 1u : type == 1 ? 2u : 4u;
+    size_t isz = type == 0 ? 1u : type == 1u ? 2u : 4u;
     size_t n = (size_t)count * isz;
     if (n > (64u << 20)) return;
     uint8_t *copy = malloc(n);
@@ -5640,6 +5747,158 @@ static void nvn_cb_snapshot_indices(nvn_cmd_t *cmd, int type, int count, uint64_
     memcpy(copy, (const void *)(uintptr_t)index, n);
     cmd->u.draw_indexed.index_data = copy;
     cmd->u.draw_indexed.index_size = n;
+}
+
+/* --- Per-draw vertex-stream snapshots -----------------------------------
+ * The guest records draws into a recycled ring buffer and only replays the
+ * retired handle later.  The segment's bind state keeps the *address* of the
+ * last draw's stream, but the bytes are already gone.  Snapshot each small
+ * bound stream at draw time (the same idea as index_data above); the segment
+ * replay merges the per-draw copies into one stream and offsets every draw. */
+#define NVN_VB_SNAP_CAP   (64u << 10)   /* per stream */
+#define NVN_VB_SNAP_TOTAL (128u << 20)  /* live snapshots across recordings */
+static size_t g_vb_snap_live;
+static pthread_mutex_t g_vb_snap_lock = PTHREAD_MUTEX_INITIALIZER;
+static int nvn_vb_snap_reserve(size_t n) {
+    int ok = 0;
+    pthread_mutex_lock(&g_vb_snap_lock);
+    if (g_vb_snap_live + n <= NVN_VB_SNAP_TOTAL) {
+        g_vb_snap_live += n;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&g_vb_snap_lock);
+    return ok;
+}
+static void nvn_vb_snap_release(size_t n) {
+    pthread_mutex_lock(&g_vb_snap_lock);
+    if (g_vb_snap_live >= n) g_vb_snap_live -= n;
+    else g_vb_snap_live = 0;
+    pthread_mutex_unlock(&g_vb_snap_lock);
+}
+
+/* Vertex count an indexed command references, so the snapshot covers the
+ * bytes the draw really reads even when the guest declared a smaller range. */
+static uint32_t nvn_cb_index_vertex_count(const nvn_cmd_t *cmd) {
+    if (!cmd || cmd->kind != NVN_CMD_DRAW_INDEXED) return 0;
+    const uint8_t *idx = cmd->u.draw_indexed.index_data;
+    uint32_t n = cmd->u.draw_indexed.count;
+    uint32_t maxi = 0;
+    if (!idx || !n) return cmd->u.draw_indexed.base_vertex + n;
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t v;
+        if (cmd->u.draw_indexed.index_type == 0) v = idx[k];
+        else if (cmd->u.draw_indexed.index_type == 1) {
+            uint16_t x = 0; memcpy(&x, idx + (size_t)k * 2, 2); v = x;
+        } else {
+            v = 0; memcpy(&v, idx + (size_t)k * 4, 4);
+        }
+        if (v > maxi) maxi = v;
+    }
+    return cmd->u.draw_indexed.base_vertex + maxi + 1;
+}
+
+static void nvn_cb_snapshot_vertex_buffers(nvn_cmd_t *cmd, const nvn_bind_state_t *b,
+                                           uint32_t need_verts) {
+    if (!cmd || !b) return;
+    uint8_t **data;
+    size_t *size;
+    uint8_t *stream;
+    uint32_t *count;
+    if (cmd->kind == NVN_CMD_DRAW) {
+        data = cmd->u.draw.vb_data; size = cmd->u.draw.vb_size;
+        stream = cmd->u.draw.vb_stream; count = &cmd->u.draw.vb_count;
+    } else if (cmd->kind == NVN_CMD_DRAW_INDEXED) {
+        data = cmd->u.draw_indexed.vb_data; size = cmd->u.draw_indexed.vb_size;
+        stream = cmd->u.draw_indexed.vb_stream; count = &cmd->u.draw_indexed.vb_count;
+    } else {
+        return;
+    }
+    uint32_t n = 0;
+    for (int i = 0; i < 16 && n < 4; i++) {
+        if (!(b->vb_mask & (1u << i)) || !b->vb[i].address || !b->vb[i].size)
+            continue;
+        /* A huge scene stream is not recyclable within a frame's reach and a
+         * private copy would be pointless; leave it to the guest address. */
+        if (b->vb[i].size > NVN_VB_SNAP_CAP) continue;
+        uint32_t stride = b->vs[i] ? (uint32_t)b->vs[i] : 1;
+        size_t want = b->vb[i].size;
+        size_t needed = (size_t)need_verts * stride;
+        if (needed > want) {
+            if (needed > NVN_VB_SNAP_CAP) needed = NVN_VB_SNAP_CAP;
+            /* Extend from the guest ring only when the range is mapped. */
+            if (nvn_guest_range_ok(b->vb[i].address, needed)) want = needed;
+        }
+        if (!want || want > NVN_VB_SNAP_CAP) continue;
+        if (!nvn_vb_snap_reserve(want)) continue;
+        uint8_t *copy = malloc(want);
+        if (!copy) { nvn_vb_snap_release(want); continue; }
+        memcpy(copy, (const void *)(uintptr_t)b->vb[i].address, want);
+        data[n] = copy;
+        size[n] = want;
+        stream[n] = (uint8_t)i;
+        n++;
+    }
+    *count = n;
+}
+
+static void nvn_cb_snapshot_free(nvn_cmd_t *cmd) {
+    if (!cmd) return;
+    uint8_t **data = NULL;
+    size_t *size = NULL;
+    uint32_t *count = NULL;
+    if (cmd->kind == NVN_CMD_DRAW) {
+        data = cmd->u.draw.vb_data; size = cmd->u.draw.vb_size;
+        count = &cmd->u.draw.vb_count;
+    } else if (cmd->kind == NVN_CMD_DRAW_INDEXED) {
+        data = cmd->u.draw_indexed.vb_data; size = cmd->u.draw_indexed.vb_size;
+        count = &cmd->u.draw_indexed.vb_count;
+    }
+    if (!data || !count) return;
+    for (uint32_t i = 0; i < *count && i < 4; i++) {
+        if (data[i]) {
+            nvn_vb_snap_release(size[i]);
+            free(data[i]);
+            data[i] = NULL;
+            size[i] = 0;
+        }
+    }
+    *count = 0;
+}
+
+/* Record-time vertex-stream evidence for the large text/UI passes.  Replay
+ * shows the address has been recycled; this prints the bytes while the guest
+ * still owns them, so the two traces can be compared directly. */
+static int nvn_cb_trace_record_vb_want(cb_t *c) {
+    if (!c || (!nvn_trace_inputs() && !nvn_trace_composite())) return 0;
+    nvn_cb_target_t *t = nvn_cb_target(c, 0);
+    return t && t->valid && (t->width >= 1024 || t->height >= 1024);
+}
+static void nvn_cb_trace_record_vb(cb_t *c, const char *what, uint32_t count) {
+    static unsigned seen, logged;
+    if (!nvn_cb_trace_record_vb_want(c)) return;
+    seen++;
+    int want = seen <= 64 || (seen % 256) == 0;
+    if (!want || logged >= 256) return;
+    logged++;
+    const nvn_bind_state_t *b = c->bind_state;
+    nvn_cb_target_t *t = nvn_cb_target(c, 0);
+    fprintf(stderr, "[totk-record-vb] #%u %s cb=%p %ux%u count=%u vb_mask=%#x",
+            logged, what, (void *)c, t ? t->width : 0, t ? t->height : 0, count,
+            b ? b->vb_mask : 0);
+    if (b) for (int i = 0; i < 16; i++) {
+        if (!(b->vb_mask & (1u << i)) || !b->vb[i].address) continue;
+        uint32_t w[8] = { 0 };
+        size_t nw = b->vb[i].size < sizeof w ? b->vb[i].size : sizeof w;
+        /* This is the guest's own bound stream at draw-record time, so reading
+         * it is as valid as the snapshot copy below; the pool-range check would
+         * reject ring windows that are mapped but not fully inside one epoch. */
+        if (nw) memcpy(w, (const void *)(uintptr_t)b->vb[i].address, nw);
+        fprintf(stderr, " | vb%d addr=%#llx size=%zu first=%08x %08x %08x %08x"
+                        " %08x %08x %08x %08x",
+                i, (unsigned long long)b->vb[i].address, b->vb[i].size,
+                w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+    }
+    fputc('\n', stderr);
 }
 
 static void nvnCommandBufferDrawElements(cb_t *c, int mode, int type, int count,
@@ -5655,10 +5914,13 @@ static void nvnCommandBufferDrawElements(cb_t *c, int mode, int type, int count,
         cmd->u.draw_indexed.base_vertex = 0;
         cmd->u.draw_indexed.indices = index;
         nvn_cb_snapshot_indices(cmd, type, count, index);
+        nvn_cb_snapshot_vertex_buffers(cmd, c->bind_state,
+                                       nvn_cb_index_vertex_count(cmd));
     }
     c->draw_count += count;
     nvn_cb_draw_snapshot(c);
     nvn_frame_draw_trace(c, "elements", count);
+    nvn_cb_trace_record_vb(c, "elements", (uint32_t)count);
     if (nvn_trace() || (nvn_trace_first() && nvn_draw_trace++ < 32))
         fprintf(stderr, "[totk-nvn] DrawElements cb=%p rec=%u mode=%d type=%d count=%d index=%#llx"
                         " va_mask=%#x vs_mask=%#x\n", (void *)c, c->recording, mode, type, count,
@@ -5679,8 +5941,11 @@ static void nvnCommandBufferDrawElementsBaseVertex(cb_t *c, int mode, int type, 
         cmd->u.draw_indexed.base_vertex = (uint32_t)base_vertex;
         cmd->u.draw_indexed.indices = index;
         nvn_cb_snapshot_indices(cmd, type, count, index);
+        nvn_cb_snapshot_vertex_buffers(cmd, c->bind_state,
+                                       nvn_cb_index_vertex_count(cmd));
     }
     c->draw_count += count;
+    nvn_cb_trace_record_vb(c, "elements-base", (uint32_t)count);
     if (nvn_trace())
         fprintf(stderr, "[totk-nvn] DrawElementsBaseVertex mode=%d type=%d count=%d index=%#llx base=%d\n",
                 mode, type, count, (unsigned long long)index, base_vertex);
@@ -8645,6 +8910,184 @@ static void nvn_exec_gpu_commands(const nvn_cmd_t *cmds, uint32_t ncmds,
     nvn_gpu_stats_log(where);
 }
 
+/* Find one stream's record-time snapshot in a draw command. */
+static const uint8_t *nvn_draw_vb_find(const nvn_cmd_t *c, int stream, size_t *size) {
+    if (!c || !size) return NULL;
+    if (c->kind == NVN_CMD_DRAW) {
+        for (uint32_t k = 0; k < c->u.draw.vb_count && k < 4; k++)
+            if (c->u.draw.vb_stream[k] == stream && c->u.draw.vb_data[k]) {
+                *size = c->u.draw.vb_size[k];
+                return c->u.draw.vb_data[k];
+            }
+    } else if (c->kind == NVN_CMD_DRAW_INDEXED) {
+        for (uint32_t k = 0; k < c->u.draw_indexed.vb_count && k < 4; k++)
+            if (c->u.draw_indexed.vb_stream[k] == stream && c->u.draw_indexed.vb_data[k]) {
+                *size = c->u.draw_indexed.vb_size[k];
+                return c->u.draw_indexed.vb_data[k];
+            }
+    }
+    return NULL;
+}
+
+/* Merge the per-draw vertex snapshots of one segment into a single stream per
+ * binding and offset every translated draw's first/base_vertex.  The guest
+ * binds a different small ring window per glyph/quad draw; replaying the
+ * segment with the last draw's bind state would render every draw from that
+ * one window.  Only all-or-nothing merges are attempted: if any bound stream
+ * lacks a snapshot for any draw (a large scene stream, or a budget refusal),
+ * the caller keeps the previous single-state behaviour. */
+static unsigned nvn_merge_draw_vertex_snapshots(const nvn_cmd_t *cmds, uint32_t ncmds,
+                                                nvn_bind_state_t *bs,
+                                                GfxCmd *translated, uint32_t tcount,
+                                                uint32_t tw, uint32_t th,
+                                                uint8_t *out_data[16],
+                                                size_t out_size[16]) {
+    if (!cmds || !ncmds || !bs || !translated) return 0;
+    const nvn_cmd_t **draws = calloc(ncmds, sizeof *draws);
+    if (!draws) return 0;
+    uint32_t ndraw = 0;
+    for (uint32_t i = 0; i < ncmds; i++)
+        if (cmds[i].kind == NVN_CMD_DRAW || cmds[i].kind == NVN_CMD_DRAW_INDEXED)
+            draws[ndraw++] = &cmds[i];
+    if (!ndraw) { free(draws); return 0; }
+
+    int merge_stream[16] = {0};
+    unsigned ncand = 0, nmissing = 0;
+    for (int s = 0; s < 16; s++) {
+        if (!(bs->vb_mask & (1u << s)) || !bs->vb[s].address || !bs->vb[s].size)
+            continue;
+        unsigned have = 0;
+        for (uint32_t k = 0; k < ndraw; k++) {
+            size_t n = 0;
+            if (nvn_draw_vb_find(draws[k], s, &n)) have++;
+        }
+        if (!have) { nmissing++; continue; }
+        if (have != ndraw) {
+            /* Mixed snapshot coverage: merging would leave some draws reading
+             * the last draw's window.  Keep the whole segment on the old path. */
+            free(draws);
+            return 0;
+        }
+        merge_stream[s] = 1;
+        ncand++;
+    }
+    /* A segment that mixes a snapshot-covered stream with an unsnapshotted
+     * (large scene) stream cannot be replayed from one call safely. */
+    if (!ncand || nmissing) { free(draws); return 0; }
+
+    /* Decisive record-vs-replay evidence for the first few merged segments:
+     * the bytes copied at draw time next to the bytes still at the guest
+     * address when the deferred replay runs. */
+    if (nvn_trace_inputs()) {
+        static unsigned cmp_logs;
+        if (cmp_logs < 8) {
+            cmp_logs++;
+            for (int s = 0; s < 16; s++) {
+                if (!merge_stream[s]) continue;
+                size_t rn = 0;
+                const uint8_t *rec = nvn_draw_vb_find(draws[0], s, &rn);
+                uint32_t rw[4] = { 0 }, pw[4] = { 0 };
+                if (rec) memcpy(rw, rec, sizeof rw < rn ? sizeof rw : rn);
+                size_t pn = bs->vb[s].size < sizeof pw ? bs->vb[s].size : sizeof pw;
+                if (pn && nvn_guest_range_ok(bs->vb[s].address, pn))
+                    memcpy(pw, (const void *)(uintptr_t)bs->vb[s].address, pn);
+                fprintf(stderr, "[totk-vb-cmp] %ux%u stream=%d draws=%u"
+                                " record=%08x %08x %08x %08x (%zu B)"
+                                " replay=%08x %08x %08x %08x @%#llx size=%zu\n",
+                        tw, th, s, ndraw, rw[0], rw[1], rw[2], rw[3], rn,
+                        pw[0], pw[1], pw[2], pw[3],
+                        (unsigned long long)bs->vb[s].address, bs->vb[s].size);
+            }
+        }
+    }
+
+    uint32_t *offset = calloc(ndraw, sizeof *offset);
+    if (!offset) { free(draws); return 0; }
+    uint32_t total_verts = 0;
+    for (uint32_t k = 0; k < ndraw; k++) {
+        const nvn_cmd_t *c = draws[k];
+        uint32_t need = c->kind == NVN_CMD_DRAW
+                      ? c->u.draw.first + c->u.draw.count
+                      : nvn_cb_index_vertex_count(c);
+        for (int s = 0; s < 16; s++) {
+            if (!merge_stream[s]) continue;
+            size_t n = 0;
+            (void)nvn_draw_vb_find(c, s, &n);
+            uint32_t stride = bs->vs[s] ? (uint32_t)bs->vs[s] : 1;
+            uint32_t v = (uint32_t)((n + stride - 1) / stride);
+            if (v > need) need = v;
+        }
+        offset[k] = total_verts;
+        total_verts += need;
+    }
+
+    /* Bound the merged copy; fall back rather than allocate hundreds of MiB. */
+    for (int s = 0; s < 16; s++) {
+        if (!merge_stream[s]) continue;
+        uint32_t stride = bs->vs[s] ? (uint32_t)bs->vs[s] : 1;
+        if ((size_t)total_verts * stride > (64u << 20)) {
+            free(offset);
+            free(draws);
+            return 0;
+        }
+    }
+
+    int ok = 1;
+    for (int s = 0; s < 16 && ok; s++) {
+        if (!merge_stream[s]) continue;
+        uint32_t stride = bs->vs[s] ? (uint32_t)bs->vs[s] : 1;
+        size_t bytes = (size_t)total_verts * stride;
+        uint8_t *buf = bytes ? calloc(1, bytes) : NULL;
+        if (!buf) { ok = 0; break; }
+        for (uint32_t k = 0; k < ndraw && ok; k++) {
+            size_t n = 0;
+            const uint8_t *src = nvn_draw_vb_find(draws[k], s, &n);
+            if (!src) { ok = 0; break; }
+            size_t room = (size_t)(offset[k] > total_verts ? 0 : total_verts - offset[k]);
+            room *= stride;
+            if (n > room) n = room;
+            memcpy(buf + (size_t)offset[k] * stride, src, n);
+        }
+        if (!ok) { free(buf); break; }
+        out_data[s] = buf;
+        out_size[s] = bytes;
+    }
+    if (!ok) {
+        for (int s = 0; s < 16; s++) {
+            if (!merge_stream[s]) continue;
+            free(out_data[s]);
+            out_data[s] = NULL;
+            out_size[s] = 0;
+        }
+        free(offset);
+        free(draws);
+        return 0;
+    }
+    /* Only now that every stream is built is the bind state redirected, so a
+     * failed allocation never leaves it pointing at freed memory. */
+    for (int s = 0; s < 16; s++) {
+        if (!merge_stream[s]) continue;
+        bs->vb[s].address = (uint64_t)(uintptr_t)out_data[s];
+        bs->vb[s].size = out_size[s];
+        bs->vb_mask |= 1u << s;
+    }
+
+    /* Remap the translated draw list in record order. */
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < tcount && k < ndraw; i++) {
+        if (translated[i].kind == GFX_CMD_DRAW) {
+            translated[i].u.draw.first += offset[k];
+            k++;
+        } else if (translated[i].kind == GFX_CMD_DRAW_INDEXED) {
+            translated[i].u.draw_indexed.base_vertex += offset[k];
+            k++;
+        }
+    }
+    free(offset);
+    free(draws);
+    return ncand;
+}
+
 /* Render one retired offscreen segment from its immutable snapshot.  Each
  * segment targets the texture it actually recorded draws for, so the 1920x1080
  * clear-only target of a UI/atlas buffer is never treated as its scene pass. */
@@ -9014,6 +9457,35 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
             uint32_t count = nvn_translate_commands(&view, translated + base,
                                                     cap - base, rt, clear, &has_clear) + base;
             nvn_remap_texture_bind_cmds(translated, count, rp);
+            /* The segment's recorded commands carry a private vertex snapshot
+             * per draw.  Merge those windows into one stream per binding and
+             * offset each draw, so a glyph/quad batch renders every draw from
+             * its own record-time bytes instead of the last draw's recycled
+             * range.  Falls back when any bound stream lacks a snapshot. */
+            uint8_t *vb_merge[16] = { 0 };
+            size_t vb_merge_size[16] = { 0 };
+            unsigned nmerge = nvn_merge_draw_vertex_snapshots(
+                e->cmds + sg->first_cmd, sg->ncmds, &eff, translated, count,
+                lw, lh, vb_merge, vb_merge_size);
+            if (nmerge) {
+                static unsigned merge_seen, merge_log;
+                merge_seen++;
+                if ((merge_seen <= 16 || (merge_seen % 4096) == 0) && merge_log < 24) {
+                    merge_log++;
+                    fprintf(stderr, "[totk-nvn] vb-merge #%u seg=%u %ux%u draws=%u streams=%u",
+                            merge_seen, seg_index, lw, lh, sg->draw_count, nmerge);
+                    for (int i = 0; i < 16; i++)
+                        if (vb_merge[i]) {
+                            uint32_t mw[8] = { 0 };
+                            size_t mn = vb_merge_size[i] < sizeof mw
+                                      ? vb_merge_size[i] : sizeof mw;
+                            if (mn) memcpy(mw, vb_merge[i], mn);
+                            fprintf(stderr, " vb%d=%zu first=%08x %08x %08x %08x",
+                                    i, vb_merge_size[i], mw[0], mw[1], mw[2], mw[3]);
+                        }
+                    fputc('\n', stderr);
+                }
+            }
             /* Diagnostic only (off by default): force blending off for the
              * small UI passes.  Used to tell "the shader wrote transparent
              * pixels" apart from "the blend state dropped them"; not a fix. */
@@ -9055,6 +9527,8 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
                                                     streams, nstreams);
             if (getenv("TOTK_ANDROID_TRACE_SCENE_STEPS"))
                 fprintf(stderr, "[totk-scene-step] execute end drew=%d\n", drew);
+            for (uint32_t oi = 0; oi < nowned; oi++) free(owned[oi]);
+            for (int mi = 0; mi < 16; mi++) free(vb_merge[mi]);
             free(translated);
             if (nvn_trace_composite() && lw >= 1000) {
                 size_t rn = 0;
@@ -9124,6 +9598,23 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
             int ok = gfx_backend_offscreen_write_ppm_index(rt, 0, path);
             fprintf(stderr, "[totk-frame] segment target -> %s (%s)\n", path,
                     ok ? "ok" : "failed");
+        }
+        /* The 1920x1080 text/glyph composite: capture its offscreen image so
+         * the vertex-stream fix can be judged by pixels, not only first_nz. */
+        if (seg_ppm && *seg_ppm && lw >= 1024) {
+            static unsigned big_ppm;
+            uint8_t cpx[4] = { 0 };
+            int have_px = gfx_backend_offscreen_read_pixel_index(rt, 0, lw / 2, lh / 2,
+                                                                cpx) != 0;
+            int nonzero = cpx[0] | cpx[1] | cpx[2] | cpx[3];
+            if (have_px && nonzero && big_ppm < 4) {
+                big_ppm++;
+                char path[PATH_MAX];
+                snprintf(path, sizeof path, "%s-text-%ux%u-%u.ppm", seg_ppm, lw, lh, big_ppm);
+                int ok = gfx_backend_offscreen_write_ppm_index(rt, 0, path);
+                fprintf(stderr, "[totk-frame] text target -> %s (%s)\n", path,
+                        ok ? "ok" : "failed");
+            }
         }
     }
     /* Same evidence for the large (window-sized) scene segments: the window
