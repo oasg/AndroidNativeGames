@@ -6793,10 +6793,18 @@ static void nvn_inherit_ubo_slots(nvn_bind_state_t *b, GfxReflectedPipeline *rp)
     }
 }
 
+/* Diagnostic: which NVN uniform-buffer index/size actually fed each shader
+ * cbuf slot in the most recent nvn_apply_bind_state.  The UI vertex shader
+ * reads vp_c3 (slot 3) rows 1..6/33 and vp_c1 (slot 1), so the mapping has to
+ * be observed rather than assumed. */
+typedef struct { int32_t nvn; uint64_t addr; size_t size; int valid; } nvn_ubo_dec_t;
+static nvn_ubo_dec_t g_ubo_dec[2][16];
+
 static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
                                  const nvn_bind_state_t *b, cb_t *cb) {
     (void)p;
     if (!b || !rp) return;
+    memset(g_ubo_dec, 0, sizeof g_ubo_dec);
     const nvn_pipe_ubo_t *pspec = nvn_pipe_ubo_get(rp);
     for (int stage = 0; stage < 2; stage++) {
         uint32_t nspec = pspec ? pspec->nubo[stage] : 0;
@@ -6827,6 +6835,8 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
                 if (nvn_trace())
                     fprintf(stderr, "[totk-nvn] UBO stage=%d nvn index=%d size=%zu not in reflection\n",
                             stage, i, size);
+            } else if (i < 16) {
+                g_ubo_dec[stage][i] = (nvn_ubo_dec_t){ i, b->ubo[stage][i].address, size, 1 };
             }
         }
         /* NVN binds uniform buffers by the program's UBO index while the
@@ -6847,6 +6857,9 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
                     if (gfx_backend_reflected_bind_ubo_slot(rp, (uint32_t)stage,
                                                             (uint32_t)target,
                                                             bdata[k], bsize[k])) {
+                        if (target >= 0 && target < 16)
+                            g_ubo_dec[stage][target] = (nvn_ubo_dec_t){ bidx[k],
+                                b->ubo[stage][bidx[k]].address, bsize[k], 1 };
                         if (nvn_trace_inputs()) {
                             static unsigned mlog;
                             if (mlog++ < 8)
@@ -6868,6 +6881,9 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
             if (target >= 0 && target != failed_slot &&
                 gfx_backend_reflected_bind_ubo_slot(rp, (uint32_t)stage, (uint32_t)target,
                                                     failed_data, failed_size)) {
+                if (target < 16 && failed_slot >= 0 && failed_slot < 16)
+                    g_ubo_dec[stage][target] = (nvn_ubo_dec_t){ failed_slot,
+                        b->ubo[stage][failed_slot].address, failed_size, 1 };
                 static unsigned logged;
                 if (logged++ < 8)
                     fprintf(stderr, "[totk-nvn] UBO stage=%d nvn index=%d -> shader cbuf"
@@ -8323,6 +8339,35 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
      * bind state.  TOTK binds the font/atlas on a state-only recording and
      * relies on it staying live for later draw buffers. */
     nvn_bind_state_t eff = *seed;
+    /* NVN uniform-buffer binds are queue-scoped: the last bind of a cbuf index
+     * is what the GPU reads for draws that did not rebind it.  A UI recording
+     * interleaves several programs that all use cbuf index 0 for their own c3,
+     * so a segment's draw-time snapshot can hold a different program's c3
+     * (observed: the 360x69 UI chain read a 64 KiB 1920x1080 projection instead
+     * of its own 560-byte transform, which collapsed every quad off-screen).
+     * The recording's final bind state is the last bind and is what the
+     * producer segment already uses, so prefer it for the small UI passes. */
+    if (sg->width <= 512 && e->bind) {
+        for (int i = 0; i < 16; i++) {
+            if (!(e->bind->ubo_mask[0] & (1u << i))) continue;
+            if (!e->bind->ubo[0][i].address || !e->bind->ubo[0][i].size) continue;
+            if (eff.ubo[0][i].address == e->bind->ubo[0][i].address &&
+                eff.ubo[0][i].size == e->bind->ubo[0][i].size)
+                continue;
+            if (nvn_ui_seg_want()) {
+                static unsigned lim;
+                if (lim++ < 16)
+                    fprintf(stderr, "[totk-ui-seg] ubo override seg=%u idx=%d"
+                                    " snap=(%#llx,%zu) -> final=(%#llx,%zu)\n",
+                            seg_index, i,
+                            (unsigned long long)eff.ubo[0][i].address, eff.ubo[0][i].size,
+                            (unsigned long long)e->bind->ubo[0][i].address,
+                            e->bind->ubo[0][i].size);
+            }
+            eff.ubo[0][i] = e->bind->ubo[0][i];
+            eff.ubo_mask[0] |= 1u << i;
+        }
+    }
     prog_t *p = e->prog;
     uint32_t ntex_spec[2] = { 0, 0 };
     {
@@ -8776,6 +8821,37 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
                         seg_index, (unsigned long long)bs->vb[0].address,
                         v0, v1, v2, v3, h0, h1, h2, h3);
             }
+        }
+    }
+    if (nvn_ui_seg_want()) {
+        /* Which NVN uniform buffer fed each shader cbuf slot, plus the rows the
+         * UI vertex shader actually reads (vp_c3 rows 1..6 and 33). */
+        fprintf(stderr, "[totk-ui-seg] ubo seg=%u slots:", seg_index);
+        for (int i = 0; i < 16; i++)
+            if (g_ubo_dec[0][i].valid)
+                fprintf(stderr, " c%d<=idx%d(%#llx,%zu)", i, g_ubo_dec[0][i].nvn,
+                        (unsigned long long)g_ubo_dec[0][i].addr, g_ubo_dec[0][i].size);
+        for (int i = 0; i < 4; i++) {
+            uint64_t ga = 0;
+            size_t gn = 0;
+            if (nvn_global_ubo_get(0, i, &ga, &gn))
+                fprintf(stderr, " glob%d=(%#llx,%zu)", i, (unsigned long long)ga, gn);
+        }
+        fputc('\n', stderr);
+        for (int i = 0; i < 16; i++) {
+            if (!g_ubo_dec[0][i].valid) continue;
+            const uint32_t *w = (const uint32_t *)(uintptr_t)g_ubo_dec[0][i].addr;
+            size_t nw = g_ubo_dec[0][i].size / 4;
+            if (!w || nw < 16) continue;
+            static const int rows[7] = { 1, 2, 3, 4, 5, 6, 33 };
+            fprintf(stderr, "[totk-ui-seg] ubo seg=%u c%d rows:", seg_index, i);
+            for (int r = 0; r < 7; r++) {
+                int base = rows[r] * 4;
+                if ((size_t)base + 4 > nw) { fprintf(stderr, " %d=oob", rows[r]); continue; }
+                fprintf(stderr, " %d=%08x,%08x,%08x,%08x", rows[r],
+                        w[base], w[base + 1], w[base + 2], w[base + 3]);
+            }
+            fputc('\n', stderr);
         }
     }
     pthread_mutex_unlock(&g_retired_lock);
