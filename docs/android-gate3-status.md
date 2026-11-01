@@ -12,10 +12,12 @@ history, the window pass, and present-target routing all execute. Gates 1 and 2
 pass in the **empty-save/loading** state.
 
 Gate 3 (a visible title/save-slot UI, or a real 3D frame, through the window) is
-**not reached**. The remaining gap is not a dropped host command: in every state
-reached, the guest records no producer for the UI masks/font atlas, and the one
-state that does record a large UI batch records it **queued and never submits
-it**.
+**not reached**. The remaining gap is not a dropped host command. The 2048x4096
+font atlas **is** written by the guest through plain memory (not the NVN texel
+API), but the host cached the first upload and never re-uploaded it; a
+checksum-based reload fix is being added. The text pass's per-draw vertex
+buffers are also recycled before the queued replay. The one state that records
+a large UI batch records it **queued and never submits it**.
 
 ## 2. Delivered host fixes
 
@@ -70,16 +72,31 @@ The window is no longer `target=offscreen`. The present target can be routed to
 the last large scene RT. The window PPM is still all black because its source
 (the fade/clear or the zero-mask UI composite) is black.
 
-### 4.4 No producer for the UI masks / font atlas in the reached states
+### 4.4 The font atlas is guest-written directly; the host cache was stale
 
 The two masked passes seen in the save/loading state sample:
 
-- `2048x4096` R8 (`0x366483df0`), `first_nz=none`, 24 sample binds, `rt_binds=0`,
-  `dirty=0`, 0 CPU writes;
-- `780x60` A2B10G10R10 (`0x336d93668` and aliases), `first_nz=none`.
+- `2048x4096` R8 (`0x366483df0`) — the font/glyph atlas;
+- `780x60` A2B10G10R10 (`0x336d93668` and aliases) — still `first_nz=none`.
 
-No command buffer contains a Copy/Clear/Dispatch/Blit or a draw targeting either
-mask. The accounting run is decisive:
+The old `first_nz` probe capped at 1 MiB. Sampling the **whole 8 MiB** storage
+shows the atlas is not empty: the first nonzero byte is at ~7.7 MiB
+(`first=7766080`, `nz=223/131072` sampled bytes), and the checksum changes over
+time (`d865… → 890d… → a20d… → d4f1… → c992…`). The guest writes the atlas
+through **plain memory**, bypassing every NVN texel API, which is why the API
+counters, `rt_binds`, and the 1 MiB probe all said "none".
+
+The host cached the first upload and never rebuilt it. A checksum-based reload
+in `nvn_texture_gfx_ready_locked()` (Lane 2, patch
+`/tmp/gate3-atlas-reload.patch`) detects the change, drops the cached
+`GfxTexture`, and re-uploads. It fires five times in a 300 s run
+(`[totk-nvn] mask reload … sum=…`).
+
+The 780x60 A2B10G10R10 textures remain all zero across the whole run; their
+producer is still unknown.
+
+The CB accounting still shows no Copy/Clear/Dispatch/Blit producer, which is
+consistent with direct guest writes:
 
 ```text
 recorded=14092 finalized=14092 submitted=1200 retired=6592 call_cmds=491
@@ -87,23 +104,19 @@ unsubmitted=12891 | draws_buf=3734 gpu_buf=0 mask_buf=0
 ```
 
 The 91 % "unsubmitted" buffers are the engine's normal small buffers replayed
-through `CallCommands`; every one has `mask_candidate=0`.
+through `CallCommands`; every one has `mask_candidate=0`. A temporary
+`tex-write` probe confirms the `nvnTextureWriteTexels` calls (51 in gate34, 93
+in a 300 s run) only write small 4x1/4x4/16x16/128x32/32x32 textures, never the
+atlas.
 
-A temporary `tex-write` probe (patch: `/tmp/gate3-texwrite-trace.patch`) shows
-what `nvnTextureWriteTexels` actually writes. In the gate34 state the counter is
-51; in a 300 s run it reaches 93. The targets are small: 4x1/4x4 RGBA8, 16x16
-RGBA8, 128x32 R8 and 32x32 R8 mips. **No write targets the 2048x4096 or 780x60
-masks.** The text pass `8a20741c` runs and samples the 2048x4096 mask, but its
-`gfx` is a zero upload (`rt=0`, `dirty=0`).
-
-### 4.5 The font pipeline is present, but not producing
+### 4.5 The font pipeline is present
 
 The guest contains `nn::font::ScalableFontEngine`, `nn::font::RectDrawer`, and
 `sead/nvn_font` resources, and opens
-`Font/Font.Nin_NX_NVN.bfarc.zs` (5.6 MB). The 2048x4096 R8 atlas and the 780x60
-text textures are allocated, but nothing fills them in the states reached. The
-font rasterizer is either gated behind the title/save UI state or uses a path
-that does not appear in the recording (no BindImage/Dispatch/Copy/DrawTexture).
+`Font/Font.Nin_NX_NVN.bfarc.zs` (5.6 MB). The 2048x4096 R8 atlas is written
+directly by the guest (4.4); the 780x60 text textures remain zero. The text
+pass `8a20741c` runs and samples the atlas, but its target is still zero because
+the per-draw vertex buffers are recycled (4.7).
 
 ### 4.6 The one large UI batch is recorded but never executes
 
@@ -130,9 +143,25 @@ state and reproduced it exactly:
 ```
 
 No `rt 400x225/64x64 fmt=0x3f` executed; the `seg2-400x225-*` PPM is 1 colour
-black, and the window PPM is the host clear `(13,20,31)/(13,20,30)`. The
-2048x4096 font atlas is still zero at every bind, so even a drained batch would
-draw black text until the atlas producer runs.
+black, and the window PPM is the host clear `(13,20,31)/(13,20,30)`.
+
+### 4.7 The text pass vertex buffers are recycled before replay
+
+The text pass `ps=8a20741c…` (1920x1080, samples the 2048x4096 R8 atlas + a
+96x96 BC4 atlas) still produces a zero target after the atlas reload. Its
+replay-time vertex stream is degenerate:
+
+```text
+[totk-frame] composite-3f   vb 0 addr=0x3670fe000 size=112 first=00000000 00000000 00000000 ffffffff
+```
+
+The position attribute is at offset 0, so all four vertices are at the origin.
+The guest recycles the VB between recording and the queued replay.
+`nvn_cb_snapshot_indices()` already deep-copies index bytes into
+`cmd->u.draw_indexed.index_data`, but there is no vertex-buffer equivalent, and
+the segment replay uses one bind state (the last draw) for all 318 text draws.
+Lane 2 is implementing per-draw vertex snapshots and per-draw replay; the atlas
+reload alone is not enough.
 
 ## 5. App shell (parallel work)
 
@@ -181,24 +210,26 @@ was removed with it. CLI data under `/data/local/tmp/totk-android` is intact.
 
 ## 6. Remaining options
 
-1. **Font atlas producer (the root blocker for text/UI).** The 2048x4096 R8
-   mask is sampled by the text pass but never written by any recorded CPU/RT/
-   copy/dispatch/image path. The `nn::font` rasterizer is either gated behind
-   the title/text state or uses an API the recording does not show. Find that
-   path before touching the queue or the blend state; without it the text draws
-   are black even if they execute.
-2. **8,427-draw drain (necessary but not sufficient).** The 300 s late-input
-   run still shows `queued=1` for the 400x225/64x64 `0x3f` batches, and the
-   400x225 PPM is black. Re-test the drain only after (1) is fixed, otherwise a
-   drained batch still samples a zero atlas.
-3. **App-shell HLE deadlock.** With TLS solved, the app boots to `nnMain` +
+1. **Atlas direct-write reload (Lane 2, in progress).** The guest writes the
+   font atlas through plain memory; the host must checksum the storage and
+   rebuild the cached `GfxTexture` on change. The patch is
+   `/tmp/gate3-atlas-reload.patch`.
+2. **Text pass per-draw vertex snapshots (Lane 2, in progress).** The 318 text
+   draws are replayed with a single recycled VB. Snapshot small VB bytes at
+   record time and replay each draw's own buffer; the index bytes already have
+   this treatment.
+3. **8,427-draw drain (necessary but not sufficient).** The 400x225/64x64
+   `0x3f` batches still show `queued=1`; re-test after (1) and (2), otherwise a
+   drained batch still draws from stale/zero inputs.
+4. **App-shell HLE deadlock.** With TLS solved, the app boots to `nnMain` +
    save mount + a 1920x1080 window, then deadlocks holding a core lock in
-   `libc.so+0xa6020` with waiters at `sdk+0xde1888`. This needs the device
-   unlocked first; then instrument the HLE lock/futex owner and the
-   `TryPeekLightMessageQueue` waiter.
-4. **Accept the boundary.** The host fixes, the app TLS fix, and this report are
-   preserved; Gate 3 is recorded as blocked by the guest title/UI state and the
-   font atlas producer, not by the renderer or present path.
+   `libc.so+0xa6020` (inside `syscall`) with waiters at `sdk+0xde1888`. This
+   needs the device unlocked first; then instrument the HLE lock/futex owner
+   and the `TryPeekLightMessageQueue` waiter.
+5. **Accept the boundary.** The host fixes, the app TLS fix, and this report are
+   preserved; Gate 3 is recorded as blocked by the direct-write atlas reload,
+   the per-draw text VBs, and the guest title/UI state -- not by the renderer or
+   present path.
 
 ## 7. Reproduce
 
