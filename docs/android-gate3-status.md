@@ -1,7 +1,7 @@
 # Android Gate 3 status and known boundaries
 
-Date: 2026-11-01  
-Main: `f554d85` (`merge: L2 command-buffer accounting`)  
+Date: 2026-11-02  
+Main: `4efb8c5` (`merge: L2 route the window present through the sampled RT`)  
 Device: 2721dfe4, Adreno 830, `com.totk.android`
 
 ## 1. Summary
@@ -11,13 +11,17 @@ compute/copy/clear, render-target association, FIFO UI drain, per-program UBO
 history, the window pass, and present-target routing all execute. Gates 1 and 2
 pass in the **empty-save/loading** state.
 
-Gate 3 (a visible title/save-slot UI, or a real 3D frame, through the window) is
-**not reached**. The remaining gap is not a dropped host command. The 2048x4096
-font atlas **is** written by the guest through plain memory (not the NVN texel
-API), but the host cached the first upload and never re-uploaded it; a
-checksum-based reload fix is being added. The text pass's per-draw vertex
-buffers are also recycled before the queued replay. The one state that records
-a large UI batch records it **queued and never submits it**.
+Gate 3's host-side visible-UI evidence is now reached: the 1920x1080 present
+target contains the 360x69 UI (587 colours, bbox (52,959)-(411,1027), 24,840
+non-background pixels). The real Android Surface/app window and the 3D field are
+still blocked by the device lock / HLE deadlock and the separate 8,427-batch
+state.
+
+The 2048x4096 font atlas **is** written by the guest through plain memory (not
+the NVN texel API); the host's cached copy is now reloaded by checksum. The text
+pass's per-draw vertex buffers are recycled before replay; per-draw snapshots
+now fix them. Window/present routing now follows the RT the sampler reads. The
+one state that records a large UI batch still records it **queued**.
 
 ## 2. Delivered host fixes
 
@@ -39,9 +43,9 @@ merge commits.
 | --- | --- | --- |
 | 1. 360x69 UI source `first_nz != none` | **pass only in the no-save/loading state** | empty-save run: 42/64/146-colour 43x5/67x5 loading strip; real-save runs record no 360x69 at all |
 | 2. 0x3f non-zero | pass, but it is the **clear/fade colour** | `a68a565f` decodes to B10G11R11 `(0.0498, 0.0791, 0.1191)` = the pass clear |
-| 3. 1920x1080 window multi-colour + title/save UI | **fail** | window PPM `1 colour (black)`; 0x3f is the fade overlay; no UI composite |
-| 4. A/Continue into 3D | **fail** | opening-field phase reaches 180x112/720x450/1920x1080 0x7a, but the window presents the offscreen fade target only |
-| 5. 30 min / 10k presents stable | not run to gate | longest observed run 9,697 presents without a crash |
+| 3. 1920x1080 window multi-colour + title/save UI | **pass host-side (present target)** | `wip.ppm` 1920x1080: 587 colours, bg tan `a68a56`, 360x69 UI bbox (52,959)-(411,1027), 24,840 non-bg; `wiwin-1000` 73 colours. Real Surface not tested (device locked) |
+| 4. A/Continue into 3D | **fail** | opening-field phase reaches 180x112/720x450/1920x1080 0x7a; the 8,427-draw UI/field batches still never execute; no 3D frame |
+| 5. 30 min / 10k presents stable | not run to gate | longest observed run 9,697 presents without a crash (newest 1,856-present run) |
 
 ## 4. Key findings
 
@@ -160,8 +164,37 @@ The guest recycles the VB between recording and the queued replay.
 `nvn_cb_snapshot_indices()` already deep-copies index bytes into
 `cmd->u.draw_indexed.index_data`, but there is no vertex-buffer equivalent, and
 the segment replay uses one bind state (the last draw) for all 318 text draws.
-Lane 2 is implementing per-draw vertex snapshots and per-draw replay; the atlas
-reload alone is not enough.
+Fixed in `a5ddaac` (merged `3f05ae9`): small per-draw vertex streams are
+snapshotted at record time and replayed per draw. The 1920x1080 text target now
+has 587 colours (background `a68a56`, bbox (52,959)-(411,1027)).
+
+### 4.8 Window/present routing
+
+The window pass binds `0x336d9ad68` (0x3f, 1920x1080). Its bridge starts with
+no RT and empty guest storage (`src=guest`), then the queued 1920x1080 text
+segment associates the RT (`tex-rt ... gen=1`); the window sampler rebuilds
+from it (`src=rt-gen`, `first_nz=0 center=a68a565f`). `nvn_window_present_rt()`
+now routes the present to the RT the sampler actually reads, with an alias
+fallback and `g_last_scene_rt` as fallback; the headless L2 dump follows the
+present target.
+
+Verified:
+
+- `wiwin-500/1000/1500.ppm`: 25/73/13 colours, tan background, text bbox.
+- `wip.ppm` (present target): 587 colours, tan background, 360x69 UI bbox
+  (52,959)-(411,1027), 24,840 non-background pixels.
+- `[totk-vk] present #... colors=1` is the colour-attachment count, not a
+  pixel-colour count; the content evidence is the present PPM / `first_nz`.
+
+The real-surface branch of `native_window_android.c` already presents
+`present_target`. The headless no-surface branch and
+`runtime_native_window_screenshot()` still use `w->gfx_target` (the overlay), so
+the raw CLI `present #`/screenshot stays the host clear. Minimal app-side
+change in both places:
+
+```c
+GfxOffscreenTarget *t = w->present_target ? w->present_target : w->gfx_target;
+```
 
 ## 5. App shell (parallel work)
 
@@ -210,26 +243,26 @@ was removed with it. CLI data under `/data/local/tmp/totk-android` is intact.
 
 ## 6. Remaining options
 
-1. **Atlas direct-write reload (Lane 2, in progress).** The guest writes the
-   font atlas through plain memory; the host must checksum the storage and
-   rebuild the cached `GfxTexture` on change. The patch is
-   `/tmp/gate3-atlas-reload.patch`.
-2. **Text pass per-draw vertex snapshots (Lane 2, in progress).** The 318 text
-   draws are replayed with a single recycled VB. Snapshot small VB bytes at
-   record time and replay each draw's own buffer; the index bytes already have
-   this treatment.
-3. **8,427-draw drain (necessary but not sufficient).** The 400x225/64x64
-   `0x3f` batches still show `queued=1`; re-test after (1) and (2), otherwise a
-   drained batch still draws from stale/zero inputs.
-4. **App-shell HLE deadlock.** With TLS solved, the app boots to `nnMain` +
-   save mount + a 1920x1080 window, then deadlocks holding a core lock in
-   `libc.so+0xa6020` (inside `syscall`) with waiters at `sdk+0xde1888`. This
-   needs the device unlocked first; then instrument the HLE lock/futex owner
-   and the `TryPeekLightMessageQueue` waiter.
-5. **Accept the boundary.** The host fixes, the app TLS fix, and this report are
-   preserved; Gate 3 is recorded as blocked by the direct-write atlas reload,
-   the per-draw text VBs, and the guest title/UI state -- not by the renderer or
-   present path.
+1. **Real Android Surface + app HLE deadlock.** The real-surface branch already
+   presents the text RT; the app boots to `nnMain` + save mount + a 1920x1080
+   window, then deadlocks holding a core lock in `libc.so+0xa6020` (inside
+   `syscall`) with waiters at `sdk+0xde1888`. The device is locked in Direct
+   Boot and the app was uninstalled; unlock once, reinstall the fixed APK from
+   `app/tls-shell` (`d93d565`), and restore the external data. Then instrument
+   the HLE lock/futex owner and the `TryPeekLightMessageQueue` waiter.
+2. **8,427-draw / opening-field 3D.** The 400x225/64x64 `0x3f` UI batches still
+   show `queued=1` in the Phive/opening-field state; the 3D field has not been
+   reached. This is the remaining Gate 4 item, not the text/UI path.
+3. **Headless present fallback (optional).** The no-surface `present #` and
+   `runtime_native_window_screenshot()` still use `w->gfx_target`; use
+   `w->present_target ? w->present_target : w->gfx_target` to make them show the
+   same 587-colour present PPM.
+4. **Stability.** Run 30 min / 10k presents on the real surface; the newest
+   successful host-side run reached 1,856 presents and 2,290 presents in the
+   prior run, with occasional early-boot stalls under device load.
+5. **Accept the boundary.** The host-side Gate 3 UI evidence is now met
+   (`wip.ppm`, 587 colours, 360x69 UI bbox); the app window and 3D field remain
+   open.
 
 ## 7. Reproduce
 
@@ -252,11 +285,22 @@ TOTK_ANDROID_TRACE_SCENE_STEPS=1 TOTK_ANDROID_TRACE_COMPOSITE=1 \
   ./totk-android /data/local/tmp/totk-android boot-sdk
 ```
 
+The text/UI case uses the later input script and the L2 frame dump:
+
+```sh
+TOTK_ANDROID_INPUT_SCRIPT='150:A:400,180:PLUS:400,210:A:400,240:A:400' \
+TOTK_ANDROID_L2_FRAME=/data/local/tmp/totk-lane2/win.ppm \
+TOTK_ANDROID_L2_FRAME_EVERY=500
+```
+
 Evidence:
 
+- `/tmp/gate3-wip.ppm` — present target (1920x1080), 587 colours, tan bg,
+  360x69 UI bbox (52,959)-(411,1027), 24,840 non-bg
+- `/tmp/gate3-wiwin1000.ppm` — window L2 dump, 73 colours, tan bg
+- `/data/local/tmp/totk-lane2/final.log`, `wip.ppm`, `wiwin-*.ppm`
 - `/tmp/totk-lane2/evidence/cbacct.log` — decisive command-buffer accounting
 - `/tmp/totk-lane4/gate34/REPORT-gate34.md` — 0x7a fade/mask evidence
 - `/tmp/totk-lane4/framegraph/REPORT-framegraph.md` — 360x69 closed loop
 - `/tmp/totk-lane4/phive/REPORT-phive.md` — 8,427-draw queued UI batches
-- `/tmp/gate3-win1500.ppm` — clean-HEAD window PPM, 1 colour black
 - `/tmp/gate3-texwrite-trace.patch` — temporary CPU-write probe
