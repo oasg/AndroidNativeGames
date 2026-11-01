@@ -27,6 +27,7 @@
 #include <dlfcn.h>
 #include <ucontext.h>
 #include <fcntl.h>
+#include <math.h>
 #include "gfx_backend_android.h"
 #include "shader_cache_android.h"
 /* Repository-owned compute SPIR-V used by probe-nvn-compute (read-only). */
@@ -2505,6 +2506,42 @@ static uint64_t nvnTextureGetDebugID(const tex_t *t) { return t ? (uint64_t)(uin
 static uint32_t nvnTextureCompare(const tex_t *a, const tex_t *b) {
     if (!a || !b) return 0;
     return !memcmp(&a->d, &b->d, sizeof a->d) && a->mem == b->mem;
+}
+
+/* Diagnostic: dump the first vertices of stream 0 as 16-bit halves plus the
+ * resolved vertex layout, so an attribute offset/format mismatch is visible. */
+static float nvn_half_to_float(uint16_t h) {
+    uint32_t s = (h >> 15) & 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+    float v = e ? ldexpf(1.0f + (float)m / 1024.0f, (int)e - 15)
+                : (float)m / 1024.0f;
+    return s ? -v : v;
+}
+static void nvn_dump_vertex_stream(const char *tag, const GfxVertexLayout *l,
+                                   const nvn_bind_state_t *bv, int maxv) {
+    if (!tag || !l || !bv) return;
+    fprintf(stderr, "[totk-ui-seg] %s layout bindings=%u attrs=%u", tag,
+            l->nbindings, l->nattributes);
+    for (uint32_t i = 0; i < l->nbindings; i++)
+        fprintf(stderr, " b%u(stride=%u,rate=%u)", l->bindings[i].binding,
+                l->bindings[i].stride, l->bindings[i].input_rate);
+    for (uint32_t i = 0; i < l->nattributes; i++)
+        fprintf(stderr, " a%u(loc=%u,bind=%u,fmt=%#x,off=%u)",
+                i, l->attributes[i].location, l->attributes[i].binding,
+                l->attributes[i].format, l->attributes[i].offset);
+    fputc('\n', stderr);
+    uint32_t stride = l->nbindings ? l->bindings[0].stride : 0;
+    if (!stride || !(bv->vb_mask & 1u) || !bv->vb[0].address) return;
+    uint32_t nv = (uint32_t)(bv->vb[0].size / stride);
+    if (nv > (uint32_t)maxv) nv = (uint32_t)maxv;
+    const uint8_t *p = (const uint8_t *)(uintptr_t)bv->vb[0].address;
+    for (uint32_t v = 0; v < nv; v++) {
+        const uint16_t *h = (const uint16_t *)(p + (size_t)v * stride);
+        fprintf(stderr, "[totk-ui-seg] %s v%u: x=%.4f y=%.4f z=%.4f w=%.4f"
+                        " | u=%.4f v=%.4f\n", tag, v,
+                nvn_half_to_float(h[0]), nvn_half_to_float(h[1]),
+                nvn_half_to_float(h[2]), nvn_half_to_float(h[3]),
+                nvn_half_to_float(h[4]), nvn_half_to_float(h[5]));
+    }
 }
 
 /* Mark the host copy of a guest texture stale after a CPU-side texel write. */
@@ -8980,6 +9017,14 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
         }
         dbg_tex0 = bs->tex_mask[0][0];
         dbg_tex1 = bs->tex_mask[1][0];
+        if (nvn_ui_seg_want() && seg_index <= 3) {
+            GfxVertexLayout dl;
+            uint64_t dsig = 0;
+            nvn_build_vertex_layout(bs, &dl, &dsig);
+            char tag[32];
+            snprintf(tag, sizeof tag, "uiseg%u", seg_index);
+            nvn_dump_vertex_stream(tag, &dl, bs, 4);
+        }
         /* Index-range check: does the guest ring buffer still hold the bytes
          * that were recorded?  A deferred segment must use the snapshot. */
         for (uint32_t ci = 0; ci < sg->ncmds; ci++) {
@@ -9534,7 +9579,7 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
         }
         int drew = 0;
         if (reflected) {
-            uint32_t cap = cb->ncmds ? cb->ncmds : 1;
+            uint32_t cap = (cb->ncmds ? cb->ncmds : 1) + 2;
             GfxCmd *translated = calloc(cap, sizeof *translated);
             if (!translated) {
                 nvn_fail("nvnQueueSubmitCommands", "out of memory for translated commands");
@@ -9542,9 +9587,48 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             }
             float clear[4] = { 0.05f, 0.08f, 0.12f, 1.0f };
             int has_clear = 0;
-            uint32_t count = nvn_translate_commands(cb, translated, cap,
+            /* A window pass draws into the host surface; if the recording never
+             * set a usable viewport/scissor (the engine's final composite
+             * inherits them from an earlier buffer) the draw lands in a
+             * one-pixel band.  Seed the full window rectangle, like the segment
+             * prefix does for the UI passes. */
+            uint32_t pre = 0;
+            if (window_pass && cap >= 2) {
+                int have_vp = 0, have_sc = 0;
+                for (uint32_t ci = 0; ci < cb->ncmds; ci++) {
+                    if (cb->cmds[ci].kind == NVN_CMD_SET_VIEWPORT &&
+                        cb->cmds[ci].u.rect.width > 0 && cb->cmds[ci].u.rect.height > 0)
+                        have_vp = 1;
+                    if (cb->cmds[ci].kind == NVN_CMD_SET_SCISSOR &&
+                        cb->cmds[ci].u.rect.width > 0 && cb->cmds[ci].u.rect.height > 0)
+                        have_sc = 1;
+                }
+                if (!have_vp) {
+                    translated[pre].kind = GFX_CMD_SET_VIEWPORT;
+                    translated[pre].u.rect.x = 0;
+                    translated[pre].u.rect.y = 0;
+                    translated[pre].u.rect.width = (int32_t)rw;
+                    translated[pre].u.rect.height = (int32_t)rh;
+                    pre++;
+                }
+                if (!have_sc) {
+                    translated[pre].kind = GFX_CMD_SET_SCISSOR;
+                    translated[pre].u.rect.x = 0;
+                    translated[pre].u.rect.y = 0;
+                    translated[pre].u.rect.width = (int32_t)rw;
+                    translated[pre].u.rect.height = (int32_t)rh;
+                    pre++;
+                }
+                if (nvn_trace_composite()) {
+                    static unsigned vlog;
+                    if (vlog++ < 6)
+                        fprintf(stderr, "[totk-frame] window-pass seeded rects=%u"
+                                        " %ux%u (vp=%d sc=%d)\n", pre, rw, rh, have_vp, have_sc);
+                }
+            }
+            uint32_t count = nvn_translate_commands(cb, translated + pre, cap - pre,
                                                     window_pass ? NULL : rt,
-                                                    clear, &has_clear);
+                                                    clear, &has_clear) + pre;
             nvn_remap_texture_bind_cmds(translated, count, reflected);
             nvn_bind_state_t bend = bs ? *bs : (nvn_bind_state_t){0};
             /* NVN uniform-buffer binds are queue-scoped, and this cb's draws can
@@ -9587,6 +9671,7 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             if (window_pass && nvn_trace_composite()) {
                 static unsigned wp_logged;
                 if (wp_logged++ < 6) {
+                    nvn_dump_vertex_stream("window", &input, bs, 4);
                     fprintf(stderr, "[totk-frame] window-pass cb=%p rp=%p count=%u draws=%d"
                                     " streams=%u clear=%d texmask=%#x/%#x va=%#x vb=%#x"
                                     " vb0=%#llx/%zu\n", (void *)cb, (void *)reflected, count,
@@ -9609,6 +9694,14 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                                             "%.3f,%.3f,%.3f mask=%#x\n", g->u.clear.rgba[0],
                                     g->u.clear.rgba[1], g->u.clear.rgba[2], g->u.clear.rgba[3],
                                     g->u.clear.mask);
+                        else if (g->kind == GFX_CMD_SET_VIEWPORT)
+                            fprintf(stderr, "[totk-frame] window-pass   viewport %d,%d %dx%d\n",
+                                    g->u.rect.x, g->u.rect.y, g->u.rect.width,
+                                    g->u.rect.height);
+                        else if (g->kind == GFX_CMD_SET_SCISSOR)
+                            fprintf(stderr, "[totk-frame] window-pass   scissor %d,%d %dx%d\n",
+                                    g->u.rect.x, g->u.rect.y, g->u.rect.width,
+                                    g->u.rect.height);
                     }
                     if (p) {
                         fprintf(stderr, "[totk-frame] window-pass   prog-history:");
