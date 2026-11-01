@@ -220,11 +220,16 @@ typedef struct {
         struct { float depth; uint32_t dmask; int stencil; uint32_t smask; } clear_ds;
         struct { int32_t x, y, width, height; } rect;
         /* Complete NVN render-target set: every color target survives to the
-         * submit path, plus the depth target. */
+         * submit path, plus the depth target.  The resolved layout (view
+         * formats included) is captured here so a segment replay does not
+         * have to re-resolve a texture the guest may have re-created. */
         struct {
             uint32_t count;
             void *tex[GFX_MAX_COLOR_TARGETS];
             void *depth;
+            GfxRenderTargetLayout layout;
+            uint32_t width, height;
+            int have_layout;
         } targets;
         struct { uint32_t stage, kind, slot; uint64_t address; size_t size; uint64_t handle; } desc;
         struct { nvn_render_state_t rs; } state;
@@ -2244,17 +2249,30 @@ static GfxTexture *nvn_texture_gfx_ready_locked(const tex_t *t) {
         t->d.target == NVN_TARGET_2D && t->d.levels <= 1 &&
         t->d.width == b->rt_width && t->d.height == b->rt_height) {
         int vkfmt = gfx_backend_vk_format_for_nvn((uint32_t)t->d.format);
-        int bpp = vkfmt ? gfx_backend_vk_format_bpp(vkfmt) : 0;
+        /* When the render target was attached through a view, its format can
+         * differ from the base texture (a BC4 font atlas rendered through an
+         * R8 view).  The render target is the authority for the pixels, so
+         * sample it with the render target's format; requiring the base
+         * format here would drop the whole atlas. */
+        int rtf = b->rt_layout.color_count >= 1 ? b->rt_layout.color_formats[0] : 0;
+        int sample_fmt = (rtf && rtf != vkfmt) ? rtf : vkfmt;
+        if (sample_fmt != vkfmt) {
+            static unsigned view_logged;
+            if (view_logged++ < 8)
+                fprintf(stderr, "[totk-nvn] tex-from-rt view format tex=%p base fmt=%#x"
+                                " vk=%#x rt vk=%#x %ux%u\n", (const void *)t,
+                        t->d.format, vkfmt, rtf, b->rt_width, b->rt_height);
+        }
+        int bpp = sample_fmt ? gfx_backend_vk_format_bpp(sample_fmt) : 0;
         size_t need = (size_t)b->rt_width * b->rt_height * (size_t)bpp;
-        if (vkfmt && bpp > 0 && b->rt_layout.color_count >= 1 &&
-            vkfmt == b->rt_layout.color_formats[0] && need) {
+        if (sample_fmt && bpp > 0 && b->rt_layout.color_count >= 1 && need) {
             size_t have = 0;
             const uint8_t *px = gfx_backend_offscreen_pixels(b->rt, &have);
             if (px && have >= need) {
                 GfxTextureDesc d;
                 memset(&d, 0, sizeof d);
                 d.target = GFX_TEXTURE_2D;
-                d.vk_format = (uint32_t)vkfmt;
+                d.vk_format = (uint32_t)sample_fmt;
                 d.width = b->rt_width;
                 d.height = b->rt_height;
                 d.depth = 1;
@@ -2274,7 +2292,7 @@ static GfxTexture *nvn_texture_gfx_ready_locked(const tex_t *t) {
                         fprintf(stderr, "[totk-frame] tex-from-rt tex=%p gfx=%p rt=%p gen=%llu"
                                         " vkfmt=%#x %ux%u bytes=%zu first=%08x %08x %08x %08x"
                                         " first_nz=%s%#zx\n", (const void *)t, (void *)g,
-                                (void *)b->rt, (unsigned long long)b->rt_frame, vkfmt,
+                                (void *)b->rt, (unsigned long long)b->rt_frame, sample_fmt,
                                 b->rt_width, b->rt_height, need,
                                 w0[0], w0[1], w0[2], w0[3],
                                 nz == need / 4 ? "none " : "", nz == need / 4 ? 0 : nz * 4);
@@ -3278,7 +3296,31 @@ static void nvn_trace_bad_target(const char *what, uint32_t index, const void *p
 /* Resolve the NVN texture set to a host layout.  Every color target and the
  * depth target contribute their guest dimensions/format; unsupported formats
  * are explicit failures (the backend returns VK_FORMAT_UNDEFINED = 0). */
-static int nvn_rt_layout_from_targets(uint32_t n, void *const *tex, const void *depth,
+/* NVNtextureView (16 bytes): flag byte 0 (bit0 levels, bit1 layers, bit2
+ * format, bit3 target, bit4 swizzle, bit5 depth-stencil mode), byte1 base
+ * level, byte2 level count, byte3 target, u16 min layer, u16 layer count,
+ * u16 format at offset 8.  A render target may be attached through such a
+ * view, so the attachment format can differ from the base texture's format
+ * (e.g. a BC4 atlas rendered through an R8 view). */
+static int nvn_view_format(const void *view, int *format, uint32_t *base_layer,
+                           uint32_t *layers) {
+    const uint8_t *v = view;
+    if (!v) return 0;
+    int have = 0;
+    if (v[0] & 4) {
+        int f = (int)((uint32_t)v[8] | ((uint32_t)v[9] << 8));
+        if (f) { *format = f; have = 1; }
+    }
+    if (v[0] & 2) {
+        if (base_layer) *base_layer = (uint32_t)v[4] | ((uint32_t)v[5] << 8);
+        if (layers) *layers = (uint32_t)v[6] | ((uint32_t)v[7] << 8);
+    }
+    return have;
+}
+
+static int nvn_rt_layout_from_targets(uint32_t n, void *const *tex,
+                                      const void *const *views,
+                                      const void *depth, const void *depth_view,
                                       GfxRenderTargetLayout *layout,
                                       uint32_t *width, uint32_t *height,
                                       const char **why) {
@@ -3306,7 +3348,9 @@ static int nvn_rt_layout_from_targets(uint32_t n, void *const *tex, const void *
                     for (uint32_t j = i + 1; j < active_n; j++) {
                         const tex_t *tj = nvn_tex_registry_find(tex[j]);
                         if (tj) {
-                            int f = gfx_backend_vk_format_for_nvn((uint32_t)tj->d.format);
+                            int nf = tj->d.format;
+                            if (views && views[j]) nvn_view_format(views[j], &nf, NULL, NULL);
+                            int f = gfx_backend_vk_format_for_nvn((uint32_t)nf);
                             if (f) { base_fmt = f; *width = tj->d.width; *height = tj->d.height; break; }
                         }
                     }
@@ -3323,13 +3367,36 @@ static int nvn_rt_layout_from_targets(uint32_t n, void *const *tex, const void *
             if (why) *why = "color target is not an NVN texture";
             return 0;
         }
-        int fmt = gfx_backend_vk_format_for_nvn((uint32_t)t->d.format);
+        /* A view can change the attachment format (and its subresource
+         * range); the host attachment must use the view's format. */
+        int nf = t->d.format;
+        int view_fmt = 0;
+        uint32_t vbase_layer = 0, vlayers = 0;
+        if (views && views[i]) {
+            view_fmt = nvn_view_format(views[i], &nf, &vbase_layer, &vlayers);
+            if (view_fmt && vlayers > 1) {
+                static unsigned vl;
+                if (vl++ < 8)
+                    fprintf(stderr, "[totk-nvn] SetRenderTargets color%u is a view"
+                                    " with %u layers (host renders layer %u only)\n",
+                            i, vlayers, vbase_layer);
+            }
+        }
+        int fmt = gfx_backend_vk_format_for_nvn((uint32_t)nf);
         if (!fmt) {
             if (why) *why = "unsupported color target format";
             return 0;
         }
         if (!base_fmt) base_fmt = fmt;
         layout->color_formats[i] = fmt;
+        if (view_fmt && nf != t->d.format) {
+            static unsigned vf;
+            /* Always report a BC4/R8-style view mismatch; rate-limit the rest. */
+            if (vf++ < 64 || t->d.format == 0x49)
+                fprintf(stderr, "[totk-nvn] rt-view color%u base fmt=%#x -> view fmt=%#x"
+                                " vk=%#x %ux%u\n", i, t->d.format, nf, fmt,
+                        t->d.width, t->d.height);
+        }
         if (!*width || !*height) { *width = t->d.width; *height = t->d.height; }
         else if (t->d.width != *width || t->d.height != *height) {
             static unsigned logged;
@@ -3346,7 +3413,9 @@ static int nvn_rt_layout_from_targets(uint32_t n, void *const *tex, const void *
             if (why) *why = "depth target is not an NVN texture";
             return 0;
         }
-        int fmt = gfx_backend_vk_format_for_nvn((uint32_t)dt->d.format);
+        int nf = dt->d.format;
+        if (depth_view) nvn_view_format(depth_view, &nf, NULL, NULL);
+        int fmt = gfx_backend_vk_format_for_nvn((uint32_t)nf);
         if (!fmt) { if (why) *why = "unsupported depth target format"; return 0; }
         layout->depth_format = fmt;
         if (!*width) { *width = dt->d.width; *height = dt->d.height; }
@@ -3406,6 +3475,10 @@ typedef struct {
     size_t vb_copy_size[16];
     uint8_t *ubo_copy[2][16];
     size_t ubo_copy_size[2][16];
+    /* First vertex bytes seen at prepare time; compared at replay to prove
+     * whether the guest ring buffer was recycled in between. */
+    uint8_t vb_head[16];
+    int have_vb_head;
 } nvn_seg_t;
 
 static void nvn_seg_fill(const cb_t *c, nvn_seg_t *s, uint32_t first, uint32_t end) {
@@ -3487,9 +3560,18 @@ static uint32_t nvn_cb_segments(const cb_t *c, nvn_seg_t **out) {
             targets[k] = c->cmds[i].u.targets.tex[k];
         if (n > 0 && n <= GFX_MAX_COLOR_TARGETS) {
             const char *why = NULL;
-            if (nvn_rt_layout_from_targets(n, targets, c->cmds[i].u.targets.depth,
-                                           &cur, &cw, &ch, &why))
+            /* The recording captured the resolved (view-aware) layout; only
+             * fall back to re-resolving when it has none. */
+            if (c->cmds[i].u.targets.have_layout) {
+                cur = c->cmds[i].u.targets.layout;
+                cw = c->cmds[i].u.targets.width;
+                ch = c->cmds[i].u.targets.height;
                 cvalid = 1;
+            } else if (nvn_rt_layout_from_targets(n, targets, NULL,
+                                                  c->cmds[i].u.targets.depth, NULL,
+                                                  &cur, &cw, &ch, &why)) {
+                cvalid = 1;
+            }
             ctex = targets[0];
             if (ctex && nvn_window_for_texture(ctex)) cwin = 1;
         }
@@ -4730,7 +4812,6 @@ static void nvnCommandBufferSetRenderTargets(cb_t *c, int n, const void *const *
                                              const void *const *views,
                                              const void *depth, const void *depth_view) {
     nvn_api("nvnCommandBufferSetRenderTargets");
-    (void)views; (void)depth_view;
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferSetRenderTargets", "invalid command buffer"); return; }
     nvn_bind_state_t *bs = nvn_cb_bind_state(c);
     if (bs) bs->depth_tex = depth;
@@ -4762,9 +4843,19 @@ static void nvnCommandBufferSetRenderTargets(cb_t *c, int n, const void *const *
         memset(&cbt->layout, 0, sizeof cbt->layout);
         if (n > 0) {
             const char *why = NULL;
-            if (nvn_rt_layout_from_targets((uint32_t)n, (void *const *)t, depth,
+            if (nvn_rt_layout_from_targets((uint32_t)n, (void *const *)t, views,
+                                           depth, depth_view,
                                            &cbt->layout, &cbt->width, &cbt->height, &why)) {
                 cbt->valid = 1;
+                /* Keep the resolved layout with the recorded command so the
+                 * segment split (which runs at retire time) uses the same
+                 * view formats as the recording did. */
+                if (cmd) {
+                    cmd->u.targets.layout = cbt->layout;
+                    cmd->u.targets.width = cbt->width;
+                    cmd->u.targets.height = cbt->height;
+                    cmd->u.targets.have_layout = 1;
+                }
             } else {
                 char d[128];
                 snprintf(d, sizeof d, "cannot resolve render targets: %s", why ? why : "unknown");
@@ -6819,6 +6910,7 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
             int compact = 1;
             for (int k = 0; k < bound_tex && k < 8; k++)
                 if (bound_idx[k] >= (int)pspec->ntex[stage]) compact = 0;
+            int ok_remap = 0;
             if (compact) {
                 for (int k = 0; k < bound_tex && k < 8; k++) {
                     int target = pspec->tex_slot[stage][k];
@@ -6826,6 +6918,7 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
                     if (gfx_backend_reflected_bind_texture_slot(rp, (uint32_t)stage,
                                                                (uint32_t)target,
                                                                bound_g[k])) {
+                        ok_remap++;
                         static unsigned logged;
                         if (logged++ < 12)
                             fprintf(stderr, "[totk-nvn] texture stage=%d index=%d ->"
@@ -6834,6 +6927,25 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
                     }
                 }
             }
+            if (nvn_ui_seg_want() &&
+                (bound_tex >= 2 || pspec->ntex[stage] != (uint32_t)bound_tex)) {
+                static unsigned lim;
+                if (lim++ < 64)
+                    fprintf(stderr, "[totk-ui-seg] binds stage=%d rp=%p ntex=%u bound=%d"
+                                    " idx=%d,%d slot=%d,%d compact=%d ok=%d g=%p,%p\n",
+                            stage, (void *)rp, pspec->ntex[stage], bound_tex, bound_idx[0],
+                            bound_idx[1], pspec->tex_slot[stage][0],
+                            pspec->tex_slot[stage][1], compact, ok_remap,
+                            (void *)bound_g[0], (void *)bound_g[1]);
+            }
+        } else if (nvn_ui_seg_want() && bound_tex >= 2) {
+            static unsigned lim2;
+            if (lim2++ < 64)
+                fprintf(stderr, "[totk-ui-seg] binds stage=%d rp=%p ntex=%u bound=%d"
+                                " pspec=%p (no remap) slots=%d,%d\n",
+                        stage, (void *)rp, pspec ? pspec->ntex[stage] : 0, bound_tex,
+                        (const void *)pspec, pspec ? pspec->tex_slot[stage][0] : -1,
+                        pspec ? pspec->tex_slot[stage][1] : -1);
         }
 
     }
@@ -7207,6 +7319,11 @@ static void nvn_seg_prepare(nvn_seg_t *segs, uint32_t nseg, cb_t *c) {
                                         input.nattributes ? &input : NULL, sig,
                                         variant, 1);
         if (!rp) continue;
+        /* A queued segment replays after the recording thread moved on, so the
+         * guest ring buffer may already hold newer data.  This protects the
+         * large (>=1024 px) passes; small UI segments only need a bounded
+         * probe (nvn_ui_vb_changed), because copying every small segment's
+         * vertex/UBO state for a 21-segment recording exhausts memory. */
         if (sg->width >= 1024 && getenv("TOTK_ANDROID_SEG_COPY")) {
             for (int i = 0; i < 16; i++) {
                 if (!(b->vb_mask & (1u << i)) || !b->vb[i].address || !b->vb[i].size)
@@ -7238,6 +7355,11 @@ static void nvn_seg_prepare(nvn_seg_t *segs, uint32_t nseg, cb_t *c) {
             sg->pipeline = rp;
             memcpy(sg->variant, variant, sizeof sg->variant);
             sg->warm = 1;
+            if ((b->vb_mask & 1u) && b->vb[0].address) {
+                memcpy(sg->vb_head, (const void *)(uintptr_t)b->vb[0].address,
+                       sizeof sg->vb_head);
+                sg->have_vb_head = 1;
+            }
             warmed++;
         }
         pthread_mutex_unlock(&g_prog_lock);
@@ -8365,6 +8487,21 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
             uint32_t count = nvn_translate_commands(&view, translated + base,
                                                     cap - base, rt, clear, &has_clear) + base;
             nvn_remap_texture_bind_cmds(translated, count, rp);
+            /* Diagnostic only (off by default): force blending off for the
+             * small UI passes.  Used to tell "the shader wrote transparent
+             * pixels" apart from "the blend state dropped them"; not a fix. */
+            if (lw <= 512 && getenv("TOTK_ANDROID_UI_NO_BLEND")) {
+                for (uint32_t ci = 0; ci < count; ci++) {
+                    if (translated[ci].kind == GFX_CMD_DRAW)
+                        translated[ci].u.draw.state.blend_enable = 0;
+                    else if (translated[ci].kind == GFX_CMD_DRAW_INDEXED)
+                        translated[ci].u.draw_indexed.state.blend_enable = 0;
+                }
+                static unsigned nb_logged;
+                if (nb_logged++ < 4)
+                    fprintf(stderr, "[totk-ui-seg] diagnostic: blend disabled for"
+                                    " %ux%u seg=%u cmd=%p\n", lw, lh, seg_index, (void *)p);
+            }
             if (getenv("TOTK_ANDROID_TRACE_SCENE_STEPS"))
                 fprintf(stderr, "[totk-scene-step] apply bind count=%u\n", count);
             nvn_apply_bind_state(p, rp, bs, &view);
@@ -8451,16 +8588,42 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
         }
     }
     /* Lane 2: the exact 360x69 output of each of the first UI segments, so the
-     * first writer in the chain can be identified (not just the 50th). */
+     * first writer in the chain can be identified (not just the 50th).  The
+     * raw RGBA8 readback also reports alpha coverage and the RGB colour count:
+     * a PPM drops alpha, so a "drawn but transparent" target looks identical
+     * to a black one. */
     if (nvn_ui_seg_want() && lw <= 512) {
         static unsigned ui_seg_dumps;
         if (ui_seg_dumps < 12) {
             size_t rn = 0;
             const uint8_t *rpix = gfx_backend_offscreen_pixels(rt, &rn);
             uint32_t rnz = nvn_first_nonzero(rpix, rn, 1u << 20);
+            uint32_t npx = (uint32_t)(rn / 4);
+            uint32_t nz_a = 0, amin = 255, amax = 0, a0 = 0;
+            for (uint32_t i = 0; i < npx; i++) {
+                uint32_t a = rpix[i * 4 + 3];
+                if (!a) { if (!a0) a0 = 1; continue; }
+                nz_a++;
+                if (a < amin) amin = a;
+                if (a > amax) amax = a;
+            }
+            /* Distinct RGB (24-bit) colours, capped so the scan stays cheap. */
+            uint32_t cols[64];
+            uint32_t ncol = 0;
+            for (uint32_t i = 0; i < npx && ncol < 64; i++) {
+                uint32_t c = ((uint32_t)rpix[i * 4] << 16) |
+                             ((uint32_t)rpix[i * 4 + 1] << 8) | rpix[i * 4 + 2];
+                uint32_t j = 0;
+                for (; j < ncol; j++) if (cols[j] == c) break;
+                if (j == ncol) cols[ncol++] = c;
+            }
+            uint32_t ca = npx ? rpix[(size_t)(lh / 2) * lw * 4 + (size_t)(lw / 2) * 4 + 3] : 0;
             fprintf(stderr, "[totk-ui-seg] result seg=%u %ux%u drew=%d bytes=%zu"
-                            " first_nz=%s%u\n", seg_index, lw, lh, drew, rn,
-                    rnz == UINT32_MAX ? "none " : "", rnz == UINT32_MAX ? 0 : rnz);
+                            " first_nz=%s%u alpha_nz=%u/%u alpha=%u..%u centre_a=%u"
+                            " rgb_colours=%u%s\n", seg_index, lw, lh, drew, rn,
+                    rnz == UINT32_MAX ? "none " : "", rnz == UINT32_MAX ? 0 : rnz,
+                    nz_a, npx, nz_a ? amin : 0, amax, ca, ncol,
+                    a0 ? "" : " alpha-all-zero");
             const char *ui_seg_ppm = getenv("TOTK_ANDROID_UI_SEG_PPM");
             if (ui_seg_ppm && *ui_seg_ppm) {
                 char path[PATH_MAX];
@@ -8491,12 +8654,49 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
                     ok ? "ok" : "failed");
         }
     }
+    int vp[4] = { 0, 0, 0, 0 }, sc[4] = { 0, 0, 0, 0 };
+    uint32_t v0 = 0, v1 = 0, v2 = 0, v3 = 0;
+    uint32_t dbg_tex0 = 0, dbg_tex1 = 0;
+    if (nvn_ui_seg_want()) {
+        /* Compact per-segment geometry/state evidence: a segment can "draw"
+         * (the backend call succeeds) and still cover no pixels when its
+         * viewport, scissor or vertex stream is wrong. */
+        for (uint32_t ci = 0; ci < sg->ncmds; ci++) {
+            const nvn_cmd_t *cc = &e->cmds[sg->first_cmd + ci];
+            if (cc->kind == NVN_CMD_SET_VIEWPORT) {
+                vp[0] = cc->u.rect.x; vp[1] = cc->u.rect.y;
+                vp[2] = cc->u.rect.width; vp[3] = cc->u.rect.height;
+            } else if (cc->kind == NVN_CMD_SET_SCISSOR) {
+                sc[0] = cc->u.rect.x; sc[1] = cc->u.rect.y;
+                sc[2] = cc->u.rect.width; sc[3] = cc->u.rect.height;
+            }
+        }
+        dbg_tex0 = bs->tex_mask[0][0];
+        dbg_tex1 = bs->tex_mask[1][0];
+        if ((bs->vb_mask & 1u) && bs->vb[0].address) {
+            const uint8_t *v = (const uint8_t *)(uintptr_t)bs->vb[0].address;
+            memcpy(&v0, v, 4); memcpy(&v1, v + 4, 4);
+            memcpy(&v2, v + 8, 4); memcpy(&v3, v + 12, 4);
+            if (sg->have_vb_head && memcmp(sg->vb_head, v, sizeof sg->vb_head) != 0) {
+                uint32_t h0 = 0, h1 = 0, h2 = 0, h3 = 0;
+                memcpy(&h0, sg->vb_head, 4); memcpy(&h1, sg->vb_head + 4, 4);
+                memcpy(&h2, sg->vb_head + 8, 4); memcpy(&h3, sg->vb_head + 12, 4);
+                fprintf(stderr, "[totk-ui-seg] VB CHANGED seg=%u addr=%#llx now="
+                                "%08x %08x %08x %08x was=%08x %08x %08x %08x\n",
+                        seg_index, (unsigned long long)bs->vb[0].address,
+                        v0, v1, v2, v3, h0, h1, h2, h3);
+            }
+        }
+    }
     pthread_mutex_unlock(&g_retired_lock);
     if (nvn_ui_seg_want())
         fprintf(stderr, "[totk-ui-seg] run handle=%#llx seg=%u %ux%u draws=%u rp=%p"
-                        " pstate=%p warm=%d drew=%d\n",
+                        " pstate=%p warm=%d drew=%d vp=%d,%d %dx%d sc=%d,%d %dx%d"
+                        " tex=%#x/%#x v0=%08x %08x %08x %08x\n",
                 (unsigned long long)handle, seg_index, lw, lh, ndraws, (void *)rp,
-                (void *)sg_pstate, sg_warm, drew);
+                (void *)sg_pstate, sg_warm, drew,
+                vp[0], vp[1], vp[2], vp[3], sc[0], sc[1], sc[2], sc[3],
+                dbg_tex0, dbg_tex1, v0, v1, v2, v3);
     if (nvn_trace_frame())
         fprintf(stderr, "[totk-frame] scene submit handle=%#llx seg=%u rt=%p %ux%u"
                         " color0=%p cmd=[%u,%u) draws=%u program=%p pipeline=%p"
@@ -12144,7 +12344,7 @@ int runtime_nvn_sparse_target_selftest(void) {
     GfxRenderTargetLayout layout;
     uint32_t w = 0, h = 0;
     const char *why = NULL;
-    int ok = nvn_rt_layout_from_targets(4, tg, NULL, &layout, &w, &h, &why);
+    int ok = nvn_rt_layout_from_targets(4, tg, NULL, NULL, NULL, &layout, &w, &h, &why);
     ok = ok && layout.color_count == 4 && w == 64 && h == 64 &&
          layout.color_formats[0] && layout.color_formats[1] &&
          layout.color_formats[2] == layout.color_formats[0] &&
@@ -12153,7 +12353,7 @@ int runtime_nvn_sparse_target_selftest(void) {
     GfxRenderTargetLayout tl;
     uint32_t tw = 0, th = 0;
     const char *twhy = NULL;
-    ok = ok && nvn_rt_layout_from_targets(4, tail, NULL, &tl, &tw, &th, &twhy) &&
+    ok = ok && nvn_rt_layout_from_targets(4, tail, NULL, NULL, NULL, &tl, &tw, &th, &twhy) &&
          tl.color_count == 2;
     GfxOffscreenTarget *rt = ok ? nvn_host_rt_get_owner(64, 64, &layout, &A) : NULL;
     if (!rt) ok = 0;
