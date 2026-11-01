@@ -3480,15 +3480,30 @@ static int nvn_rt_layout_from_targets(uint32_t n, void *const *tex,
 }
 
 /* The window's host target layout comes from the guest window texture when the
- * guest supplied one; only a bare window falls back to the VI description. */
+ * guest supplied one; only a bare window falls back to the VI description.
+ * The guest renders its final composite into those textures, so their format
+ * is the one the compositor must match (VI's descriptor is RGBA8 even when the
+ * engine uses a 16-bit HDR target). */
 static void nvn_window_layout(const win_t *w, GfxRenderTargetLayout *layout,
                               uint32_t *width, uint32_t *height) {
     memset(layout, 0, sizeof *layout);
-    uint32_t ww = 0, wh = 0, wf = 0;
     *width = *height = 0;
-    if (w && w->native && runtime_native_window_info(w->native, &ww, &wh, &wf, NULL, NULL)) {
-        *width = ww; *height = wh;
+    uint32_t ww = 0, wh = 0, wf = 0;
+    if (w) {
+        for (int i = 0; i < w->ntex; i++) {
+            const tex_t *t = nvn_tex_registry_find(w->tex[i]);
+            if (!t || !t->d.width || !t->d.height) continue;
+            ww = t->d.width;
+            wh = t->d.height;
+            wf = (uint32_t)t->d.format;
+            break;
+        }
     }
+    if (!ww || !wh) {
+        if (w && w->native) runtime_native_window_info(w->native, &ww, &wh, &wf, NULL, NULL);
+    }
+    *width = ww;
+    *height = wh;
     uint32_t fmt = gfx_backend_vk_format_for_nvn(wf ? wf : 0x25);
     if (!fmt) fmt = gfx_backend_vk_format_for_nvn(0x25);
     layout->color_count = 1;
@@ -7246,7 +7261,18 @@ static int nvn_layout_matches_window(const win_t *w, const GfxRenderTargetLayout
     GfxRenderTargetLayout wl;
     uint32_t ww = 0, wh = 0;
     nvn_window_layout(w, &wl, &ww, &wh);
-    return ww == width && wh == height && wl.color_formats[0] == layout->color_formats[0];
+    if (ww != width || wh != height) return 0;
+    if (wl.color_formats[0] == layout->color_formats[0]) return 1;
+    /* A final composite rendered into the window's own texture with a
+     * different format still belongs to the window pass: the host presents
+     * through the window's format (the gfx present path converts).  Same size
+     * and the texture being a window texture is enough. */
+    static unsigned logged;
+    if (logged++ < 4)
+        fprintf(stderr, "[totk-nvn] window pass layout %#x vs window %#x %ux%u:"
+                        " presenting through the window format\n",
+                layout->color_formats[0], wl.color_formats[0], ww, wh);
+    return 1;
 }
 
 /* Copy color attachment 0 of a host MRT image into the window's CPU mirror so
@@ -8955,7 +8981,7 @@ static void nvn_scene_submit_sampled_target(const nvn_bind_state_t *bs, cb_t *vi
                 const tex_t *gt = NULL;
                 if (nvn_global_tex_get(st, slot, &gh, &gt) && gh == h) t = gt;
             }
-            if (t && t->d.format == 0x3f && t->d.width >= 1024) {
+            if (t && t->d.format == 0x3f) {
                 target = t;
                 break;
             }
@@ -9036,6 +9062,16 @@ static void nvn_scene_submit_pending(void) {
     if (ns && *ns) {
         long v = strtol(ns, NULL, 0);
         if (v > 0 && v <= (long)NVN_SCENE_QUEUE_MAX) max = (unsigned)v;
+    }
+    /* A heavy recording can queue hundreds of segments; a fixed batch of 8
+     * leaves the backlog growing every frame, so scale the batch with the
+     * queue depth (still bounded, and still at most one >=1024 px target). */
+    {
+        pthread_mutex_lock(&g_scene_lock);
+        unsigned depth = g_scene_pending_count;
+        pthread_mutex_unlock(&g_scene_lock);
+        unsigned want = depth / 4;
+        if (want > max) max = want > 64 ? 64 : want;
     }
     unsigned n;
     if (max < NVN_SCENE_QUEUE_MAX) {
@@ -9183,6 +9219,31 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
         int window_target = window_texture;
         int window_pass = has_window && (!have_layout ||
                           (window_target && nvn_layout_matches_window(w, &layout, rw, rh)));
+        /* Why is a window pass an offscreen pass?  Report the window's guest
+         * textures and the recorded target/size/format once per window cb. */
+        if (has_window && nvn_trace_composite() && !window_pass) {
+            static unsigned wl;
+            if (wl++ < 16) {
+                uint32_t ww = 0, wh = 0, wf = 0;
+                runtime_native_window_info(w->native, &ww, &wh, &wf, NULL, NULL);
+                GfxRenderTargetLayout wl2;
+                uint32_t lw2 = 0, lh2 = 0;
+                nvn_window_layout(w, &wl2, &lw2, &lh2);
+                fprintf(stderr, "[totk-frame] window-miss cb=%p win=%p native=%p"
+                                " win_texes=%d native=%ux%u fmt=%#x wlayout=%#x %ux%u"
+                                " | target=0x%x tex0=%p %ux%u fmt=%#x matches=%d"
+                                " mrt=%u depth=%#x\n",
+                        (void *)cb, (void *)w, (void *)w->native, w->ntex, ww, wh, wf,
+                        wl2.color_formats[0], lw2, lh2, window_target,
+                        (const void *)(window_target ? cbt->color0_tex : NULL), rw, rh,
+                        layout.color_count ? layout.color_formats[0] : 0,
+                        nvn_layout_matches_window(w, &layout, rw, rh),
+                        layout.color_count, layout.depth_format);
+                for (int ti = 0; ti < w->ntex && ti < 4; ti++)
+                    fprintf(stderr, "[totk-frame] window-miss   win.tex[%d]=%p\n", ti,
+                            (const void *)w->tex[ti]);
+            }
+        }
         const nvn_bind_state_t *bs = nvn_cb_draw_state(cb);
         /* Refresh the 0x3f source this window pass samples.  Cheap (small UI
          * targets only) and required for a correct composite; disable with
