@@ -956,6 +956,81 @@ _Static_assert(sizeof(prog_t) <= 0xC0, "NVNprogram guest ABI size");
 _Static_assert(offsetof(prog_t, sd) == 8, "NVNprogram sd offset");
 _Static_assert(offsetof(prog_t, serial) == 0x68, "NVNprogram serial offset");
 
+/* Per-program uniform-buffer history.  NVN cbuf binds are queue-scoped, but
+ * different programs reuse the same NVN index for different constant banks
+ * (the window program's c3 ortho vs a preceding pass's projection buffer at
+ * index 0).  Remember, for each program, the last buffer bound while that
+ * program was current, so a program can reclaim its own cbuf even after
+ * another program overwrote the index.  Host-only; guest memory untouched. */
+typedef struct {
+    const prog_t *prog;
+    uint32_t stage, index;
+    uint64_t address;
+    size_t size;
+    uint64_t age;
+} nvn_prog_ubo_t;
+#define NVN_PROG_UBO_MAX 512
+static nvn_prog_ubo_t g_prog_ubos[NVN_PROG_UBO_MAX];
+static unsigned g_prog_ubo_count;
+static uint64_t g_prog_ubo_age;
+static pthread_mutex_t g_prog_ubo_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void nvn_prog_ubo_set(const prog_t *p, int stage, int index,
+                             uint64_t address, size_t size) {
+    if (!p || stage < 0 || stage >= 6 || index < 0 || index >= 16) return;
+    pthread_mutex_lock(&g_prog_ubo_lock);
+    nvn_prog_ubo_t *e = NULL, *oldest = NULL;
+    for (unsigned i = 0; i < g_prog_ubo_count; i++) {
+        if (g_prog_ubos[i].prog == p && g_prog_ubos[i].stage == (uint32_t)stage &&
+            g_prog_ubos[i].index == (uint32_t)index) { e = &g_prog_ubos[i]; break; }
+        if (!oldest || g_prog_ubos[i].age < oldest->age) oldest = &g_prog_ubos[i];
+    }
+    if (!e) {
+        if (g_prog_ubo_count < NVN_PROG_UBO_MAX) e = &g_prog_ubos[g_prog_ubo_count++];
+        else if (oldest) e = oldest;
+    }
+    if (e) {
+        e->prog = p;
+        e->stage = (uint32_t)stage;
+        e->index = (uint32_t)index;
+        e->address = address;
+        e->size = size;
+        e->age = ++g_prog_ubo_age;
+    }
+    pthread_mutex_unlock(&g_prog_ubo_lock);
+}
+static int nvn_prog_ubo_get(const prog_t *p, int stage, int index,
+                            uint64_t *address, size_t *size) {
+    int ok = 0;
+    if (!p) return 0;
+    pthread_mutex_lock(&g_prog_ubo_lock);
+    for (unsigned i = 0; i < g_prog_ubo_count; i++) {
+        nvn_prog_ubo_t *e = &g_prog_ubos[i];
+        if (e->prog != p || e->stage != (uint32_t)stage || e->index != (uint32_t)index)
+            continue;
+        if (!e->address || !e->size) break;
+        if (address) *address = e->address;
+        if (size) *size = e->size;
+        e->age = ++g_prog_ubo_age;
+        ok = 1;
+        break;
+    }
+    pthread_mutex_unlock(&g_prog_ubo_lock);
+    return ok;
+}
+static void nvn_prog_ubo_forget(const prog_t *p) {
+    if (!p) return;
+    pthread_mutex_lock(&g_prog_ubo_lock);
+    for (unsigned i = 0; i < g_prog_ubo_count; ) {
+        if (g_prog_ubos[i].prog == p) {
+            g_prog_ubos[i] = g_prog_ubos[--g_prog_ubo_count];
+            continue;
+        }
+        i++;
+    }
+    pthread_mutex_unlock(&g_prog_ubo_lock);
+}
+
 typedef struct {
     uint32_t magic, state;    /* 0 pending, 1 signaled (GPU completion seen) */
     void *fence;              /* GfxFence* from the backend contract */
@@ -5515,6 +5590,7 @@ static void nvnCommandBufferBindUniformBuffer(cb_t *c, int stage, int i, uint64_
     b->ubo[stage][i].size = size;
     b->ubo_mask[stage] |= 1u << i;
     nvn_global_ubo_set(stage, i, address, size);
+    nvn_prog_ubo_set(c->prog, stage, i, address, size);
     nvn_cb_desc_event(c, (uint32_t)stage, 0, (uint32_t)i, address, size, 0);
     if (nvn_trace() || ((nvn_trace_first() || nvn_trace_inputs()) && nvn_ubo_trace++ < 8192)) {
         const uint32_t *u = (const uint32_t *)(uintptr_t)address;
@@ -5536,6 +5612,7 @@ static void nvnCommandBufferBindUniformBuffers(cb_t *c, int stage, int first, in
         b->ubo[stage][first + i].size = (size_t)r[i * 2 + 1];
         b->ubo_mask[stage] |= 1u << (first + i);
         nvn_global_ubo_set(stage, first + i, r[i * 2], (size_t)r[i * 2 + 1]);
+        nvn_prog_ubo_set(c->prog, stage, first + i, r[i * 2], (size_t)r[i * 2 + 1]);
         nvn_cb_desc_event(c, (uint32_t)stage, 0, (uint32_t)(first + i),
                           r[i * 2], (size_t)r[i * 2 + 1], 0);
     }
@@ -5976,6 +6053,7 @@ static void nvn_prog_ref(prog_shader_state_t *s) {
 }
 static void nvnProgramFinalize(prog_t *p) {
     if (!p) return;
+    nvn_prog_ubo_forget(p);
     pthread_mutex_lock(&g_prog_lock);
     prog_shader_state_t *s = prog_state_remove(p);
     if (nvn_trace())
@@ -6859,7 +6937,7 @@ static void nvn_inherit_ubo_slots(nvn_bind_state_t *b, GfxReflectedPipeline *rp)
  * cbuf slot in the most recent nvn_apply_bind_state.  The UI vertex shader
  * reads vp_c3 (slot 3) rows 1..6/33 and vp_c1 (slot 1), so the mapping has to
  * be observed rather than assumed. */
-typedef struct { int32_t nvn; uint64_t addr; size_t size; int valid; } nvn_ubo_dec_t;
+typedef struct { int32_t nvn; uint64_t addr; size_t size; int valid; const char *src; } nvn_ubo_dec_t;
 static nvn_ubo_dec_t g_ubo_dec[2][16];
 
 static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
@@ -6898,7 +6976,7 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
                     fprintf(stderr, "[totk-nvn] UBO stage=%d nvn index=%d size=%zu not in reflection\n",
                             stage, i, size);
             } else if (i < 16) {
-                g_ubo_dec[stage][i] = (nvn_ubo_dec_t){ i, b->ubo[stage][i].address, size, 1 };
+                g_ubo_dec[stage][i] = (nvn_ubo_dec_t){ i, b->ubo[stage][i].address, size, 1, "snap" };
             }
         }
         /* NVN binds uniform buffers by the program's UBO index while the
@@ -6921,7 +6999,7 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
                                                             bdata[k], bsize[k])) {
                         if (target >= 0 && target < 16)
                             g_ubo_dec[stage][target] = (nvn_ubo_dec_t){ bidx[k],
-                                b->ubo[stage][bidx[k]].address, bsize[k], 1 };
+                                b->ubo[stage][bidx[k]].address, bsize[k], 1, "snap" };
                         if (nvn_trace_inputs()) {
                             static unsigned mlog;
                             if (mlog++ < 8)
@@ -6945,7 +7023,7 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
                                                     failed_data, failed_size)) {
                 if (target < 16 && failed_slot >= 0 && failed_slot < 16)
                     g_ubo_dec[stage][target] = (nvn_ubo_dec_t){ failed_slot,
-                        b->ubo[stage][failed_slot].address, failed_size, 1 };
+                        b->ubo[stage][failed_slot].address, failed_size, 1, "snap" };
                 static unsigned logged;
                 if (logged++ < 8)
                     fprintf(stderr, "[totk-nvn] UBO stage=%d nvn index=%d -> shader cbuf"
@@ -6954,6 +7032,33 @@ static void nvn_apply_bind_state(prog_t *p, GfxReflectedPipeline *rp,
                             stage, failed_slot, target, failed_size,
                             ((const uint32_t *)failed_data)[0], ((const uint32_t *)failed_data)[1],
                             ((const uint32_t *)failed_data)[2], ((const uint32_t *)failed_data)[3]);
+            }
+        }
+        /* Per-program cbuf history: if this program bound a buffer for one of
+         * its own shader slots while it was current, that is its c3 even after
+         * another program overwrote the same NVN index.  This is what keeps the
+         * window pass from inheriting a scene pass's projection buffer. */
+        if (p && pspec) {
+            for (uint32_t k = 0; k < pspec->nubo[stage] && k < 16; k++) {
+                int slot = pspec->ubo_slot[stage][k];
+                if (slot < 0 || slot >= 16) continue;
+                uint64_t pa = 0;
+                size_t pn = 0;
+                if (!nvn_prog_ubo_get(p, stage, slot, &pa, &pn) || !pa || !pn) continue;
+                if (g_ubo_dec[stage][slot].valid &&
+                    g_ubo_dec[stage][slot].addr == pa &&
+                    g_ubo_dec[stage][slot].size == pn) continue;
+                if (!gfx_backend_reflected_bind_ubo_slot(rp, (uint32_t)stage, (uint32_t)slot,
+                                                         (const void *)(uintptr_t)pa, pn))
+                    continue;
+                g_ubo_dec[stage][slot] = (nvn_ubo_dec_t){ slot, pa, pn, 1, "prog" };
+                if (nvn_trace_composite()) {
+                    static unsigned plog;
+                    if (plog++ < 12)
+                        fprintf(stderr, "[totk-frame] UBO stage=%d cbuf slot=%d <- program"
+                                        " history (%#llx,%zu)\n", stage, slot,
+                                (unsigned long long)pa, pn);
+                }
             }
         }
         for (int i = 0; i < 16; i++) {
@@ -9505,14 +9610,26 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                                     g->u.clear.rgba[1], g->u.clear.rgba[2], g->u.clear.rgba[3],
                                     g->u.clear.mask);
                     }
+                    if (p) {
+                        fprintf(stderr, "[totk-frame] window-pass   prog-history:");
+                        for (int hi = 0; hi < 16; hi++) {
+                            uint64_t ha = 0;
+                            size_t hn = 0;
+                            if (nvn_prog_ubo_get(p, 0, hi, &ha, &hn))
+                                fprintf(stderr, " i%d=(%#llx,%zu)", hi,
+                                        (unsigned long long)ha, hn);
+                        }
+                        fputc('\n', stderr);
+                    }
                     for (int i = 0; i < 16; i++) {
                         if (!g_ubo_dec[0][i].valid) continue;
                         const uint32_t *w = (const uint32_t *)(uintptr_t)g_ubo_dec[0][i].addr;
                         size_t nw = g_ubo_dec[0][i].size / 4;
-                        fprintf(stderr, "[totk-frame] window-pass   c%d<=idx%d(%#llx,%zu)",
-                                i, g_ubo_dec[0][i].nvn,
+                        fprintf(stderr, "[totk-frame] window-pass   c%d<=idx%d(%#llx,%zu)"
+                                " src=%s", i, g_ubo_dec[0][i].nvn,
                                 (unsigned long long)g_ubo_dec[0][i].addr,
-                                g_ubo_dec[0][i].size);
+                                g_ubo_dec[0][i].size,
+                                g_ubo_dec[0][i].src ? g_ubo_dec[0][i].src : "?");
                         if (w && nw >= 16) {
                             static const int rows[7] = { 1, 2, 3, 4, 5, 6, 33 };
                             for (int r = 0; r < 7; r++) {
