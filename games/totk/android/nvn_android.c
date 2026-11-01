@@ -667,6 +667,8 @@ typedef struct {
     uint64_t serial;
 } tex_t;
 
+static void nvn_mask_trace(const tex_t *t, const char *what);
+
 /* Live NVN texture objects.  The window path needs the guest texture's
  * dimensions/format, but a guest-provided pointer must never be dereferenced
  * unless nvnTextureInitialize produced it: the registry gives us a safe
@@ -2302,6 +2304,7 @@ static void nvn_upload_trace_result(int on, const tex_t *t, const char *what,
 static GfxTexture *nvn_texture_gfx_ready_locked(const tex_t *t) {
     if (!t || t->magic != NVN_MAGIC('T', 'E', 'X', 0)) return NULL;
     tex_bridge_t *b = nvn_tex_bridge(t, 0);
+    nvn_mask_trace(t, "bind");
     /* The guest wrote texels since the host copy was uploaded: drop the stale
      * CPU-uploaded image so the normal path below re-uploads the new bytes.
      * This does not touch the render-target association; if the texture is an
@@ -2546,8 +2549,34 @@ static void nvn_dump_vertex_stream(const char *tag, const GfxVertexLayout *l,
 }
 
 /* Mark the host copy of a guest texture stale after a CPU-side texel write. */
+/* Mask producer diagnostics (Lane 4 gate34): the two R8 masks sampled by the
+ * 0x7a scene passes.  Counts target/sample binds and reports whether any
+ * producer path touched them (RT association, CPU write, upload). */
+static unsigned g_mask_binds, g_mask_rt, g_mask_writes;
+static void nvn_mask_trace(const tex_t *t, const char *what) {
+    if (!t) return;
+    int mask = (t->d.format == 0x1 &&
+                ((t->d.width == 2048 && t->d.height == 4096) ||
+                 (t->d.width == 780 && t->d.height == 60)));
+    if (!mask) return;
+    tex_bridge_t *b = nvn_tex_bridge(t, 0);
+    int rt = b && b->rt_valid;
+    if (!strcmp(what, "bind")) g_mask_binds++;
+    if (rt) g_mask_rt++;
+    static unsigned logs;
+    if (logs++ < 24 || nvn_trace_frame())
+        fprintf(stderr, "[totk-nvn] mask %s tex=%p %ux%u rt=%d gen=%llu/%llu"
+                        " gfx=%p dirty=%d binds=%u rt_binds=%u\n", what,
+                (const void *)t, t->d.width, t->d.height, rt,
+                b ? (unsigned long long)b->rt_frame : 0,
+                b ? (unsigned long long)b->rt_uploaded : 0,
+                b ? b->gfx : NULL, b ? b->gfx_dirty : 0, g_mask_binds, g_mask_rt);
+}
+
 static void nvn_texture_mark_dirty(const tex_t *t) {
     if (!t) return;
+    g_mask_writes++;
+    nvn_mask_trace(t, "cpu-write");
     pthread_mutex_lock(&g_tex_bridge_lock);
     tex_bridge_t *b = nvn_tex_bridge(t, 1);
     if (b) b->gfx_dirty = 1;
@@ -9001,8 +9030,8 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
     /* Same evidence for the large (window-sized) scene segments: the window
      * presents these targets, so a black scene has to be explained here. */
     if (nvn_trace_composite() && lw >= 1024 &&
-        nvn_tex_registry_find(sg->color0_tex) &&
-        nvn_tex_registry_find(sg->color0_tex)->d.format != 0x3f) {
+        (sg->width >= 1024 || sg->height >= 1024) &&
+        sg->layout.color_count >= 1 && sg->layout.color_formats[0] != 0) {
         static unsigned big_dumps;
         if (big_dumps < 8) {
             big_dumps++;
@@ -9024,11 +9053,23 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
                 }
             }
             const tex_t *ot = nvn_tex_registry_find(sg->color0_tex);
-            fprintf(stderr, "[totk-scene-seg] seg=%u target=%p fmt=%#x %ux%u prog=%p rp=%p"
+            char vsk[20] = "-", psk[20] = "-";
+            if (p) {
+                pthread_mutex_lock(&g_prog_lock);
+                prog_shader_state_t *ss = prog_state_find(p);
+                if (ss) {
+                    if (ss->key[0][0]) snprintf(vsk, sizeof vsk, "%.16s", ss->key[0]);
+                    if (ss->key[1][0]) snprintf(psk, sizeof psk, "%.16s", ss->key[1]);
+                }
+                pthread_mutex_unlock(&g_prog_lock);
+            }
+            fprintf(stderr, "[totk-scene-seg] seg=%u target=%p fmt=%#x layout=%#x vs=%s"
+                            " ps=%s %ux%u prog=%p rp=%p"
                             " warm=%d draws=%u dcmd=%u icmd=%u prim=%u cnt=%u itype=%u"
                             " vp=%d,%d %dx%d sc=%d,%d %dx%d texmask=%#x/%#x"
                             " vb=%#llx/%zu\n", seg_index, sg->color0_tex,
-                    ot ? ot->d.format : 0, lw, lh, (void *)p, (void *)rp, sg->warm,
+                    ot ? ot->d.format : 0, sg->layout.color_formats[0], vsk, psk,
+                    lw, lh, (void *)p, (void *)rp, sg->warm,
                     sg->draw_count, dcmd, icmd, prim, cnt, itype, vp[0], vp[1], vp[2], vp[3],
                     sc[0], sc[1], sc[2], sc[3], bs->tex_mask[0][0], bs->tex_mask[1][0],
                     (unsigned long long)bs->vb[0].address, bs->vb[0].size);
