@@ -58,6 +58,7 @@ extern int runtime_native_window_execute_reflected_ex(void *p, void *pipeline,
 extern int runtime_native_window_clear_rgba(void *p, const float rgba[4]);
 extern int runtime_native_window_read_pixel(void *p, uint32_t x, uint32_t y, uint8_t out[4]);
 extern int runtime_native_window_screenshot(void *p, const char *path);
+extern GfxOffscreenTarget *runtime_native_window_present_target(const void *p);
 static void nvn_process_submit_commands(const uint64_t *cmds, int n);
 static void nvn_warm_recording(void *cb);
 static int nvn_gpu_drain(const char *what);
@@ -4173,6 +4174,12 @@ static int nvn_is_empty_target(const void *tex) {
  * pass presents this target instead of the overlay-only window image. */
 static GfxOffscreenTarget *g_last_scene_rt;
 static uint32_t g_last_scene_w, g_last_scene_h;
+/* Which guest texture/color0/layout produced g_last_scene_rt.  The window pass
+ * often samples an alias object of the RT's texture, so keep the resource
+ * identity for the association fallback and for present routing. */
+static const tex_t *g_last_scene_tex;
+static const void *g_last_scene_color0;
+static GfxRenderTargetLayout g_last_scene_layout;
 static pthread_mutex_t g_prog_lock;
 static void nvn_warm_scene(cb_t *c);
 static void nvn_seg_prepare(nvn_seg_t *segs, uint32_t nseg, cb_t *c);
@@ -9559,6 +9566,9 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
         g_last_scene_rt = rt;
         g_last_scene_w = lw;
         g_last_scene_h = lh;
+        g_last_scene_tex = ctex;
+        g_last_scene_color0 = sg->color0_tex;
+        g_last_scene_layout = layout;
     }
     if (nvn_trace_frame() && lw <= 512) {
         static unsigned ui_log;
@@ -9957,7 +9967,12 @@ static void nvn_scene_submit_sampled_target(const nvn_bind_state_t *bs, cb_t *vi
     /* Newest first: an older recording's segments are stale, because the
      * guest re-records the same guest textures every frame. */
     for (unsigned i = g_scene_pending_count; i-- > 0; ) {
-        if (g_scene_pending[i].target != target) continue;
+        if (g_scene_pending[i].target != target) {
+           /* The window sampler and the queued color0 can be different NVN
+             * texture objects aliasing one resource; compare resources. */
+            const tex_t *pt = nvn_tex_registry_find(g_scene_pending[i].target);
+            if (!pt || !nvn_tex_same_resource(pt, target)) continue;
+        }
         handle = g_scene_pending[i].handle;
         seg = g_scene_pending[i].seg;
         memmove(&g_scene_pending[i], &g_scene_pending[i + 1],
@@ -10007,6 +10022,87 @@ static void nvn_scene_submit_sampled_target(const nvn_bind_state_t *bs, cb_t *vi
     for (unsigned i = 0; i < nchain; i++)
         nvn_submit_scene_snapshot(handle, chain[i]);
     nvn_submit_scene_snapshot(handle, seg);
+}
+
+/* The 0x3f texture the window compositor samples, resolved through the same
+ * pool/global tables the translator uses. */
+static const tex_t *nvn_window_sampled_tex(const nvn_bind_state_t *bs, cb_t *view) {
+    if (!bs || !view) return NULL;
+    const tex_pool_t *tp = nvn_tex_pool_for(view);
+    for (int st = 0; st < 2; st++)
+        for (int slot = 0; slot < 128; slot++) {
+            if (!(bs->tex_mask[st][slot / 32] & (1u << (slot % 32)))) continue;
+            uint64_t h = bs->tex[st][slot];
+            const tex_t *t = tp ? nvn_tex_pool_lookup(tp, (int)(h & 0xfffff)) : NULL;
+            if (!t) {
+                uint64_t gh = 0;
+                const tex_t *gt = NULL;
+                if (nvn_global_tex_get(st, slot, &gh, &gt) && gh == h) t = gt;
+            }
+            if (t && t->d.format == 0x3f) return t;
+        }
+    return NULL;
+}
+
+/* Pick the RT that actually backs the window's sampled 0x3f texture.  The
+ * bridge is authoritative: the queued text segment sets it through
+ * nvn_tex_set_rt.  Fall back to the last large scene target only if the
+ * sampled texture has never been associated. */
+static GfxOffscreenTarget *nvn_window_present_rt(const nvn_bind_state_t *bs, cb_t *view,
+                                                 const tex_t **tex_out) {
+    const tex_t *t = nvn_window_sampled_tex(bs, view);
+    if (tex_out) *tex_out = t;
+    if (t) {
+        tex_bridge_t *b = nvn_tex_bridge(t, 0);
+        if (nvn_trace_composite()) {
+            static unsigned src_guest, src_rt;
+            int valid = b && b->rt_valid;
+            unsigned *n = valid ? &src_rt : &src_guest;
+            if (*n < 4) {
+                (*n)++;
+                size_t ms = t->L.size ? (size_t)t->L.size
+                                      : (size_t)t->d.width * t->d.height;
+                uint32_t nz = t->mem ? nvn_first_nonzero(t->mem, ms, 1u << 20) : UINT32_MAX;
+                fprintf(stderr, "[totk-frame] window present source tex=%p %ux%u fmt=%#x"
+                                " rt_valid=%d rt=%p gen=%llu/%llu gfx=%p guest_first_nz=%s%u"
+                                " -> src=%s\n",
+                        (const void *)t, t->d.width, t->d.height, t->d.format,
+                        valid, b ? (void *)b->rt : NULL,
+                        b ? (unsigned long long)b->rt_frame : 0ull,
+                        b ? (unsigned long long)b->rt_uploaded : 0ull,
+                        b ? b->gfx : NULL,
+                        nz == UINT32_MAX ? "none " : "", nz == UINT32_MAX ? 0 : nz,
+                        valid ? "rt-gen" : (t->mem ? "guest" : "none"));
+            }
+        }
+        if (b && b->rt_valid && b->rt) return b->rt;
+    }
+    return g_last_scene_rt;
+}
+
+static int nvn_target_first_nz(GfxOffscreenTarget *t, uint32_t *first, uint8_t center[4]) {
+    if (first) *first = UINT32_MAX;
+    if (center) memset(center, 0, 4);
+    if (!t) return 0;
+    size_t n = 0;
+    const uint8_t *px = gfx_backend_offscreen_pixels(t, &n);
+    if (first && px) *first = nvn_first_nonzero(px, n, 1u << 20);
+    uint32_t w = gfx_backend_offscreen_width(t);
+    uint32_t h = gfx_backend_offscreen_height(t);
+    if (center && w && h && !gfx_backend_offscreen_read_pixel_index(t, 0, w / 2, h / 2, center))
+        memset(center, 0, 4);
+    return px != NULL;
+}
+
+/* Headless present is an offscreen target in the host window (there is no real
+ * surface to hand the present-target image to).  Frame dumps must follow the
+ * same target present() would use on a surface, or they show the overlay
+ * target instead of the scene the window pass actually samples. */
+static int nvn_window_frame_ppm(win_t *w, const char *path) {
+    if (!w || !path) return 0;
+    GfxOffscreenTarget *pt = runtime_native_window_present_target(w->native);
+    if (pt) return gfx_backend_offscreen_write_ppm_index(pt, 0, path);
+    return runtime_native_window_screenshot(w->native, path);
 }
 
 /* Called at the start of every queue submit: render the retired offscreen
@@ -10210,6 +10306,26 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             }
         }
         const nvn_bind_state_t *bs = nvn_cb_draw_state(cb);
+        /* The window composite samples an alias object of the offscreen target's
+         * texture.  If that alias never got the RT association, inherit it from
+         * the last large scene pass before the sampler is translated. */
+        if (window_pass && bs && g_last_scene_rt) {
+            const tex_t *ws = nvn_window_sampled_tex(bs, cb);
+            tex_bridge_t *wb = ws ? nvn_tex_bridge(ws, 0) : NULL;
+            if (ws && (!wb || !wb->rt_valid)) {
+                int same = ws == g_last_scene_color0 ||
+                           (g_last_scene_tex && nvn_tex_same_resource(ws, g_last_scene_tex));
+                if (same) {
+                    nvn_tex_set_rt(ws, g_last_scene_rt, &g_last_scene_layout,
+                                   g_last_scene_w, g_last_scene_h);
+                    static unsigned alias_logged;
+                    if (nvn_trace_composite() && alias_logged++ < 8)
+                        fprintf(stderr, "[totk-frame] window sample alias tex=%p ->"
+                                        " scene rt=%p %ux%u\n", (const void *)ws,
+                                (void *)g_last_scene_rt, g_last_scene_w, g_last_scene_h);
+                }
+            }
+        }
         /* Refresh the 0x3f source this window pass samples.  Cheap (small UI
          * targets only) and required for a correct composite; disable with
          * TOTK_ANDROID_NO_SAMPLED_DRAIN for A/B evidence. */
@@ -10433,6 +10549,30 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                                                     window_pass ? NULL : rt,
                                                     clear, &has_clear) + pre;
             nvn_remap_texture_bind_cmds(translated, count, reflected);
+            if (window_pass && nvn_trace_composite()) {
+                static unsigned post_src, post_nz;
+                const tex_t *st = nvn_window_sampled_tex(bs, cb);
+                tex_bridge_t *sb = st ? nvn_tex_bridge(st, 0) : NULL;
+                if (sb && sb->rt_valid) {
+                    size_t n = 0;
+                    const uint8_t *px = gfx_backend_offscreen_pixels(sb->rt, &n);
+                    uint32_t nz = nvn_first_nonzero(px, n, 1u << 20);
+                    int want = post_src < 4 ||
+                               (nz != UINT32_MAX && post_nz < 4);
+                    if (want) {
+                        if (nz == UINT32_MAX) post_src++;
+                        else post_nz++;
+                        fprintf(stderr, "[totk-frame] window sampled tex=%p"
+                                        " -> gfx=%p src=rt-gen gen=%llu/%llu"
+                                        " rt=%p bytes=%zu first_nz=%s%u\n",
+                                (const void *)st, sb->gfx,
+                                (unsigned long long)sb->rt_frame,
+                                (unsigned long long)sb->rt_uploaded,
+                                (void *)sb->rt, n,
+                                nz == UINT32_MAX ? "none " : "", nz == UINT32_MAX ? 0 : nz);
+                    }
+                }
+            }
             nvn_bind_state_t bend = bs ? *bs : (nvn_bind_state_t){0};
             /* NVN uniform-buffer binds are queue-scoped, and this cb's draws can
              * predate a rebind that the engine intended for the whole
@@ -10486,26 +10626,53 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                                                                   translated, count,
                                                                   has_clear ? clear : NULL,
                                                                   streams, nstreams);
-            if (window_pass && has_window && g_last_scene_rt) {
-                /* The window composite samples the fade overlay only; the frame
-                 * content is the scene target rendered by the scene segments.
-                 * Present that real target rather than the overlay. */
-                runtime_native_window_set_present_target(w->native, g_last_scene_rt);
+            GfxOffscreenTarget *window_present_rt = NULL;
+            const tex_t *window_present_tex = NULL;
+            if (window_pass)
+                window_present_rt = nvn_window_present_rt(bs, cb, &window_present_tex);
+            if (window_pass && has_window && window_present_rt) {
+                /* The window composite's own draw covers only the fade overlay.
+                 * The frame content is the offscreen target its 0x3f sampler
+                 * reads, so present that RT (route the sampled texture's RT, not
+                 * the overlay). */
+                runtime_native_window_set_present_target(w->native, window_present_rt);
                 if (nvn_trace_composite()) {
                     static unsigned sl;
-                    if (sl++ < 8)
+                    if (sl++ < 8) {
+                        uint32_t fnz = UINT32_MAX;
+                        uint8_t cpx[4] = { 0 };
+                        tex_bridge_t *wb = window_present_tex
+                                         ? nvn_tex_bridge(window_present_tex, 0) : NULL;
+                        nvn_target_first_nz(window_present_rt, &fnz, cpx);
                         fprintf(stderr, "[totk-frame] window presents scene rt=%p %ux%u"
-                                        " (overlay dropped)\n", (void *)g_last_scene_rt,
-                                g_last_scene_w, g_last_scene_h);
+                                        " sampled_tex=%p rt_valid=%d gen=%llu first_nz=%s%u"
+                                        " center=%02x%02x%02x%02x (overlay dropped)\n",
+                                (void *)window_present_rt,
+                                gfx_backend_offscreen_width(window_present_rt),
+                                gfx_backend_offscreen_height(window_present_rt),
+                                (const void *)window_present_tex, wb ? wb->rt_valid : 0,
+                                wb ? (unsigned long long)wb->rt_frame : 0ull,
+                                fnz == UINT32_MAX ? "none " : "", fnz == UINT32_MAX ? 0 : fnz,
+                                cpx[0], cpx[1], cpx[2], cpx[3]);
+                    }
                 }
                 const char *pp = getenv("TOTK_ANDROID_PRESENT_PPM");
                 if (pp && *pp) {
+                    /* Dump only once the target holds frame content: the first
+                     * window submit of a recording can precede the text pass. */
                     static int dumped;
-                    if (!dumped) {
+                    uint32_t fnz = UINT32_MAX;
+                    uint8_t cpx[4] = { 0 };
+                    nvn_target_first_nz(window_present_rt, &fnz, cpx);
+                    int content = fnz != UINT32_MAX ||
+                                  cpx[0] | cpx[1] | cpx[2] | cpx[3];
+                    if (!dumped && content) {
                         dumped = 1;
-                        int ok = gfx_backend_offscreen_write_ppm_index(g_last_scene_rt, 0, pp);
-                        fprintf(stderr, "[totk-frame] present ppm -> %s (%s)\n", pp,
-                                ok ? "ok" : "failed");
+                        int ok = gfx_backend_offscreen_write_ppm_index(window_present_rt, 0, pp);
+                        fprintf(stderr, "[totk-frame] present ppm -> %s (%s) first_nz=%u"
+                                        " center=%02x%02x%02x%02x\n", pp,
+                                ok ? "ok" : "failed", fnz,
+                                cpx[0], cpx[1], cpx[2], cpx[3]);
                     }
                 }
             }
@@ -10682,13 +10849,13 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
             nvn_nvn_draws && (nvn_nvn_draws % l2_every) == 0) {
             char path[PATH_MAX];
             snprintf(path, sizeof path, "%s-%u.ppm", l2_frame, nvn_nvn_draws);
-            int shot = runtime_native_window_screenshot(w->native, path);
+            int shot = nvn_window_frame_ppm(w, path);
             fprintf(stderr, "[totk-nvn] periodic frame #%u -> %s (%s)\n",
                     nvn_nvn_draws, path, shot ? "ok" : "failed");
         }
         if (has_window && l2_frame && *l2_frame && !l2_frame_dumped && dump_now) {
             l2_frame_dumped = 1;
-            int shot = runtime_native_window_screenshot(w->native, l2_frame);
+            int shot = nvn_window_frame_ppm(w, l2_frame);
             if (l2_at)
                 fprintf(stderr, "[totk-nvn] reflected frame #%u -> %s (%s)\n",
                         nvn_nvn_draws, l2_frame, shot ? "ok" : "failed");
