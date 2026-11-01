@@ -234,7 +234,15 @@ typedef struct {
         struct { uint32_t stage, kind, slot; uint64_t address; size_t size; uint64_t handle; } desc;
         struct { nvn_render_state_t rs; } state;
         struct { uint32_t primitive, first, count, instances, base_instance; } draw;
-        struct { uint32_t primitive, count, index_type, base_vertex; uint64_t indices; } draw_indexed;
+        struct {
+            uint32_t primitive, count, index_type, base_vertex;
+            uint64_t indices;
+            /* Private copy of the index bytes taken at record time: a guest
+             * ring buffer is recycled long before a retired segment replays,
+             * and the index range is not protected by the vertex/UBO copies. */
+            uint8_t *index_data;
+            size_t index_size;
+        } draw_indexed;
         /* Copy of nvnCommandBufferUpdateUniformBuffer's payload; written to
          * dst at submit time, in recorded order (NVN semantics). */
         struct { uint64_t dst; uint32_t size; uint8_t *data; } update;
@@ -3853,6 +3861,18 @@ static int nvn_cmd_clone(nvn_cmd_t *dst, const nvn_cmd_t *src) {
             dst->u.buf_to_tex.data_size = src->u.buf_to_tex.data_size;
         }
         return 1;
+    case NVN_CMD_DRAW_INDEXED:
+        dst->u.draw_indexed.index_data = NULL;
+        dst->u.draw_indexed.index_size = 0;
+        if (!src->u.draw_indexed.index_data || !src->u.draw_indexed.index_size) return 1;
+        {
+            uint8_t *copy = malloc(src->u.draw_indexed.index_size);
+            if (!copy) return 0;
+            memcpy(copy, src->u.draw_indexed.index_data, src->u.draw_indexed.index_size);
+            dst->u.draw_indexed.index_data = copy;
+            dst->u.draw_indexed.index_size = src->u.draw_indexed.index_size;
+        }
+        return 1;
     case NVN_CMD_DISPATCH:
         /* Each copy owns its descriptor snapshot and its own reference on the
          * program state, exactly like a fresh recording. */
@@ -3887,6 +3907,11 @@ static void nvn_cmd_payload_free(nvn_cmd_t *cmd) {
         free(cmd->u.buf_to_tex.data);
         cmd->u.buf_to_tex.data = NULL;
         cmd->u.buf_to_tex.data_size = 0;
+        break;
+    case NVN_CMD_DRAW_INDEXED:
+        free(cmd->u.draw_indexed.index_data);
+        cmd->u.draw_indexed.index_data = NULL;
+        cmd->u.draw_indexed.index_size = 0;
         break;
     case NVN_CMD_DISPATCH:
         free(cmd->u.dispatch.bind);
@@ -5294,6 +5319,21 @@ static void nvnCommandBufferSetPrimitiveRestart(cb_t *c, uint32_t enable, int in
     if (nvn_trace())
         fprintf(stderr, "[totk-nvn] SetPrimitiveRestart enable=%u index=%d\n", enable, index);
 }
+/* Deep-copy the index bytes of a recorded DrawElements.  The guest reuses its
+ * index ring buffer between recording and the queued segment replay, so the
+ * address alone is not enough for a deferred draw. */
+static void nvn_cb_snapshot_indices(nvn_cmd_t *cmd, int type, int count, uint64_t index) {
+    if (!cmd || !index || count <= 0) return;
+    size_t isz = type == 0 ? 1u : type == 1 ? 2u : 4u;
+    size_t n = (size_t)count * isz;
+    if (n > (64u << 20)) return;
+    uint8_t *copy = malloc(n);
+    if (!copy) return;
+    memcpy(copy, (const void *)(uintptr_t)index, n);
+    cmd->u.draw_indexed.index_data = copy;
+    cmd->u.draw_indexed.index_size = n;
+}
+
 static void nvnCommandBufferDrawElements(cb_t *c, int mode, int type, int count,
                                          uint64_t index) {
     if (!c || c->magic != NVN_MAGIC('C', 'M', 'D', 'B')) { nvn_fail("nvnCommandBufferDrawElements", "invalid command buffer"); return; }
@@ -5306,6 +5346,7 @@ static void nvnCommandBufferDrawElements(cb_t *c, int mode, int type, int count,
         cmd->u.draw_indexed.index_type = (uint32_t)type;
         cmd->u.draw_indexed.base_vertex = 0;
         cmd->u.draw_indexed.indices = index;
+        nvn_cb_snapshot_indices(cmd, type, count, index);
     }
     c->draw_count += count;
     nvn_cb_draw_snapshot(c);
@@ -5329,6 +5370,7 @@ static void nvnCommandBufferDrawElementsBaseVertex(cb_t *c, int mode, int type, 
         cmd->u.draw_indexed.index_type = (uint32_t)type;
         cmd->u.draw_indexed.base_vertex = (uint32_t)base_vertex;
         cmd->u.draw_indexed.indices = index;
+        nvn_cb_snapshot_indices(cmd, type, count, index);
     }
     c->draw_count += count;
     if (nvn_trace())
@@ -7104,7 +7146,9 @@ static uint32_t nvn_translate_commands(const cb_t *cb, GfxCmd *out, uint32_t max
             out[n].u.draw_indexed.count = c->u.draw_indexed.count;
             out[n].u.draw_indexed.index_type = c->u.draw_indexed.index_type;
             out[n].u.draw_indexed.base_vertex = c->u.draw_indexed.base_vertex;
-            out[n].u.draw_indexed.indices = (const void *)(uintptr_t)c->u.draw_indexed.indices;
+            out[n].u.draw_indexed.indices = c->u.draw_indexed.index_data
+                ? (const void *)c->u.draw_indexed.index_data
+                : (const void *)(uintptr_t)c->u.draw_indexed.indices;
             out[n].u.draw_indexed.index_size = (size_t)c->u.draw_indexed.count *
                 (c->u.draw_indexed.index_type == 2 ? 4 :
                  c->u.draw_indexed.index_type == 1 ? 2 : 1);
@@ -8153,6 +8197,7 @@ static void nvn_exec_gpu_commands(const nvn_cmd_t *cmds, uint32_t ncmds,
  * clear-only target of a UI/atlas buffer is never treated as its scene pass. */
 static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
     int drew = 0;
+    uint32_t tl_count = 0, tl_streams = 0, tl_stream0 = 0;
     pthread_mutex_lock(&g_retired_lock);
     nvn_retired_t *e = NULL;
     for (unsigned i = 0; i < NVN_RETIRED_MAX; i++)
@@ -8510,6 +8555,11 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
             uint32_t nowned = 0;
             uint32_t nstreams = nvn_build_vertex_streams(bs, streams, 24, owned, 16,
                                                          &nowned, sg->draw_count);
+            if (nvn_ui_seg_want() && lw <= 512) {
+                tl_count = count;
+                tl_streams = nstreams;
+                tl_stream0 = nstreams ? (uint32_t)streams[0].size : 0;
+            }
             if (getenv("TOTK_ANDROID_TRACE_SCENE_STEPS"))
                 fprintf(stderr, "[totk-scene-step] execute begin streams=%u\n", nstreams);
             {
@@ -8657,6 +8707,10 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
     int vp[4] = { 0, 0, 0, 0 }, sc[4] = { 0, 0, 0, 0 };
     uint32_t v0 = 0, v1 = 0, v2 = 0, v3 = 0;
     uint32_t dbg_tex0 = 0, dbg_tex1 = 0;
+    uint32_t ndraw_cmd = 0, nidx_cmd = 0, idx_type = 0, idx_count = 0;
+    uint32_t idx_prim = 0;
+    uint64_t idx_ptr = 0;
+    uint32_t idxv[6] = { 0, 0, 0, 0, 0, 0 };
     if (nvn_ui_seg_want()) {
         /* Compact per-segment geometry/state evidence: a segment can "draw"
          * (the backend call succeeds) and still cover no pixels when its
@@ -8669,10 +8723,46 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
             } else if (cc->kind == NVN_CMD_SET_SCISSOR) {
                 sc[0] = cc->u.rect.x; sc[1] = cc->u.rect.y;
                 sc[2] = cc->u.rect.width; sc[3] = cc->u.rect.height;
+            } else if (cc->kind == NVN_CMD_DRAW) {
+                ndraw_cmd++;
+            } else if (cc->kind == NVN_CMD_DRAW_INDEXED) {
+                if (!nidx_cmd) {
+                    idx_type = cc->u.draw_indexed.index_type;
+                    idx_count = cc->u.draw_indexed.count;
+                    idx_prim = cc->u.draw_indexed.primitive;
+                    idx_ptr = cc->u.draw_indexed.indices;
+                    const uint8_t *src = cc->u.draw_indexed.index_data
+                        ? cc->u.draw_indexed.index_data
+                        : (const uint8_t *)(uintptr_t)cc->u.draw_indexed.indices;
+                    for (uint32_t k = 0; k < 6 && k < idx_count && src; k++) {
+                        if (idx_type == 0) idxv[k] = src[k];
+                        else if (idx_type == 1) { uint16_t v = 0; memcpy(&v, src + k * 2, 2); idxv[k] = v; }
+                        else { uint32_t v = 0; memcpy(&v, src + k * 4, 4); idxv[k] = v; }
+                    }
+                }
+                nidx_cmd++;
             }
         }
         dbg_tex0 = bs->tex_mask[0][0];
         dbg_tex1 = bs->tex_mask[1][0];
+        /* Index-range check: does the guest ring buffer still hold the bytes
+         * that were recorded?  A deferred segment must use the snapshot. */
+        for (uint32_t ci = 0; ci < sg->ncmds; ci++) {
+            const nvn_cmd_t *cc = &e->cmds[sg->first_cmd + ci];
+            if (cc->kind != NVN_CMD_DRAW_INDEXED) continue;
+            if (cc->u.draw_indexed.index_data && cc->u.draw_indexed.index_size >= 4) {
+                uint32_t now = 0;
+                memcpy(&now, (const void *)(uintptr_t)cc->u.draw_indexed.indices, 4);
+                uint32_t was = 0;
+                memcpy(&was, cc->u.draw_indexed.index_data, 4);
+                if (now != was)
+                    fprintf(stderr, "[totk-ui-seg] IDX CHANGED seg=%u type=%u count=%u"
+                                    " addr=%#llx now=%08x was=%08x\n", seg_index,
+                            cc->u.draw_indexed.index_type, cc->u.draw_indexed.count,
+                            (unsigned long long)cc->u.draw_indexed.indices, now, was);
+            }
+            break;
+        }
         if ((bs->vb_mask & 1u) && bs->vb[0].address) {
             const uint8_t *v = (const uint8_t *)(uintptr_t)bs->vb[0].address;
             memcpy(&v0, v, 4); memcpy(&v1, v + 4, 4);
@@ -8692,11 +8782,18 @@ static int nvn_submit_scene_snapshot(uint64_t handle, uint32_t seg_index) {
     if (nvn_ui_seg_want())
         fprintf(stderr, "[totk-ui-seg] run handle=%#llx seg=%u %ux%u draws=%u rp=%p"
                         " pstate=%p warm=%d drew=%d vp=%d,%d %dx%d sc=%d,%d %dx%d"
-                        " tex=%#x/%#x v0=%08x %08x %08x %08x\n",
+                        " tex=%#x/%#x dcmd=%u icmd=%u itype=%u iprim=%u icount=%u iptr=%#llx"
+                        " idx=%u,%u,%u,%u,%u,%u vb=%#llx/%zu tl=%u/%u/%u"
+                        " v0=%08x %08x %08x %08x\n",
                 (unsigned long long)handle, seg_index, lw, lh, ndraws, (void *)rp,
                 (void *)sg_pstate, sg_warm, drew,
                 vp[0], vp[1], vp[2], vp[3], sc[0], sc[1], sc[2], sc[3],
-                dbg_tex0, dbg_tex1, v0, v1, v2, v3);
+                dbg_tex0, dbg_tex1, ndraw_cmd, nidx_cmd, idx_type, idx_prim, idx_count,
+                (unsigned long long)idx_ptr, idxv[0], idxv[1], idxv[2], idxv[3],
+                idxv[4], idxv[5],
+                (unsigned long long)bs->vb[0].address, bs->vb[0].size,
+                tl_count, tl_streams, tl_stream0,
+                v0, v1, v2, v3);
     if (nvn_trace_frame())
         fprintf(stderr, "[totk-frame] scene submit handle=%#llx seg=%u rt=%p %ux%u"
                         " color0=%p cmd=[%u,%u) draws=%u program=%p pipeline=%p"
