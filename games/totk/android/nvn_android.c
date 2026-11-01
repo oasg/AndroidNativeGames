@@ -7347,13 +7347,23 @@ static void nvn_warm_recording(void *vc) {
     int window_pass = have_window && window_texture &&
                       nvn_layout_matches_window(w, &layout, rw, rh);
     uint32_t fmt = window_pass ? nvn_window_format(w) : layout.color_formats[0];
+    /* Same depth-free window layout the submit path uses. */
+    GfxRenderTargetLayout wlayout;
+    const GfxRenderTargetLayout *pl = &layout;
+    if (window_pass) {
+        uint32_t ww = 0, wh = 0;
+        nvn_window_layout(w, &wlayout, &ww, &wh);
+        wlayout.depth_format = 0;
+        pl = &wlayout;
+        if (!fmt) fmt = wlayout.color_formats[0];
+    }
     GfxVertexLayout input;
     uint64_t vertex_sig = 0;
     const nvn_bind_state_t *wbs = nvn_cb_draw_state(cb);
     nvn_build_vertex_layout(wbs, &input, &vertex_sig);
     char variant[192];
     nvn_variant_suffix(p, cb, variant, sizeof variant);
-    (void)nvn_program_cached_pipeline(p, fmt, &layout, window_pass,
+    (void)nvn_program_cached_pipeline(p, fmt, pl, window_pass,
                                       input.nattributes ? &input : NULL,
                                       vertex_sig, variant, 1);
 }
@@ -7611,8 +7621,10 @@ static void nvn_trace_segment_inputs(const char *tag, cb_t *view,
             const tex_bridge_t *b = nvn_tex_bridge(t, 0);
             char src[64];
             if (!g) snprintf(src, sizeof src, "none");
-            else if (b && b->rt_valid && b->rt_frame == b->rt_uploaded)
-                snprintf(src, sizeof src, "rt-gen=%llu", (unsigned long long)b->rt_frame);
+            else if (b && b->rt_valid)
+                snprintf(src, sizeof src, "rt-%s=%llu",
+                         b->rt_frame == b->rt_uploaded ? "gen" : "pending",
+                         (unsigned long long)b->rt_frame);
             else snprintf(src, sizeof src, "guest");
             fprintf(stderr, "[totk-frame] %s   tex st=%d slot=%d handle=%#llx tid=%d"
                             " tex=%p tgt=%d fmt=%#x %ux%u lv=%u layers=%u"
@@ -9385,11 +9397,22 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
         if (!reflected && has_program) {
             char variant[192];
             nvn_variant_suffix(p, cb, variant, sizeof variant);
-            uint32_t pf = window_pass ? nvn_window_format(w)
-                                      : (have_layout ? layout.color_formats[0] : 0);
-            reflected = nvn_program_cached_pipeline(p, pf,
-                                                    have_layout ? &layout : NULL,
-                                                    window_pass,
+            /* A window pass draws into the host surface, which has the window's
+             * format and no depth attachment.  The recorded layout may carry a
+             * depth target (the offscreen composite it samples), and passing it
+             * here creates a pipeline the window target cannot match. */
+            GfxRenderTargetLayout wlayout;
+            const GfxRenderTargetLayout *pl = have_layout ? &layout : NULL;
+            uint32_t pf = have_layout ? layout.color_formats[0] : 0;
+            if (window_pass) {
+                uint32_t ww = 0, wh = 0;
+                nvn_window_layout(w, &wlayout, &ww, &wh);
+                wlayout.depth_format = 0;
+                pl = &wlayout;
+                pf = nvn_window_format(w);
+                if (!pf) pf = wlayout.color_formats[0];
+            }
+            reflected = nvn_program_cached_pipeline(p, pf, pl, window_pass,
                                                     input.nattributes ? &input : NULL,
                                                     vertex_sig, variant, 1);
         }
@@ -9431,6 +9454,34 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                                                                   translated, count,
                                                                   has_clear ? clear : NULL,
                                                                   streams, nstreams);
+            if (window_pass && nvn_trace_composite()) {
+                static unsigned wp_logged;
+                if (wp_logged++ < 6) {
+                    fprintf(stderr, "[totk-frame] window-pass cb=%p rp=%p count=%u draws=%d"
+                                    " streams=%u clear=%d texmask=%#x/%#x va=%#x vb=%#x"
+                                    " vb0=%#llx/%zu\n", (void *)cb, (void *)reflected, count,
+                            cb->draw_count, nstreams, has_clear, bend.tex_mask[0][0],
+                            bend.tex_mask[1][0], bend.va_mask, bend.vb_mask,
+                            (unsigned long long)bend.vb[0].address, bend.vb[0].size);
+                    for (uint32_t ci = 0; ci < count && ci < 16; ci++) {
+                        const GfxCmd *g = &translated[ci];
+                        if (g->kind == GFX_CMD_DRAW)
+                            fprintf(stderr, "[totk-frame] window-pass   draw prim=%u"
+                                            " first=%u count=%u blend=%u\n",
+                                    g->u.draw.primitive, g->u.draw.first, g->u.draw.count,
+                                    g->u.draw.state.blend_enable);
+                        else if (g->kind == GFX_CMD_DRAW_INDEXED)
+                            fprintf(stderr, "[totk-frame] window-pass   drawi prim=%u"
+                                            " count=%u type=%u\n", g->u.draw_indexed.primitive,
+                                    g->u.draw_indexed.count, g->u.draw_indexed.index_type);
+                        else if (g->kind == GFX_CMD_CLEAR_COLOR)
+                            fprintf(stderr, "[totk-frame] window-pass   clear rgba=%.3f,"
+                                            "%.3f,%.3f,%.3f mask=%#x\n", g->u.clear.rgba[0],
+                                    g->u.clear.rgba[1], g->u.clear.rgba[2], g->u.clear.rgba[3],
+                                    g->u.clear.mask);
+                    }
+                }
+            }
             else
                 drew = gfx_backend_reflected_execute_ex(reflected, rt, translated, count,
                                                         has_clear ? clear : NULL,
