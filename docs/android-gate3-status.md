@@ -1,7 +1,7 @@
 # Android Gate 3 status and known boundaries
 
 Date: 2026-11-02  
-Main: `4efb8c5` (`merge: L2 route the window present through the sampled RT`)  
+Main: `7715d9b` (`threads/android: stop virtual-core starvation on host waits and SVCs`)  
 Device: 2721dfe4, Adreno 830, `com.totk.android`
 
 ## 1. Summary
@@ -43,9 +43,9 @@ merge commits.
 | --- | --- | --- |
 | 1. 360x69 UI source `first_nz != none` | **pass only in the no-save/loading state** | empty-save run: 42/64/146-colour 43x5/67x5 loading strip; real-save runs record no 360x69 at all |
 | 2. 0x3f non-zero | pass, but it is the **clear/fade colour** | `a68a565f` decodes to B10G11R11 `(0.0498, 0.0791, 0.1191)` = the pass clear |
-| 3. 1920x1080 window multi-colour + title/save UI | **pass host-side (present target)** | `wip.ppm` 1920x1080: 587 colours, bg tan `a68a56`, 360x69 UI bbox (52,959)-(411,1027), 24,840 non-bg; `wiwin-1000` 73 colours. Real Surface not tested (device locked) |
+| 3. 1920x1080 window multi-colour + title/save UI | **host-side pass; app real Surface content pending** | `wip.ppm` 1920x1080: 587 colours, bg tan `a68a56`, 360x69 UI bbox (52,959)-(411,1027), 24,840 non-bg; app real Surface now presents 16,104/22,002 frames but shows the host clear `(13,20,31)` + status overlay (content path in progress) |
 | 4. A/Continue into 3D | **fail** | opening-field phase reaches 180x112/720x450/1920x1080 0x7a; the 8,427-draw UI/field batches still never execute; no 3D frame |
-| 5. 30 min / 10k presents stable | not run to gate | longest observed run 9,697 presents without a crash (newest 1,856-present run) |
+| 5. 30 min / 10k presents stable | **partial** | app real Surface 16,104 presents (22,002 in a later run), zero `[totk-stall]` across 4-5 minute runs; 30-minute run not yet done |
 
 ## 4. Key findings
 
@@ -196,76 +196,82 @@ change in both places:
 GfxOffscreenTarget *t = w->present_target ? w->present_target : w->gfx_target;
 ```
 
-## 5. App shell (parallel work)
+## 5. App shell (real Surface)
 
-The app shell is isolated in
+The app shell lives in
 `/Users/oasis/.local/share/opencode/worktree/9bf67f/app-tls` (branch
-`app/tls-shell`, now `3270628` after merging main's renderer fixes). The TLS
-blocker is solved:
+`app/tls-shell`). Key commits: `d93d565` (TLS), `3270628` (main renderer merge),
+`cec9be4` (lazy account UID), `539b07a1` (data/crash diagnostics), `e0a5d7a`
+(RT cache), `88f4904` (Lane 3 core deadlock).
 
-- APK builds/installs; the three guest images are packed as
-  `lib<name>_patched.so` so the loader can `mmap(PROT_EXEC)` them from
+- **TLS**: bionic `pthread_key_create` returns `0x80000000 | n`; the slot base
+  is thread/layout dependent. The loader discovers both slots once by scanning
+  the thread's TLS mapping and verifies the same offsets on every thread.
+  Measured `off=0x198` / `0x1a8`; boot reaches `mapped all` → constructors →
+  `ENTER nnMain`.
+- **Guest images**: packed as `lib<name>_patched.so`, mapped PROT_EXEC from
   `/data/app/.../lib/arm64` (external FUSE denies executable mappings).
-- Bionic `pthread_key_create` returns `0x80000000 | n`, stores the value in a
-  16-byte record, and the TLS-slot base is thread/layout dependent. The fix
-  scans the thread's TLS mapping (from `/proc/self/maps`) for the pointers just
-  stored, rejecting the 64-byte-aligned `__thread` copies, and verifies the same
-  offsets on every later thread.
-- Measured: `tls tp=... host_key=-2147483627 off=0x198 ... guest_key=-2147483626
-  off=0x1a8 ...`; boot reaches `mapped all`, constructors, `ENTER nnMain`, save
-  mount (zero-UID adoption picks `f9cd…`), `vi host native window 1920x1080`,
-  and 808 presents.
-- CLI probes PASS with the same fix (`probe-vulkan`, `probe-nvn-state`,
-  `probe-nvn-copy`, `boot-sdk` loader-ready).
-- The real Surface only received 3 presents: the display was OFF and the MIUI
-  keyguard owned focus (`surfaceDestroyed` at 22:02:42), so the renderer stayed
-  offscreen. This is environmental, not a code path: `input keyevent` is denied
-  on this ROM, `/dev/input` is SELinux-denied, and MIUI denies `showWhenLocked`
-  to `com.totk.android`.
-- Next blocker after TLS: an HLE lock/futex deadlock. Both cores were held for
-  127 s; the owner is a host frame in `libc.so+0xa6020` while holding the core
-  lock (`guest=0`), with waiters at `sdk+0xde1888` (later
-  `nn::os::TryPeekLightMessageQueue+0x80`).
-- The branch now merges main's renderer fixes (`3270628`) and the APK was
-  rebuilt with them; it includes the TLS fix plus the text/atlas/present fixes.
-
-### Device recovery needed (human unlock)
-
-A reboot to escape the display-off/keyguard loop left the device in Direct Boot
-with a lock credential. Activities no longer resolve, `adb install` is blocked,
-and a failed reinstall removed `com.totk.android`; the 6.6 GB app external data
-was removed with it. CLI data under `/data/local/tmp/totk-android` is intact.
-
-1. Unlock the phone once (PIN/pattern/fingerprint).
-2. `adb install -r --no-incremental \
-   /Users/oasis/.local/share/opencode/worktree/9bf67f/app-tls/games/totk/android/app/build/totk-android.apk`
-3. Re-create `/sdcard/Android/data/com.totk.android/files/{game,romfs,profile,shader-cache}`
-   (the 6.6 GB romfs copy was deleted).
-4. `adb shell svc power stayon true` after unlocking, then launch with
-   `--es account_uid f9cdd55b6d4c70efc1c8e47378dad985`.
+- **Data ownership crash (root cause of the null VI/account object)**: the app
+  UID changed on reinstall (`10340`/`u0_a340`), while the external
+  `files/romfs`/`profile` dirs were still owned by the previous UID
+  (`10280`/`u0_a280`, group `ext_data_rw` = 1078). The app was not in that
+  group, so Scoped Storage denied traversal and the guest got a null heap in the
+  boot resource loader (`main+0x1123f7c`, `strb wzr,[x0,#8]`). The data was
+  recreated as readable copies (`romfs`, `profile-rw`, `shader-cache-rw`,
+  `game`), `chmod -R a+rX` (`a+rwX` for profile/cache), and the save backed up
+  to `/data/local/tmp/totk-save-backup/save`.
+- **App shell diagnostics**: always-on guest crash stack, system-property traces
+  (`debug.totk.*`), `MountRom` unreadable-root reporting, and a
+  `profile-rw`/`shader-cache-rw` fallback in `MainActivity`.
+- **Render-target cache**: the boot logo creates a new guest target each frame;
+  the 128-entry RT cache had no eviction. Added LRU eviction/reuse (never the
+  current present/scene RT; `nvn_tex_forget_rt` clears sampled copies). Headless
+  boot: `creates=1984 live=128 evictions=1856`, zero `cache full`. App: 453
+  presents past the logo, zero `cache full`.
+- **Virtual-core deadlock**: Android `services_android.c` never called
+  `runtime_core_checkpoint()` at SVCs, and the LightMessageQueue lock loop uses
+  SVC `0x36` (`SynchronizePreemptionState`). Added the checkpoint/SVC `0x36`,
+  unblocked SIGUSR2 for loader/guest threads, allowed the SIGUSR2 handler to
+  switch a core stopped at a blocking futex/`clock_nanosleep`, released cores
+  around blocking fs/romfs/fsp reads, and split `g_prog_lock` around shader
+  cache/pipeline creation. Real app: `startup logo finished`, 16,104 real
+  swapchain `surface target present #` (22,002 in a later run), **zero
+  `[totk-stall]`** across 4–5 minute runs. Screenshot
+  `/tmp/lane3g-shot-final.png`.
+- **Current content gap**: the real Surface still shows the host clear
+  `(13,20,31)` plus the status overlay, not the title/save UI. The app logs
+  `nvnCommandBufferBindStorageBuffer: invalid binding` at the logo→title
+  transition and the RT churn continues. `wip.ppm` (the host-side present
+  target) already contains the 587-colour/360x69 UI; the remaining work is
+  mapping that RT into the real-surface present (Lane 2).
+- **Main integration**: RT cache `ce57f74`, Lane 3 shared runtime
+  `7715d9b`; the app shell commits stay on `app/tls-shell`.
+- Device: unlocked; data readable; save backed up. The display times out after
+  ~70 s and destroys the Surface, so keep the screen on for long runs.
 
 ## 6. Remaining options
 
-1. **Real Android Surface + app HLE deadlock.** The real-surface branch already
-   presents the text RT; the app boots to `nnMain` + save mount + a 1920x1080
-   window, then deadlocks holding a core lock in `libc.so+0xa6020` (inside
-   `syscall`) with waiters at `sdk+0xde1888`. The device is locked in Direct
-   Boot and the app was uninstalled; unlock once, reinstall the fixed APK from
-   `app/tls-shell` (`d93d565`), and restore the external data. Then instrument
-   the HLE lock/futex owner and the `TryPeekLightMessageQueue` waiter.
+1. **Real-Surface content (Lane 2, in progress).** The app now presents 16k+
+   frames to the real swapchain with zero stalls, but the Surface is the host
+   clear `(13,20,31)` + status overlay, not the title/save UI. The logo→title
+   transition logs `nvnCommandBufferBindStorageBuffer: invalid binding` and RT
+   churn continues. Trace the invalid binding (stage/index/handle/size) and the
+   window present RT vs the sampler RT; `wip.ppm` already has the 587-colour /
+   360x69 UI. This is the last host-renderer step for the app.
 2. **8,427-draw / opening-field 3D.** The 400x225/64x64 `0x3f` UI batches still
    show `queued=1` in the Phive/opening-field state; the 3D field has not been
    reached. This is the remaining Gate 4 item, not the text/UI path.
-3. **Headless present fallback (optional).** The no-surface `present #` and
-   `runtime_native_window_screenshot()` still use `w->gfx_target`; use
-   `w->present_target ? w->present_target : w->gfx_target` to make them show the
-   same 587-colour present PPM.
-4. **Stability.** Run 30 min / 10k presents on the real surface; the newest
-   successful host-side run reached 1,856 presents and 2,290 presents in the
-   prior run, with occasional early-boot stalls under device load.
-5. **Accept the boundary.** The host-side Gate 3 UI evidence is now met
-   (`wip.ppm`, 587 colours, 360x69 UI bbox); the app window and 3D field remain
-   open.
+3. **Stability.** Run 30 min on the real Surface (16,104/22,002 presents already
+   reached with zero stalls). The display times out after ~70 s and destroys the
+   Surface; add `FLAG_KEEP_SCREEN_ON` or keep the screen on for the long run.
+4. **App data/UID.** The external data is now readable copies
+   (`romfs`/`profile-rw`/`shader-cache-rw`/`game`); the save is backed up at
+   `/data/local/tmp/totk-save-backup/save`. Keep the data owner aligned with the
+   app UID on reinstall; otherwise Scoped Storage denies romfs and the guest
+   crashes with the null resource heap.
+5. **Accept the boundary.** The host-side Gate 3 UI evidence is met (`wip.ppm`,
+   587 colours, 360x69 UI bbox); the app now runs/presents (Lane 3), and the
+   Surface content + 3D field remain open.
 
 ## 7. Reproduce
 
