@@ -131,6 +131,9 @@ unsigned runtime_romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buf
     if (!out || !runtime_romfs_handle(h) || offset < 0 || (!buffer && size)) return INVALID;
     Entry *e = &entries[h - HANDLE_BASE];
     if (e->fd <= 0) return INVALID;
+    /* Blocking host I/O is a kernel wait on Horizon: do not keep the virtual
+     * core while the guest thread waits for storage. */
+    int away __attribute__((cleanup(runtime_core_back))) = runtime_core_away();
     uint64_t done = 0;
     while (done < size) {
         ssize_t n = pread(e->fd, (uint8_t *)buffer + done, (size_t)(size - done), (off_t)(offset + (int64_t)done));

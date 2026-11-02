@@ -363,6 +363,11 @@ static unsigned read_file(uint64_t *out, uint64_t h, int64_t offset, void *buffe
     int fd, mode; if (!out || offset < 0 || (!buffer && size) || !file_of(h, &fd, &mode)) return R_INVALID_ARGUMENT;
     if (!(mode & OPEN_READ)) return R_OPEN_MODE;
     dm_guest_write_prepare(buffer, (size_t)size);
+    /* A blocking host read is a kernel wait on Horizon: the guest thread does
+     * not own a core while it waits, so a better thread may run.  Without this
+     * a FUSE read of several seconds kept core 0 and starved every worker
+     * masked to it (the 5 s stall seen at boot). */
+    int away __attribute__((cleanup(runtime_core_back))) = runtime_core_away();
     uint64_t done = 0;
     while (done < size) { ssize_t n = pread(fd, (uint8_t *)buffer + done, (size_t)(size - done), offset + (off_t)done); if (n < 0) runtime_fail("host save read failure"); if (!n) break; done += (uint64_t)n; }
     *out = done; return 0;
@@ -380,6 +385,7 @@ static unsigned write_file(uint64_t h, int64_t offset, const void *buffer, uint6
         static int delay_ms = -1; if (delay_ms < 0) { const char *e = getenv("TOTK_SAVE_WRITE_DELAY_MS"); delay_ms = e ? atoi(e) : 0; }
         if (delay_ms > 0) usleep((useconds_t)delay_ms * 1000);   /* tests only: slow saves down so a window close lands in the middle of one */
     }
+    int away __attribute__((cleanup(runtime_core_back))) = runtime_core_away();
     while (done < size) { ssize_t n = pwrite(fd, (const uint8_t *)buffer + done, (size_t)(size - done), offset + (off_t)done); if (n <= 0) runtime_fail("host save write failure"); done += (uint64_t)n; }
     if (option && (*option & 1)) fsync(fd);
     return 0;

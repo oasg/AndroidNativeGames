@@ -6642,6 +6642,12 @@ static uint32_t nvn_program_set_shaders(prog_t *p, int n, const void *shaders,
     }
     p->nstage = (uint32_t)n;
 
+    /* This path reads the offline shader cache (and, after the unlock below,
+     * may create a pipeline) while holding g_prog_lock.  Do not keep a virtual
+     * core across it: a waiter that owns a core and blocks on g_prog_lock is
+     * the 5 s stall seen at boot.  The core is retaken when this call returns
+     * to guest code (cleanup). */
+    int away_sc __attribute__((cleanup(runtime_core_back))) = runtime_core_away();
     pthread_mutex_lock(&g_prog_lock);
     prog_shader_state_t *s = prog_state_find(p);
     if (!s) {
@@ -6792,6 +6798,10 @@ static uint32_t nvnProgramSetShadersExt(prog_t *p, int n, const void *shaders) {
     return nvn_program_set_shaders(p, n, shaders, 0x18, "nvnProgramSetShadersExt");
 }
 static int nvn_read_file(const char *path, uint8_t **out, size_t *size) {
+    /* No runtime_core_away here: nvn_program_cached_pipeline calls this with
+     * g_prog_lock held, and releasing the virtual core under a host mutex lets
+     * the next thread block on that mutex while holding the core (lock/core
+     * inversion).  The combined shader-cache path needs the lock split first. */
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
@@ -7053,6 +7063,27 @@ static GfxReflectedPipeline *nvn_program_cached_pipeline(prog_t *p, uint32_t nvn
                     (unsigned long long)vertex_sig, (unsigned long long)variant_sig);
         pthread_mutex_unlock(&g_prog_lock);
         return NULL;
+    }
+    /* The creation path parses the shader/resource JSON and calls the Vulkan
+     * driver.  A guest thread that wants g_prog_lock must not be left holding
+     * a virtual core while this thread sits in that I/O: that is the host
+     * lock / virtual core inversion seen as a 5 s stall (owner in
+     * nvn_program_set_shaders -> __svfscanf, waiters queued for its core).
+     * Release the core for the miss path only, then re-check the cache because
+     * another thread may have published the same pipeline while we were out. */
+    pthread_mutex_unlock(&g_prog_lock);
+    int away __attribute__((cleanup(runtime_core_back))) = runtime_core_away();
+    pthread_mutex_lock(&g_prog_lock);
+    s = prog_state_find(p);
+    if (!s || (s->loaded & ((1u << 0) | (1u << 1))) != ((1u << 0) | (1u << 1))) {
+        pthread_mutex_unlock(&g_prog_lock);
+        return NULL;
+    }
+    cached = prog_pipe_find(s, fmt, layout_sig, vertex_sig, variant_sig);
+    if (cached) {
+        s->pipeline = cached;
+        pthread_mutex_unlock(&g_prog_lock);
+        return cached;
     }
     if (strcmp(s->variant, variant ? variant : "")) {
         for (unsigned st = 0; st < 2; st++) {

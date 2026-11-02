@@ -101,6 +101,7 @@ static void storage_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs
         if (read && rq->nb && rq->b[0].size) {
             if (read > rq->b[0].size) read = rq->b[0].size;
             void *dst = ipc_guest(rq->b[0].addr, read);
+            int away __attribute__((cleanup(runtime_core_back))) = runtime_core_away();
             ssize_t got = pread(st->fd, dst, (size_t)read, (off_t)offset);
             if (got < 0) { rs->result = FS_RESULT_BAD_PATH; return; }
             read = (uint64_t)got;
@@ -174,6 +175,7 @@ static void file_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
         if (rq->nb && rq->b[0].size) {
             if (size > rq->b[0].size) size = rq->b[0].size;
             void *dst = ipc_guest(rq->b[0].addr, size);
+            int away __attribute__((cleanup(runtime_core_back))) = runtime_core_away();
             ssize_t got = pread(f->fd, dst, (size_t)size, (off_t)offset);
             if (got < 0) { rs->result = FS_RESULT_BAD_PATH; return; }
             read = (uint64_t)got;
@@ -188,6 +190,7 @@ static void file_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
         memcpy(&size, rq->data + 8, 8);
         if (size > rq->a[0].size) size = rq->a[0].size;
         void *src = ipc_guest(rq->a[0].addr, size);
+        int away __attribute__((cleanup(runtime_core_back))) = runtime_core_away();
         ssize_t put = pwrite(f->fd, src, (size_t)size, (off_t)offset);
         if (put < 0) { rs->result = FS_RESULT_BAD_PATH; return; }
         uint64_t written = (uint64_t)put;

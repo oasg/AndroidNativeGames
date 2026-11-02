@@ -307,7 +307,16 @@ static void query_memory(uint64_t out, uint64_t addr) {
     }
 }
 
+/* The macOS services layer calls this before dispatching every SVC (services.c:
+ * runtime_svc).  The Android layer used to rely only on the SIGUSR2 async
+ * preemption path, so a guest spin loop that does enter an SVC (the SDK's
+ * LightMessageQueue lock loop calls SVC 0x36 while it is contended) could never
+ * hand its virtual core to a better waiter.  Keep the same preemption point as
+ * the other host: cheap when no waiter beats this thread. */
+void runtime_core_checkpoint(void);
+
 uint64_t runtime_svc(unsigned num, uint64_t *r, const char *module, uint64_t offset) {
+    runtime_core_checkpoint();
     static int trace = -1;
     if (trace < 0) trace = getenv("TOTK_ANDROID_TRACE_SVC") != NULL;
     /* Low-noise SVC histogram for boot stalls: tells whether a hot
@@ -460,6 +469,10 @@ uint64_t runtime_svc(unsigned num, uint64_t *r, const char *module, uint64_t off
             r[0] = 0; return 0;
         }
         case 0x27: { size_t n = (size_t)r[1]; if (n > 65536) n = 65536; fwrite((void *)(uintptr_t)r[0], 1, n, stderr); r[0] = 0; return 0; }
+        /* SynchronizePreemptionState (Horizon 8.0.0+).  The SDK's user-space
+         * locks issue it while they spin on a contended lock.  It has no work
+         * for this host; the SVC-entry checkpoint above is the useful part. */
+        case 0x36: r[0] = 0; return 0;
         case 0x29: r[0] = 0; r[1] = get_info((unsigned)r[1]); return 0;
         case 0x2c: { /* MapPhysicalMemory(addr, size): commit guest pages */
             uint64_t addr = r[0], size = r[1];

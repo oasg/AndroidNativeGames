@@ -510,9 +510,27 @@ static int g_android_async_preempt;    // kicks actually switch cores
 static int g_android_trace_preempt;    // TOTK_ANDROID_TRACE_PREEMPT
 static uint64_t g_android_preempt_kicks, g_android_preempt_suppressed, g_android_preempt_fail;
 static uint64_t g_android_preempt_async, g_android_preempt_not_top, g_android_preempt_busy;
+static uint64_t g_android_preempt_host;   // switch made on a thread blocked in a host syscall
 static uint64_t g_android_handler_entries, g_android_samples, g_android_trace_lines;
 static __thread int g_android_in_handler;
 static void android_preempt_signal(int sig, siginfo_t *si, void *ctx);
+/* ART and the Android framework keep their own signal masks, and a thread
+ * inherits the mask of the pthread that created it.  A guest thread created
+ * from an ART worker therefore arrives with SIGUSR2 blocked: pthread_kill
+ * succeeds but the handler never runs, so neither async core preemption nor
+ * the stall sampler sees the thread.  Unblock it on every thread that can run
+ * guest code (the loader/main thread and each CreateThread worker). */
+static void android_unblock_preempt_signal(void) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR2);
+    int e = pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+    if (e) {
+        static int reported;
+        if (__atomic_fetch_add(&reported, 1, __ATOMIC_RELAXED) < 4)
+            fprintf(stderr, "[threads] could not unblock SIGUSR2 (%d): async preemption may be delayed\n", e);
+    }
+}
 static int android_async_preempt_init(void) {   // idempotent; first caller holds G
     if (g_android_preempt_ready) return g_android_async_preempt;
     g_android_preempt_ready = 1;
@@ -554,6 +572,27 @@ static uint64_t android_kick_gap_ns(void) {
     }
     return (uint64_t)v;
 }
+/* A thread stopped at a blocking host syscall is in the kernel: it holds no
+ * host mutex of its own (a futex wait owns nothing until it returns) and cannot
+ * release the virtual core through the HLE path.  If a better guest waiter
+ * wants that core, let it run, exactly as runtime_core_away() would.  Only the
+ * waiting syscalls qualify; read/write can be reached with a host lock held
+ * (the shader cache reads under g_prog_lock), so they are not included. */
+static int android_host_blocking_syscall(const ucontext_t *u) {
+    uint64_t pc = (uint64_t)u->uc_mcontext.pc;
+    if (!pc) return 0;
+    uint32_t insn;
+    memcpy(&insn, (const void *)(uintptr_t)pc, sizeof insn);
+    if (insn != 0xd4000001u) return 0;                 /* svc #0 */
+    switch ((int)u->uc_mcontext.regs[8]) {
+    case 98: {                                          /* futex */
+        unsigned op = (unsigned)u->uc_mcontext.regs[1] & 0x7fu;
+        return op == 0 || op == 6 || op == 9 || op == 11;   /* WAIT / LOCK_PI / WAIT_BITSET / WAIT_REQUEUE_PI */
+    }
+    case 115: return 1;                                 /* clock_nanosleep */
+    default: return 0;
+    }
+}
 static void android_preempt_signal(int sig, siginfo_t *si, void *ctx) {
     (void)sig; (void)si;
     if (g_android_in_handler) return;   /* never recurse, whatever the signal mask says */
@@ -563,17 +602,19 @@ static void android_preempt_signal(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *u = ctx;
     uint64_t pc = (uint64_t)u->uc_mcontext.pc;
     __atomic_fetch_add(&g_android_handler_entries, 1, __ATOMIC_RELAXED);
+    int top = runtime_guest_top_level(pc);
     if (__atomic_load_n(&t->sample_want, __ATOMIC_ACQUIRE)) {   /* stall watchdog: sample wherever this thread is */
         t->sample_pc = pc;
         t->sample_lr = (uint64_t)u->uc_mcontext.regs[30];
         t->sample_fp = (uint64_t)u->uc_mcontext.regs[29];
-        t->sample_top = runtime_guest_top_level(pc);
+        t->sample_top = top;
         __atomic_store_n(&t->sample_want, 0, __ATOMIC_RELEASE);
         __atomic_fetch_add(&g_android_samples, 1, __ATOMIC_RELAXED);
     }
     if (!g_android_async_preempt) goto out;
     if (!__atomic_load_n(&t->preempt, __ATOMIC_ACQUIRE) || t->cur_core < 0) goto out;
-    if (!runtime_guest_top_level(pc)) {   /* inside an HLE host call, a rewritten gate or host code */
+    int host_block = !top && android_host_blocking_syscall(u);
+    if (!top && !host_block) {   /* inside an HLE host call, a rewritten gate or host code */
         __atomic_fetch_add(&g_android_preempt_not_top, 1, __ATOMIC_RELAXED);
         if (g_android_trace_preempt && __atomic_fetch_add(&g_android_trace_lines, 1, __ATOMIC_RELAXED) < 64)
             fprintf(stderr, "[threads] preempt skipped h=%#x pc=%#llx core=%d: not top-level guest code\n",
@@ -586,9 +627,11 @@ static void android_preempt_signal(int sig, siginfo_t *si, void *ctx) {
         if (t->cur_core >= 0 && t->preempt && core_should_yield_plain(t)) {
             core_put(t); core_take(t);
             __atomic_fetch_add(&g_android_preempt_async, 1, __ATOMIC_RELAXED);
+            if (host_block) __atomic_fetch_add(&g_android_preempt_host, 1, __ATOMIC_RELAXED);
             if (g_android_trace_preempt && __atomic_fetch_add(&g_android_trace_lines, 1, __ATOMIC_RELAXED) < 64)
-                fprintf(stderr, "[threads] preempt h=%#x pc=%#llx core=%d: core given up\n",
-                        t->handle, (unsigned long long)pc, t->cur_core);
+                fprintf(stderr, "[threads] preempt h=%#x pc=%#llx core=%d: core given up%s\n",
+                        t->handle, (unsigned long long)pc, t->cur_core,
+                        host_block ? " (host blocking syscall)" : "");
         } else t->preempt = 0;
         pthread_mutex_unlock(&G);
     } else {
@@ -686,6 +729,9 @@ __attribute__((weak)) void runtime_hle_stack_set(uintptr_t top) { (void)top; }  
 static void *thread_main(void *p) {
     thr_t *t = p;
     pthread_setspecific(g_keythr, t);
+#ifdef __ANDROID__
+    android_unblock_preempt_signal();
+#endif
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
@@ -726,6 +772,9 @@ void dm_thread_returned(void) { die("客体线程入口函数返回（Horizon �
 // 主线程登记，返回其句柄（交给 nnosInitialize 作主线程句柄）
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
 uint32_t svc_thread_main_init(void) {
+#ifdef __ANDROID__
+    android_unblock_preempt_signal();   /* the loader thread is the guest main thread */
+#endif
     pthread_key_create(&g_keythr, NULL);
     thr_t *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cv, NULL);
@@ -1393,12 +1442,13 @@ static void dump_threads(unsigned secs) {
 #endif
 #ifdef __ANDROID__
     fprintf(stderr, "[totk-dump] android preempt: kicks %llu (suppressed %llu, failed %llu), handler entries %llu,"
-                    " cores given up %llu, not-top-level %llu, G busy %llu, samples %llu\n",
+                    " cores given up %llu (host syscall %llu), not-top-level %llu, G busy %llu, samples %llu\n",
             (unsigned long long)__atomic_load_n(&g_android_preempt_kicks, __ATOMIC_RELAXED),
             (unsigned long long)__atomic_load_n(&g_android_preempt_suppressed, __ATOMIC_RELAXED),
             (unsigned long long)__atomic_load_n(&g_android_preempt_fail, __ATOMIC_RELAXED),
             (unsigned long long)__atomic_load_n(&g_android_handler_entries, __ATOMIC_RELAXED),
             (unsigned long long)__atomic_load_n(&g_android_preempt_async, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&g_android_preempt_host, __ATOMIC_RELAXED),
             (unsigned long long)__atomic_load_n(&g_android_preempt_not_top, __ATOMIC_RELAXED),
             (unsigned long long)__atomic_load_n(&g_android_preempt_busy, __ATOMIC_RELAXED),
             (unsigned long long)__atomic_load_n(&g_android_samples, __ATOMIC_RELAXED));
@@ -1543,6 +1593,14 @@ static void *stall_watchdog(void *unused) {
                 char chain[512];
                 runtime_guest_chain(clr, cfp, chain, sizeof chain);
                 fprintf(stderr, "[totk-stall]   owner guest chain (%s): %s\n", from, chain);
+            }
+            /* When the owner was interrupted in host code (a blocked syscall,
+             * a host mutex, …), the sampled LR/FP name the host call chain;
+             * print it too.  That is how a core held across a futex wait is
+             * told apart from one held across a guest spin. */
+            if (!si.sample_top && si.lr) {
+                fprintf(stderr, "[totk-stall]   owner host chain (sampled):");
+                dump_chain(si.lr, si.fp);
             }
         } else {
             fprintf(stderr, "[totk-stall]   owner pc=no sample (signal not delivered yet)\n");

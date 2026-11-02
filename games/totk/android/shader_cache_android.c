@@ -324,6 +324,10 @@ static int mkdir_p(const char *path) {
 }
 
 static int read_file(const char *path, uint8_t **out, size_t *size) {
+    /* Do NOT give the virtual core up here: callers (nvn_program_set_shaders /
+     * nvn_program_cached_pipeline) hold g_prog_lock across this read.  Handing
+     * the core to a thread that then blocks on g_prog_lock inverts host lock
+     * against virtual core (seen as a futex stall in nvnCommandBufferEndRecording). */
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
