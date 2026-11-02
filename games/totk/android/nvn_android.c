@@ -896,6 +896,28 @@ static void nvn_tex_set_rt(const tex_t *t, GfxOffscreenTarget *rt,
                 (unsigned long long)b->rt_frame);
     pthread_mutex_unlock(&g_tex_bridge_lock);
 }
+
+/* Drop every sampled-texture association that points at an RT about to be
+ * destroyed.  The host render-target cache evicts old logo/UI targets; a stale
+ * bridge->rt would otherwise dangle and a later sample would read freed memory. */
+static void nvn_tex_forget_rt(GfxOffscreenTarget *rt) {
+    if (!rt) return;
+    pthread_mutex_lock(&g_tex_bridge_lock);
+    for (unsigned i = 0; i < g_tex_bridge_count; i++) {
+        tex_bridge_t *b = &g_tex_bridges[i];
+        if (b->rt != rt) continue;
+        b->rt = NULL;
+        b->rt_valid = 0;
+        b->rt_uploaded = 0;
+        b->rt_frame = 0;
+        if (b->gfx) {
+            gfx_backend_texture_destroy((GfxTexture *)b->gfx);
+            b->gfx = NULL;
+        }
+    }
+    pthread_mutex_unlock(&g_tex_bridge_lock);
+}
+
 typedef struct {
     uint8_t minf, magf, ws, wt, wr, cmp_mode, cmp_func, reduction;
     float lod_min, lod_max, lod_bias, aniso, border[4], lod_snap;
@@ -3410,6 +3432,7 @@ typedef struct {
     GfxRenderTargetLayout layout;
     const void *owner;          /* guest colour-0 texture this image backs */
     GfxOffscreenTarget *gfx;
+    uint64_t last_use;          /* LRU stamp: refreshed on every lookup */
 } nvn_host_rt_t;
 /* Title/save UI creates a distinct host target per UI plane/atlas; 16 was
  * exhausted before the save-slot screen could render.  The host images are
@@ -3417,7 +3440,13 @@ typedef struct {
  * live guest targets, not frames. */
 static nvn_host_rt_t g_host_rts[128];
 static unsigned g_host_rt_count;
+static uint64_t g_host_rt_clock;
+static unsigned g_host_rt_creates, g_host_rt_evictions;
 static pthread_mutex_t g_host_rt_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Defined with the scene-present state below; the eviction policy protects the
+ * target currently routed to present(). */
+static GfxOffscreenTarget *g_last_scene_rt;
+static GfxOffscreenTarget *g_present_rt;
 
 static uint64_t nvn_layout_sig(const GfxRenderTargetLayout *l) {
     if (!l) return 0;
@@ -3453,39 +3482,85 @@ static GfxOffscreenTarget *nvn_host_rt_get_owner(uint32_t width, uint32_t height
         if (g_host_rts[i].owner != owner) continue;
         if (!nvn_layout_equal(&g_host_rts[i].layout, layout)) continue;
         GfxOffscreenTarget *gfx = g_host_rts[i].gfx;
+        g_host_rts[i].last_use = ++g_host_rt_clock;
         pthread_mutex_unlock(&g_host_rt_lock);
         return gfx;
     }
-    if (g_host_rt_count >= sizeof g_host_rts / sizeof g_host_rts[0]) {
-        pthread_mutex_unlock(&g_host_rt_lock);
-        nvn_fail("nvnCommandBufferSetRenderTargets", "host render-target cache full");
-        return NULL;
-    }
+    /* The boot logo records a fresh guest texture (and therefore a fresh
+     * owner) for each animation frame.  Without eviction the 128-entry cache
+     * fills and every later SetRenderTargets fails forever.  Create the new
+     * image first, then replace the least-recently-used entry that is not the
+     * current present target. */
     GfxOffscreenTarget *gfx = gfx_backend_offscreen_create_layout(width, height, layout);
     if (!gfx) {
         pthread_mutex_unlock(&g_host_rt_lock);
         return NULL;
     }
-    g_host_rts[g_host_rt_count].width = width;
-    g_host_rts[g_host_rt_count].height = height;
-    g_host_rts[g_host_rt_count].layout = *layout;
-    g_host_rts[g_host_rt_count].owner = owner;
-    g_host_rts[g_host_rt_count].gfx = gfx;
-    g_host_rt_count++;
-    if (g_host_rt_count <= 32 || nvn_trace())
+    unsigned slot = g_host_rt_count;
+    if (slot >= sizeof g_host_rts / sizeof g_host_rts[0]) {
+        uint64_t oldest = UINT64_MAX;
+        unsigned victim = UINT_MAX;
+        for (unsigned i = 0; i < g_host_rt_count; i++) {
+            if (!g_host_rts[i].gfx) continue;
+            if (g_host_rts[i].gfx == g_last_scene_rt ||
+                g_host_rts[i].gfx == g_present_rt) continue;
+            if (g_host_rts[i].last_use < oldest) {
+                oldest = g_host_rts[i].last_use;
+                victim = i;
+            }
+        }
+        if (victim == UINT_MAX) {
+            pthread_mutex_unlock(&g_host_rt_lock);
+            gfx_backend_offscreen_destroy(gfx);
+            nvn_fail("nvnCommandBufferSetRenderTargets", "host render-target cache full (all pinned)");
+            return NULL;
+        }
+        slot = victim;
+        uint32_t vw = g_host_rts[victim].width, vh = g_host_rts[victim].height;
+        const void *vo = g_host_rts[victim].owner;
+        GfxOffscreenTarget *old = g_host_rts[victim].gfx;
+        g_host_rt_evictions++;
+        if (g_host_rt_evictions <= 8 || (g_host_rt_evictions % 64) == 0)
+            fprintf(stderr, "[totk-nvn] host rt evict #%u %ux%u owner=%p age=%llu"
+                            " (creates=%u live=%u)\n", g_host_rt_evictions,
+                    vw, vh, vo, (unsigned long long)oldest,
+                    g_host_rt_creates, g_host_rt_count);
+        /* Drop sampled-texture associations before destroying the image. */
+        nvn_tex_forget_rt(old);
+        gfx_backend_offscreen_destroy(old);
+    } else {
+        g_host_rt_count++;
+    }
+    g_host_rts[slot].width = width;
+    g_host_rts[slot].height = height;
+    g_host_rts[slot].layout = *layout;
+    g_host_rts[slot].owner = owner;
+    g_host_rts[slot].gfx = gfx;
+    g_host_rts[slot].last_use = ++g_host_rt_clock;
+    g_host_rt_creates++;
+    if (g_host_rt_creates <= 32 || nvn_trace() || (g_host_rt_evictions &&
+                                                   (g_host_rt_creates % 64) == 0))
         fprintf(stderr, "[totk-nvn] host render target %ux%u colors=%u depth=%#x"
-                        " owner=%p created\n", width, height, layout->color_count,
-                layout->depth_format, owner);
+                        " owner=%p created (creates=%u live=%u evictions=%u)\n",
+                width, height, layout->color_count, layout->depth_format, owner,
+                g_host_rt_creates, g_host_rt_count, g_host_rt_evictions);
     pthread_mutex_unlock(&g_host_rt_lock);
     return gfx;
 }
 static void nvn_host_rt_clear(void) {
     pthread_mutex_lock(&g_host_rt_lock);
     for (unsigned i = 0; i < g_host_rt_count; i++) {
-        if (g_host_rts[i].gfx) gfx_backend_offscreen_destroy(g_host_rts[i].gfx);
+        if (g_host_rts[i].gfx) {
+            nvn_tex_forget_rt(g_host_rts[i].gfx);
+            gfx_backend_offscreen_destroy(g_host_rts[i].gfx);
+        }
         g_host_rts[i].gfx = NULL;
     }
     g_host_rt_count = 0;
+    g_host_rt_clock = 0;
+    g_host_rt_creates = g_host_rt_evictions = 0;
+    g_present_rt = NULL;
+    g_last_scene_rt = NULL;
     pthread_mutex_unlock(&g_host_rt_lock);
 }
 
@@ -10636,6 +10711,7 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                  * reads, so present that RT (route the sampled texture's RT, not
                  * the overlay). */
                 runtime_native_window_set_present_target(w->native, window_present_rt);
+                g_present_rt = window_present_rt;
                 if (nvn_trace_composite()) {
                     static unsigned sl;
                     if (sl++ < 8) {
@@ -10778,6 +10854,7 @@ static void nvn_process_submit_commands(const uint64_t *cmds, int n) {
                  * holds the frame content (no invented pixels). */
                 if (has_window && rt && rw >= 1024 && rh >= 1024) {
                     runtime_native_window_set_present_target(w->native, rt);
+                    g_present_rt = rt;
                     if (nvn_trace_composite()) {
                         static unsigned pl;
                         if (pl++ < 8)
