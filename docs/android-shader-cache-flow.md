@@ -10,7 +10,7 @@ guest NVN control/code  --(TOTK_ANDROID_SHADER_DUMP)-->  <key>.ctl + <key>.code
         |                                          <stage>/<key>.spv + .res.json
         |                                          <stage>/<key>-<suffix>.spv + .res.json
         v                                                        |
-  runtime_shader_identity()  -------------------------------->  shader_cache_android.c
+  runtime_shader_identity()  -------------------------------->  shader_cache/
 ```
 
 It covers the UI/compute capture, the exact offline command, the cache layout,
@@ -28,7 +28,7 @@ Related documents:
 
 ## 1. Runtime key
 
-`runtime_shader_identity()` in `games/totk/android/shader_cache_android.c`
+`runtime_shader_identity()` in `games/totk/android/shader_cache/`
 computes the cache key.  For a bound NVN shader:
 
 ```text
@@ -216,7 +216,7 @@ Options that matter:
 - `--clean`: remove the output first;
 - `--report <path>`: default `<out>/translation-report.json`.
 
-Output layout (exactly what `shader_cache_android.c` reads):
+Output layout (exactly what `shader_cache/` reads):
 
 ```text
 <out>/vs/<key>.spv
@@ -377,7 +377,7 @@ lead logs are present, and the latest UI log (`ui4.log`) has 16 cache hits and
 Copy/clear/blit are **not** cache modules in this build.  They are NVN command
 shims (`nvnCommandBufferClearTexture`, `CopyBufferToTexture`,
 `CopyTextureToTexture`, `nvnCommandBufferBlit`) that are still
-`nvn_zero_call()` in `nvn_android.c`; no amount of shader-cache work fills
+`nvn_zero_call()` in `nvn/`; no amount of shader-cache work fills
 them.  The UI compute modules are all buffer/texture modules with zero storage
 images, so they cannot write pixels directly either.  This is a Lane 2
 blocker, not a cache gap.

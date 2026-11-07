@@ -38,7 +38,7 @@ signatures.  A needed addition goes through Lane 0 as another additive commit.
 
 ## 3. Probe hooks
 
-Probe dispatch stays in `loader_android.c`, but the four new probes are
+Probe dispatch stays in `loader/`, but the four new probes are
 reserved by `probe_hooks_android.[ch]`:
 
 | probe | strong definition | owner |
@@ -50,7 +50,7 @@ reserved by `probe_hooks_android.[ch]`:
 
 Until the strong definition lands, the weak stub prints
 `not implemented` and exits **77**.  A probe must never report a false pass.
-`loader_android.c` is owned by Lane 3 after Wave 0; Lane 1/2 do not edit it.
+`loader/` is owned by Lane 3 after Wave 0; Lane 1/2 do not edit it.
 
 ## 4. Build and run
 
@@ -100,9 +100,9 @@ Wave 1 and records the exact command for the final soak.
 | lane | may edit |
 | --- | --- |
 | 0 | `.gitignore`, `build.sh`, `devrun.sh`, `probe_hooks_android.[ch]`, `gfx_backend_android.h` (contract only), `docs/` |
-| 1 | `gfx_vulkan_android.c`, new `gfx_compute_spv.h`, new `shaders/*` repo-owned test shaders |
-| 2 | `nvn_android.c` |
-| 3 | `runtime/threads.c`, `loader_android.c` |
+| 1 | `gfx/`, new `gfx_compute_spv.h`, new `shaders/*` repo-owned test shaders |
+| 2 | `nvn/` |
+| 3 | `runtime/threads.c`, `loader/` |
 | 4 | no production code; outputs only under `/tmp` and `/data/local/tmp` |
 | 5 | `android/tools/`, `docs/` |
 

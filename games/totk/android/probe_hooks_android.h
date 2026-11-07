@@ -8,11 +8,11 @@
 #ifndef TOTK_ANDROID_PROBE_HOOKS_H
 #define TOTK_ANDROID_PROBE_HOOKS_H
 
-/* games/totk/android/gfx_vulkan_android.c (Lane 1). */
+/* games/totk/android/gfx/ (Lane 1). */
 int gfx_backend_compute_probe(const char *work_dir);
 int gfx_backend_copy_probe(const char *work_dir);
 
-/* games/totk/android/nvn_android.c (Lane 2). */
+/* games/totk/android/nvn/ (Lane 2). */
 int nvn_compute_probe(const char *work_dir);
 int nvn_copy_probe(const char *work_dir);
 

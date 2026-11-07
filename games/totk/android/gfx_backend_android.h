@@ -251,7 +251,7 @@ typedef struct {
 } GfxPipelineState;
 
 /* Offline reflection helpers shared by the probes and the NVN program bridge.
- * They are implemented in loader_android.c; `json_path` is the .res.json and
+ * They are implemented in loader/; `json_path` is the .res.json and
  * `spv_path` the translated module.  SPIR-V wins for descriptor type/count. */
 unsigned gfx_reflect_full(const char *json_path, const char *spv_path, uint32_t target_set,
                           GfxBindingSpec *out, unsigned max);

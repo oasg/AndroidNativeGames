@@ -228,7 +228,7 @@ The app shell lives in
   current present/scene RT; `nvn_tex_forget_rt` clears sampled copies). Headless
   boot: `creates=1984 live=128 evictions=1856`, zero `cache full`. App: 453
   presents past the logo, zero `cache full`.
-- **Virtual-core deadlock**: Android `services_android.c` never called
+- **Virtual-core deadlock**: Android `services/` never called
   `runtime_core_checkpoint()` at SVCs, and the LightMessageQueue lock loop uses
   SVC `0x36` (`SynchronizePreemptionState`). Added the checkpoint/SVC `0x36`,
   unblocked SIGUSR2 for loader/guest threads, allowed the SIGUSR2 handler to

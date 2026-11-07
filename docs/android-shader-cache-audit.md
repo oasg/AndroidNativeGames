@@ -274,15 +274,15 @@ cache keys for them:
 - no `cs`, `vs` or `ps` `.res.json` in the cache declares a storage image
   (`images` is empty for all 5,810 reflections);
 - the four NVN entry points are still `nvn_zero_call()` stubs in
-  `games/totk/android/nvn_android.c` (lines ~9927-9958), so they never reach
+  `games/totk/android/nvn/` (lines ~9927-9958), so they never reach
   the backend;
 - the UI compute modules are buffer/sampled-texture modules, so they cannot
   write the `0x3f` target directly.
 
 Filling the cache cannot make copy/clear/blit work.  That is a Lane 2
-(`nvn_android.c`) blocker: implement the shims on top of the frozen
+(`nvn/`) blocker: implement the shims on top of the frozen
 `gfx_backend_texture_copy/clear` API from Lane 1, then re-run the UI capture.
-Reported here; this lane did not edit `nvn_android.c`.
+Reported here; this lane did not edit `nvn/`.
 
 ## 5. Audit tool exit status
 

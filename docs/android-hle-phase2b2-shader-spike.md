@@ -169,7 +169,7 @@ pipeline binding work continue.
   samplers, arrays, storage images and texel buffers.
 - 2B.2c: run the first actual draw; keep the clear/simple-triangle fallback for
   missing shader variants.  The runtime key lookup and lazy pipeline are in
-  place (`shader_cache_android.c`, `probe-nvn-frame`); packing the real startup
+  place (`shader_cache/`, `probe-nvn-frame`); packing the real startup
   subset is the remaining step.
 - 2B.3: Android Surface/JNI app shell.
 

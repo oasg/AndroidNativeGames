@@ -47,7 +47,7 @@ service is readable in the log and in the crash report.
 
 ### Crash report
 
-`games/totk/android/loader_android.c` maps both `pc` and `lr` to
+`games/totk/android/loader/` maps both `pc` and `lr` to
 `module+offset`, walks the guest `x29` chain through `/proc/self/mem` (a stale
 frame pointer ends the walk instead of faulting again), and prints the last
 HLE call, the last IPC request and the guest thread handle:

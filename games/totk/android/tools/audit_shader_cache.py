@@ -22,7 +22,7 @@ Usage:
 
 Missing-key check: a key that a dump captured but the cache does not contain
 as a canonical `<key>.spv` is reported under `missing`.  Variants alone are
-not enough: `shader_cache_android.c` only loads a variant after the canonical
+not enough: `shader_cache/` only loads a variant after the canonical
 module hit.
 """
 import argparse

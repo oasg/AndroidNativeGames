@@ -4,6 +4,25 @@ This directory contains the first native Android host for the rewritten TOTK
 1.0.0 modules. It is deliberately small: loader + key page + relocation + host
 gate + HLE-stack thunks + a minimal SVC layer.
 
+## Source layout
+
+The four large bring-up translation units are split by feature so each source
+file stays below roughly 500 lines:
+
+| Directory | Responsibility |
+|---|---|
+| `loader/` | module mapping, relocation, crash reports, reflection, CLI probes |
+| `nvn/` | NVN object graph, command recording, scene submission, proc table |
+| `gfx/` | Vulkan device, formats, offscreen targets, present, pipelines, compute |
+| `nvdrv/` | nvdrv/nvmap/nvhost service |
+| `services/` | Android SVC layer and the `lm` logging service |
+| `shader_cache/` | shader identity resolution and the SPIR-V disk cache |
+
+Each directory has a private `<module>_internal.h` umbrella, its own state and
+API headers, and one `.c` per feature slice.  Files under `*/impl/*.inc` are
+implementation phases of a single long function and are included by their
+owner; they are not separate translation units.
+
 ## What works
 
 - Maps `main`, `sdk`, `subsdk0` from `rewritten/android-v0` with SHA-256 checks.
@@ -31,7 +50,7 @@ gate + HLE-stack thunks + a minimal SVC layer.
   `ThreadType+0x1b0` is filled with the guest thread handle, which
   `nn::os::UnlockMutex` uses for its owner check.
 - `nvnBootstrapLoader`/`nvnDeviceGetProcAddress` and the full NVN object graph
-  run on the host (`nvn_android.c`): device, memory pool, buffer, texture and
+  run on the host (`nvn/`): device, memory pool, buffer, texture and
   texture view, sampler and sampler pool, texture pool, program, queue, window,
   sync and event. Builders write real fields, mappings return the backing
   storage, handles are non-zero, and unknown object APIs are reported instead
@@ -40,7 +59,7 @@ gate + HLE-stack thunks + a minimal SVC layer.
   `docs/android-hle-phase2a.md`.
 - `nn::vi` uses the SDK display/initialize/vsync path, with host layer/native
   window objects for `CreateLayer`/`GetNativeWindow`.
-- `nvdrv` is a real host service (`nvdrv_android.c`): Open/Close/Initialize/
+- `nvdrv` is a real host service (`nvdrv/`): Open/Close/Initialize/
   SetAruid/Ioctl3/MapSharedMem, nvmap create/alloc/free/id/param, nvhost-ctrl
   syncpoints, and a guest-visible 1 GiB nvmap window at `0x500000000` that
   `QueryMemory` reports as committed.  Unknown devices/ioctls return explicit
@@ -50,7 +69,7 @@ gate + HLE-stack thunks + a minimal SVC layer.
   1280x720 in handheld); `probe-vi` checks the object and the NVN builder
   round trip.  `probe-nvn-submit` records one command buffer, submits it and
   presents through the selected graphics backend.
-- The Android graphics backend is Vulkan (`gfx_vulkan_android.c`): real
+- The Android graphics backend is Vulkan (`gfx/`): real
   `VkInstance`/`VkDevice`/graphics queue, an offscreen `VkImage` target with
   GPU clear and readback, and an optional `VkSwapchainKHR` over an
   `ANativeWindow*`.  `TOTK_ANDROID_GFX_BACKEND=auto|vulkan|software` selects
@@ -431,7 +450,7 @@ Expected results on an arm64 Android device:
    reaches its **first real GPU submit**.  The next stop is
    `main+0x7a8600` after `nvnQueueFenceSync`, where a renderer object's first
    qword is null.  See `docs/android-hle-phase2a.md`.
-3. `nvdrv` is now a real service (`nvdrv_android.c`): Open/Close/Initialize/
+3. `nvdrv` is now a real service (`nvdrv/`): Open/Close/Initialize/
    SetAruid/Ioctl3/MapSharedMem plus a guest-visible nvmap window at
    `0x500000000`.  `probe-nvdrv` exercises it.  The next nvdrv work is the
    versioned GetStatus/display/scheduler ioctls used after the first frame.

@@ -2,7 +2,7 @@
  *
  * nvn_deswizzle.c is the shared Tegra GOB block-linear decoder from the macOS
  * route; it needs the desktop nvn_texdesc/nvn_tex.c layout functions.  Keep
- * that include boundary in this file so nvn_android.c's own compact tex_desc
+ * that include boundary in this file so nvn/'s own compact tex_desc
  * stays independent and no global/static names collide.
  */
 #include "nvn_tex.h"

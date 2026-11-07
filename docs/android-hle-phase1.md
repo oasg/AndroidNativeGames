@@ -57,7 +57,7 @@ not a guest patch:
 
 ```
 if (state == 1)
-    run_init_array(&module);       /* loader_android.c */
+    run_init_array(&module);       /* loader/ */
 ```
 
 `run_init_array()` walks the module's `DT_INIT_ARRAY`/`DT_INIT_ARRAYSZ` range
@@ -130,7 +130,7 @@ aborted.
 
 The fix has two parts:
 
-1. `runtime_guest_stack_info()` (services_android.c) reports the guest stack
+1. `runtime_guest_stack_info()` (services/) reports the guest stack
    range (`low_space + STACK_OFF`, `STACK_SIZE`).
 2. `runtime_thread_init()` carves a per-thread 1 MiB committed stack area from
    the top of the guest stack, places `TLS (8 KiB) + TLR (0x200) + ThreadType
@@ -308,7 +308,7 @@ protocol objects) is:
 [ipc] unknown command service=nvdrv command=0 type=6 data=00000000
 ```
 
-nvdrv now has a real host service (`nvdrv_android.c`) rather than the generic
+nvdrv now has a real host service (`nvdrv/`) rather than the generic
 Android stub: Initialize/SetAruid/SetGraphicsFirmwareMemoryMarginEnabled,
 Open/Close/Ioctl3, QueryEvent/MapSharedMem, nvmap allocation and nvhost-ctrl
 syncpoints.  Its nvmap memory lives in a guest-visible window at
@@ -346,7 +346,7 @@ device was never created and `main+0x463c048` stayed null. This is **not** an
 am/applet lifecycle problem; `sead::ThreadMgr` is published
 (`main+0x463c000 = 0x330900200`) before the task runs.
 
-`games/totk/android/nvn_android.c` now implements the initialization contract:
+`games/totk/android/nvn/` now implements the initialization contract:
 
 - `nvnBootstrapLoader` / `nvnDeviceGetProcAddress` return real host entries.
 - `nvnDeviceInitialize` returns success.

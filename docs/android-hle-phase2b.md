@@ -32,7 +32,7 @@ gfx_backend_attach_android_surface(ANativeWindow *, width, height, nvn_format);
 gfx_backend_surface_present(r, g, b, a);
 ```
 
-`games/totk/android/gfx_vulkan_android.c` owns:
+`games/totk/android/gfx/` owns:
 
 - instance, physical device and graphics queue;
 - device, command pool, one primary command buffer and a fence;
@@ -48,7 +48,7 @@ gfx_backend_surface_present(r, g, b, a);
 | `vulkan` | require Vulkan and a Vulkan target; failure returns `NULL` |
 | `software` | never initialize Vulkan; use the CPU mirror |
 
-The NVN layer in `nvn_android.c` is unchanged as the object graph.  It keeps
+The NVN layer in `nvn/` is unchanged as the object graph.  It keeps
 the NVN reserved object sizes, magics, builders, memory-pool/buffer mappings and
 the actual call order.  `nvnQueuePresentTexture` forwards the final present to
 the host native window, which presents through Vulkan when a target exists.
@@ -57,7 +57,7 @@ the host native window, which presents through Vulkan when a target exists.
 
 ### NVN object semantics
 
-Reused: the Android `nvn_android.c` object graph was built from the same NVN
+Reused: the Android `nvn/` object graph was built from the same NVN
 contract as the desktop layer, including reserved sizes, builder defaults,
 memory-pool flags, buffer mapping and submit/present instrumentation.
 
@@ -67,7 +67,7 @@ CAMetalLayer and the macOS presentation loop.
 ### Texture layout and format mapping
 
 The Tegra X1 block-linear storage calculation remains in
-`nvn_android.c` (`nvn_tex_layout`): GOB size, tile height/depth, packaged
+`nvn/nvn_texture_layout.c` (`nvn_host_tex_layout`): GOB size, tile height/depth, packaged
 layout, mip offsets, linear targets and TOTK's `MINIMAL_LAYOUT` path.  This is
 still what sizes and offsets guest memory.
 

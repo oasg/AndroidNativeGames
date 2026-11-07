@@ -10,7 +10,7 @@ tool copies `<stem>.spv` and `<stem>.res.json` to:
     <out>/<stage>/<nvn_key>-<suffix>.spv
     <out>/<stage>/<nvn_key>-<suffix>.res.json
 
-That is the layout `shader_cache_android.c` reads from
+That is the layout `shader_cache/` reads from
 `TOTK_ANDROID_SHADER_CACHE`.  The output may contain game-derived bytes and
 belongs in the work folder, never in the repository.
 
@@ -29,7 +29,7 @@ import sys
 STAGES = {'vs', 'ps', 'gs', 'tcs', 'tes', 'cs'}
 SPV_MAGIC = b'\x03\x02\x23\x07'
 
-# NVN format -> attribute class, mirroring nvn_attr_class() in nvn_android.c.
+# NVN format -> attribute class, mirroring nvn_attr_class() in nvn/.
 NVN_ATTR_UNSIGNED = frozenset({
     0x03, 0x08, 0x0B, 0x0F, 0x14, 0x17, 0x1B, 0x20, 0x23, 0x27, 0x2C, 0x2F,
 })
@@ -209,7 +209,7 @@ def res_texture_slot(entry):
     handle = entry.get('handle')
     if not isinstance(handle, int):
         return None
-    # Same decode as reflect_json_section() in loader_android.c.
+    # Same decode as reflect_json_section() in loader/.
     off0 = handle & 0x3fff
     byte_off = off0 * 4
     if 0x168 <= byte_off < 0x568:

@@ -136,7 +136,7 @@ memory accessor, which the host does not have. They are now host no-device
 initializers next to `InitializeNpad`; without them the SDK dereferenced a null
 HID singleton (`sdk+0x497fec`).
 
-## 3. NVN object graph (`nvn_android.c`)
+## 3. NVN object graph (`nvn/`)
 
 The previous file returned `nvn_ok`/`nvn_nop` for almost everything. It now owns
 the object graph and the pointer semantics the guest expects, while still not
@@ -227,7 +227,7 @@ construction.
 
 ## 6. Phase 2A.3: nvdrv is a real service
 
-`games/totk/android/nvdrv_android.c` replaces the generic Android stub for
+`games/totk/android/nvdrv/` replaces the generic Android stub for
 `nvdrv`, `nvdrv:a`, `nvdrv:s` and `nvdrv:t`.  It implements the public
 `INvDrvServices` command shape:
 

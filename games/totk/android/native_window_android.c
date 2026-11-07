@@ -48,6 +48,21 @@ static pthread_mutex_t g_host_window_lock = PTHREAD_MUTEX_INITIALIZER;
  * game path normally passes the HostNativeWindow it got from VI. */
 static HostNativeWindow *g_shell_window;
 
+/* Surface handed over by the Android app shell.  The game creates its own host
+ * window later (nn::vi CreateLayer -> runtime_native_window_create), so the
+ * first such window adopts this surface.  Keeping it here instead of changing
+ * the VI path means the loader still runs unchanged from the CLI. */
+static void *g_pending_android;
+static uint32_t g_pending_width;
+static uint32_t g_pending_height;
+static uint32_t g_pending_format;
+static HostNativeWindow *g_primary_surface_window;
+static pthread_mutex_t g_surface_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void runtime_native_window_attach_android(void *native_window, void *host_window,
+                                          uint32_t width, uint32_t height,
+                                          uint32_t nvn_format);
+
 int runtime_native_window_valid(const void *p) {
     if (!p) return 0;
     int found = 0;
@@ -120,12 +135,28 @@ void *runtime_native_window_create(uint32_t width, uint32_t height, uint32_t for
             width, height, w->format, (unsigned long long)layer_id,
             w->gfx_target ? "vulkan" : "software", (void *)w->buffer, w->buffer_size);
     host_window_register(w);
+
+    /* The first host window the game creates adopts the app shell's surface.
+     * Later windows stay offscreen unless the shell explicitly reattaches. */
+    pthread_mutex_lock(&g_surface_lock);
+    void *anw = g_pending_android;
+    uint32_t sw = g_pending_width, sh = g_pending_height, sfmt = g_pending_format;
+    int adopt = anw && !g_primary_surface_window;
+    if (adopt) g_primary_surface_window = w;
+    pthread_mutex_unlock(&g_surface_lock);
+    if (adopt) {
+        runtime_native_window_attach_android(anw, w, sw ? sw : width, sh ? sh : height,
+                                             sfmt ? sfmt : w->format);
+    }
     return w;
 }
 
 void runtime_native_window_destroy(void *p) {
     HostNativeWindow *w = p;
     if (!w || w->magic != HOST_NW_MAGIC) return;
+    pthread_mutex_lock(&g_surface_lock);
+    if (g_primary_surface_window == w) g_primary_surface_window = NULL;
+    pthread_mutex_unlock(&g_surface_lock);
     host_window_unregister(w);
     if (w->gfx_target) gfx_backend_offscreen_destroy(w->gfx_target);
     if (w->surface_ok) gfx_backend_detach_android_surface();
@@ -211,6 +242,34 @@ void runtime_native_window_attach_android(void *native_window, void *host_window
         w->offscreen = 1;
         fprintf(stderr, "[totk-vi] ERROR Android surface attach failed; keeping offscreen target\n");
     }
+}
+
+/* App-shell entry points.  The shell calls set_pending_surface() when Java has
+ * a Surface, before the loader starts.  The game's first VI host window then
+ * adopts it (see runtime_native_window_create).  Calling it again after a
+ * rotation/foreground transition reattaches the new Surface to that window;
+ * clear_pending_surface() detaches without destroying the render target. */
+void runtime_native_window_set_pending_surface(void *native_window, uint32_t width,
+                                               uint32_t height, uint32_t nvn_format) {
+    pthread_mutex_lock(&g_surface_lock);
+    g_pending_android = native_window;
+    g_pending_width = width;
+    g_pending_height = height;
+    g_pending_format = nvn_format;
+    HostNativeWindow *primary = g_primary_surface_window;
+    pthread_mutex_unlock(&g_surface_lock);
+    if (native_window && primary)
+        runtime_native_window_attach_android(native_window, primary, width, height, nvn_format);
+}
+
+void runtime_native_window_clear_pending_surface(void) {
+    pthread_mutex_lock(&g_surface_lock);
+    g_pending_android = NULL;
+    g_pending_width = g_pending_height = g_pending_format = 0;
+    HostNativeWindow *primary = g_primary_surface_window;
+    pthread_mutex_unlock(&g_surface_lock);
+    if (primary)
+        runtime_native_window_attach_android(NULL, primary, 0, 0, 0);
 }
 
 /* Host window implicitly created by the attach call above (NULL if the caller

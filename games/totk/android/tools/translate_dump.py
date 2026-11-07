@@ -15,7 +15,7 @@ Android cache layout:
 The canonical module is always translated and kept as the fallback.  With
 `--answers` each bind-state row additionally produces a variant.  `--answers
 auto` derives one row per shader from the canonical SPIR-V / .res.json, using
-the same naming as `nvn_variant_suffix()` in nvn_android.c:
+the same naming as `nvn_variant_suffix()` in nvn/:
 
     a<16 x f/u/s/_>[-t<slot>_<target>[d]]...
 

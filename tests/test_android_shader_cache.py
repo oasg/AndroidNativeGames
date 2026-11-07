@@ -1,7 +1,7 @@
 """The Android shader-cache packer writes the runtime key + stage layout.
 
 Also covers the offline answer/variant naming shared by shader_spike.py,
-translate_dump.py and nvn_variant_suffix() in nvn_android.c.
+translate_dump.py and nvn_variant_suffix() in nvn/.
 """
 import json
 from pathlib import Path
@@ -455,9 +455,10 @@ int main(void) {
             src = root/'resolve_test.c'
             src.write_text(self.TEST_C)
             exe = root/'resolve_test'
+            shader_cache = sorted((ROOT/'games/totk/android/shader_cache').glob('*.c'))
             r = subprocess.run([
                 cc, '-std=c11', '-O1', '-I', str(ROOT/'games/totk/android'),
-                str(src), str(ROOT/'games/totk/android/shader_cache_android.c'),
+                str(src), *map(str, shader_cache),
                 str(ROOT/'games/totk/android/sha256.c'), '-o', str(exe)],
                 capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)

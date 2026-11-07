@@ -17,7 +17,7 @@ python3 "$repo/games/totk/android/tools/prepare_triangle_spv.py" --ndk "$ndk" --
 "$cc" -shared -fPIC -O2 -I"$repo/games/totk/android" -I"$repo/games/totk/runtime" -I"$work" \
   -o "$work/lib/arm64-v8a/libtotk_surface.so" \
   "$here/surface_test.c" "$repo/games/totk/android/native_window_android.c" \
-  "$repo/games/totk/android/gfx_vulkan_android.c" \
+  "$repo"/games/totk/android/gfx/*.c \
   -lvulkan -landroid -llog -pthread
 javac -source 8 -target 8 -cp "$jar" -d "$work/classes" "$here/java/com/totk/surfacetest/MainActivity.java"
 "$bt/d8" --lib "$jar" --output "$work/dex" $(find "$work/classes" -name '*.class')
